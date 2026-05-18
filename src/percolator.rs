@@ -9498,6 +9498,54 @@ impl RiskEngine {
         Ok(())
     }
 
+    // ========================================================================
+    // resolve_market_refund (refund-mode resolution for binary outcome markets)
+    // ========================================================================
+
+    /// Refund-mode market resolution.
+    ///
+    /// Transitions the market from `Live` to `Resolved` *without* applying a
+    /// settlement price. Every trader's PnL is zeroed; their `collateral` is
+    /// left untouched. The downstream `force_close_resolved_not_atomic` path
+    /// then withdraws each position's collateral verbatim, returning every
+    /// trader to par.
+    ///
+    /// Intended for binary-outcome markets whose underlying question resolves
+    /// as ambiguous and where settling at any specific price would be wrong —
+    /// the underlying event was cancelled, the resolution criteria became
+    /// impossible to evaluate, or the resolver explicitly elected the refund
+    /// branch.
+    ///
+    /// # Contract
+    ///
+    /// - Caller MUST already have ensured no active bankrupt-close
+    ///   continuation is in flight (the wrapper-side equivalent of the
+    ///   `Live`-mode guard in `resolve_market_not_atomic`).
+    /// - This entry point does NOT accrue live state, does NOT apply funding,
+    ///   does NOT perform the deviation-band check (there is no settlement
+    ///   price to deviate against).
+    /// - On success: `market_mode == Resolved`, every account's PnL is zero,
+    ///   every account's `collateral` is preserved.
+    /// - On any failure, no state mutation is observable to callers.
+    ///
+    /// # Errors
+    ///
+    /// - `RiskError::Unauthorized` if `market_mode != Live`.
+    /// - `RiskError::Overflow` if `now_slot < self.current_slot` or
+    ///   `now_slot < self.last_market_slot` (slot monotonicity).
+    /// - `RiskError::CorruptState` if account-table invariants do not hold
+    ///   on exit (the standard `assert_public_postconditions` gate).
+    ///
+    /// # Stability
+    ///
+    /// The signature and the contract documented above are stable — callers
+    /// may compile against them today. The body is intentionally a stub at
+    /// this commit; the implementation lands in a subsequent commit alongside
+    /// its Kani harness.
+    pub fn resolve_market_refund_not_atomic(&mut self, _now_slot: u64) -> Result<()> {
+        todo!("refund-mode resolution body not yet implemented")
+    }
+
     /// Combined convenience: reconcile + terminal close if ready.
     /// For pnl <= 0 accounts or terminal-ready markets, completes in one call
     /// and returns `ResolvedCloseResult::Closed(capital)`.
