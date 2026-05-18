@@ -9518,9 +9518,9 @@ impl RiskEngine {
     ///
     /// # Contract
     ///
-    /// - Caller MUST already have ensured no active bankrupt-close
-    ///   continuation is in flight (the wrapper-side equivalent of the
-    ///   `Live`-mode guard in `resolve_market_not_atomic`).
+    /// - The engine refuses to transition out of `Live` if a bankrupt-close
+    ///   continuation is in flight; callers receive `RecoveryRequired` in
+    ///   that case (the same gate as `resolve_market_not_atomic`).
     /// - This entry point does NOT accrue live state, does NOT apply funding,
     ///   does NOT perform the deviation-band check (there is no settlement
     ///   price to deviate against).
@@ -9531,6 +9531,8 @@ impl RiskEngine {
     /// # Errors
     ///
     /// - `RiskError::Unauthorized` if `market_mode != Live`.
+    /// - `RiskError::RecoveryRequired` if a bankrupt-close continuation is
+    ///   active (matches `resolve_market_not_atomic`'s behavior).
     /// - `RiskError::Overflow` if `now_slot < self.current_slot` or
     ///   `now_slot < self.last_market_slot` (slot monotonicity).
     /// - `RiskError::CorruptState` if account-table invariants do not hold
@@ -9538,12 +9540,28 @@ impl RiskEngine {
     ///
     /// # Stability
     ///
-    /// The signature and the contract documented above are stable — callers
-    /// may compile against them today. The body is intentionally a stub at
-    /// this commit; the implementation lands in a subsequent commit alongside
-    /// its Kani harness.
-    pub fn resolve_market_refund_not_atomic(&mut self, _now_slot: u64) -> Result<()> {
-        todo!("refund-mode resolution body not yet implemented")
+    /// The signature, the precondition guards, and the contract documented
+    /// above are stable — callers may compile against them today. The body
+    /// past the guard block is intentionally a stub at this commit; the
+    /// PnL-zeroing loop, the mode transition, and the matching Kani harness
+    /// land in subsequent commits.
+    pub fn resolve_market_refund_not_atomic(&mut self, now_slot: u64) -> Result<()> {
+        // Mirror the precondition checks from `resolve_market_not_atomic`.
+        // Refund mode skips the deviation-band check (there is no settlement
+        // price to deviate against) and the price-range validation, but the
+        // live-mode guard, the bankrupt-close gate, and the slot-monotonicity
+        // checks all apply identically.
+        if self.market_mode != MarketMode::Live {
+            return Err(RiskError::Unauthorized);
+        }
+        self.ensure_no_active_bankrupt_close()?;
+        if now_slot < self.current_slot {
+            return Err(RiskError::Overflow);
+        }
+        if now_slot < self.last_market_slot {
+            return Err(RiskError::Overflow);
+        }
+        todo!("zero PnL on every account, transition mode, assert postconditions")
     }
 
     /// Combined convenience: reconcile + terminal close if ready.
