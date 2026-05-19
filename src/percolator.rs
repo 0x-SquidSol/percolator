@@ -9499,6 +9499,55 @@ impl RiskEngine {
     }
 
     // ========================================================================
+    // refund_detach_account (refund-mode per-account unwind helper)
+    // ========================================================================
+
+    /// Internal helper for refund-mode market resolution.
+    ///
+    /// Detaches a single account from any open position and refunds all of
+    /// its non-`capital` reserves back into `capital`, leaving the slot in a
+    /// state where `force_close_resolved_not_atomic` can withdraw the user's
+    /// collateral verbatim.
+    ///
+    /// Intended invariants on a successful return:
+    ///
+    /// - `pnl` is `0`. Refund mode is the "close at entry price" semantic,
+    ///   so the unrealized leg cancels out and `pnl` carries no residual.
+    /// - `reserved_pnl` is `0`, with its prior value drained into `capital`.
+    /// - `position_basis_q` is `0`.
+    /// - ADL snapshots (`adl_a_basis`, `adl_k_snap`, `f_snap`,
+    ///   `adl_epoch_snap`) are at the side's current defaults.
+    /// - Warmup reserves (`sched_*`, `pending_*`) are zero, with their
+    ///   notional drained into `capital`.
+    /// - `capital` is preserved as the post-refund-eligible amount the
+    ///   user will withdraw via the resolved-close path.
+    /// - Aggregate counters are decremented to reflect the detach
+    ///   (`oi_eff_(side)_q`, `stored_pos_count_(side)`, plus any
+    ///   `pnl_pos_tot` contribution this account had).
+    /// - `is_used` remains `1` — the slot stays claimed so the user can
+    ///   later call `force_close_resolved_not_atomic` against it.
+    ///
+    /// # Errors
+    ///
+    /// - `RiskError::AccountNotFound` if `idx` is out of range.
+    /// - `RiskError::CorruptState` if `idx` isn't marked used in the
+    ///   bitmap, or if any per-account or aggregate invariant fails to
+    ///   hold on exit.
+    ///
+    /// # Stability
+    ///
+    /// The signature is stable. The body is intentionally a stub at this
+    /// commit; the per-account field touches and the aggregate-state
+    /// coordination land in subsequent commits — split into the
+    /// "account without an open position" and "account with an open
+    /// position" cases for atomic review.
+    test_visible! {
+    fn refund_detach_account(&mut self, _idx: u16) -> Result<()> {
+        todo!("refund-detach body not yet implemented")
+    }
+    }
+
+    // ========================================================================
     // resolve_market_refund (refund-mode resolution for binary outcome markets)
     // ========================================================================
 
