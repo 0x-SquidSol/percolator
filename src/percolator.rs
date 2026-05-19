@@ -9504,28 +9504,41 @@ impl RiskEngine {
 
     /// Internal helper for refund-mode market resolution.
     ///
-    /// Detaches a single account from any open position and refunds all of
-    /// its non-`capital` reserves back into `capital`, leaving the slot in a
-    /// state where `force_close_resolved_not_atomic` can withdraw the user's
-    /// collateral verbatim.
+    /// Walks one account. If the account holds an open position, detaches
+    /// it cleanly so the market's aggregate `oi_eff_(side)_q` and
+    /// `stored_pos_count_(side)` counters can reach zero by
+    /// `resolve_market_refund_not_atomic` exit. Accounts without an open
+    /// position are a no-op — refund mode does not unwind already-closed
+    /// trades.
+    ///
+    /// The detach uses the "close at entry price" semantic, so an open
+    /// position's unrealized leg cancels out and no new realized PnL is
+    /// produced. The user's `capital` is preserved, ready for them to
+    /// withdraw via `force_close_resolved_not_atomic` once the market is
+    /// in `Resolved` mode.
     ///
     /// Intended invariants on a successful return:
     ///
-    /// - `pnl` is `0`. Refund mode is the "close at entry price" semantic,
-    ///   so the unrealized leg cancels out and `pnl` carries no residual.
-    /// - `reserved_pnl` is `0`, with its prior value drained into `capital`.
-    /// - `position_basis_q` is `0`.
-    /// - ADL snapshots (`adl_a_basis`, `adl_k_snap`, `f_snap`,
-    ///   `adl_epoch_snap`) are at the side's current defaults.
-    /// - Warmup reserves (`sched_*`, `pending_*`) are zero, with their
-    ///   notional drained into `capital`.
-    /// - `capital` is preserved as the post-refund-eligible amount the
-    ///   user will withdraw via the resolved-close path.
-    /// - Aggregate counters are decremented to reflect the detach
-    ///   (`oi_eff_(side)_q`, `stored_pos_count_(side)`, plus any
-    ///   `pnl_pos_tot` contribution this account had).
     /// - `is_used` remains `1` — the slot stays claimed so the user can
     ///   later call `force_close_resolved_not_atomic` against it.
+    /// - `position_basis_q` is `0`.
+    /// - If the account had an open position pre-call: aggregate counters
+    ///   tracking that position (`oi_eff_(side)_q`,
+    ///   `stored_pos_count_(side)`, plus side-mode transitions when the
+    ///   side's stored count reaches zero) are coherently updated; the
+    ///   position's unrealized leg cancels out so post-call `pnl`
+    ///   reflects only previously-realized PnL.
+    /// - If the account had no open position pre-call: no state change.
+    ///
+    /// Refund mode does NOT unwind previously-closed trades. A trader's
+    /// existing `pnl`, `reserved_pnl`, and warmup reserves stay as they
+    /// were — they reflect capital flows that have already happened, and
+    /// the engine's reserve-shape invariant
+    /// (`sched_remaining + pending_remaining == reserved_pnl`) means
+    /// reserves are not separately drainable into `capital` without also
+    /// adjusting `pnl`. The existing
+    /// `force_close_resolved_not_atomic` / terminal-close path
+    /// consolidates them into the user's withdraw amount.
     ///
     /// # Errors
     ///
@@ -9536,14 +9549,26 @@ impl RiskEngine {
     ///
     /// # Stability
     ///
-    /// The signature is stable. The body is intentionally a stub at this
-    /// commit; the per-account field touches and the aggregate-state
-    /// coordination land in subsequent commits — split into the
-    /// "account without an open position" and "account with an open
-    /// position" cases for atomic review.
+    /// The signature is stable. The body is partial at this commit: the
+    /// no-position case is implemented (a no-op); the with-position case
+    /// is gated by `todo!()` and lands in a subsequent commit.
     test_visible! {
-    fn refund_detach_account(&mut self, _idx: u16) -> Result<()> {
-        todo!("refund-detach body not yet implemented")
+    fn refund_detach_account(&mut self, idx: u16) -> Result<()> {
+        let i = idx as usize;
+        if i >= MAX_ACCOUNTS || idx as u64 >= self.params.max_accounts {
+            return Err(RiskError::AccountNotFound);
+        }
+        if !self.is_used(i) {
+            return Err(RiskError::CorruptState);
+        }
+        if self.accounts[i].position_basis_q != 0 {
+            todo!("refund-detach for accounts with an open position not yet implemented")
+        }
+        // No open position — refund mode is a no-op here. Already-closed
+        // trades stay closed; any reserved_pnl, warmup reserves, and
+        // pre-existing realized pnl are consolidated by
+        // force_close_resolved_not_atomic when the user later withdraws.
+        Ok(())
     }
     }
 
