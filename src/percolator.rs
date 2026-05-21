@@ -9549,9 +9549,13 @@ impl RiskEngine {
     ///
     /// # Stability
     ///
-    /// The signature is stable. The body is partial at this commit: the
-    /// no-position case is implemented (a no-op); the with-position case
-    /// is gated by `todo!()` and lands in a subsequent commit.
+    /// The signature and the per-account state transitions are stable
+    /// in both the no-position and with-position cases. The aggregate
+    /// OI counters (`oi_eff_long_q` and `oi_eff_short_q`) are NOT
+    /// touched here — they are a batch concern, zeroed once by
+    /// `resolve_market_refund_not_atomic` after iterating every active
+    /// account, matching the engine's existing "drain to zero" pattern
+    /// for resolved markets (spec §5.2.2 batch-update precedent).
     test_visible! {
     fn refund_detach_account(&mut self, idx: u16) -> Result<()> {
         let i = idx as usize;
@@ -9561,13 +9565,23 @@ impl RiskEngine {
         if !self.is_used(i) {
             return Err(RiskError::CorruptState);
         }
+        // If the account holds an open position, detach it via the engine's
+        // existing decrement-only path. `attach_effective_position` with
+        // `new_eff_pos_q = 0` accounts for any orphaned fractional remainder
+        // via phantom-dust accounting, decrements `stored_pos_count_(side)`,
+        // zeros `position_basis_q`, and resets ADL snapshots to canonical
+        // zero-position defaults. It does NOT touch `oi_eff_(side)_q` —
+        // OI is an aggregate concern handled by
+        // `resolve_market_refund_not_atomic` after the per-account loop.
+        //
+        // For accounts that already have no open position, this branch is
+        // skipped; refund mode is a no-op for them. Already-closed trades
+        // stay closed; pre-existing `pnl`, `reserved_pnl`, and warmup
+        // reserves are consolidated by `force_close_resolved_not_atomic`
+        // at terminal close.
         if self.accounts[i].position_basis_q != 0 {
-            todo!("refund-detach for accounts with an open position not yet implemented")
+            self.attach_effective_position(i, 0i128)?;
         }
-        // No open position — refund mode is a no-op here. Already-closed
-        // trades stay closed; any reserved_pnl, warmup reserves, and
-        // pre-existing realized pnl are consolidated by
-        // force_close_resolved_not_atomic when the user later withdraws.
         Ok(())
     }
     }
