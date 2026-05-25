@@ -9592,17 +9592,26 @@ impl RiskEngine {
 
     /// Refund-mode market resolution.
     ///
-    /// Transitions the market from `Live` to `Resolved` *without* applying a
-    /// settlement price. Every trader's PnL is zeroed; their `collateral` is
-    /// left untouched. The downstream `force_close_resolved_not_atomic` path
-    /// then withdraws each position's collateral verbatim, returning every
-    /// trader to par.
+    /// Transitions the market from `Live` to `Resolved` without applying a
+    /// settlement price. Open positions are detached at zero unrealized PnL
+    /// via the engine's existing decrement-only path; previously-closed
+    /// trades are preserved as already-realized PnL on their accounts. This
+    /// matches the Polymarket/Kalshi convention for INVALID resolution:
+    /// "make every trader whole on positions still on the book, leave
+    /// already-closed activity as it stands."
     ///
     /// Intended for binary-outcome markets whose underlying question resolves
     /// as ambiguous and where settling at any specific price would be wrong —
     /// the underlying event was cancelled, the resolution criteria became
     /// impossible to evaluate, or the resolver explicitly elected the refund
     /// branch.
+    ///
+    /// After this call, the downstream `force_close_resolved_not_atomic`
+    /// path withdraws each account's `capital`, consolidating any
+    /// `reserved_pnl` and warmup reserves through the engine's standard
+    /// terminal-close flow (the reserve-shape invariant
+    /// `sched_remaining + pending_remaining == reserved_pnl` means reserves
+    /// are not separately drainable into `capital` from this entry point).
     ///
     /// # Contract
     ///
@@ -9611,10 +9620,19 @@ impl RiskEngine {
     ///   that case (the same gate as `resolve_market_not_atomic`).
     /// - This entry point does NOT accrue live state, does NOT apply funding,
     ///   does NOT perform the deviation-band check (there is no settlement
-    ///   price to deviate against).
-    /// - On success: `market_mode == Resolved`, every account's PnL is zero,
-    ///   every account's `collateral` is preserved.
-    /// - On any failure, no state mutation is observable to callers.
+    ///   price to deviate against), and does NOT push a new oracle sample
+    ///   (the engine's `last_oracle_price` remains as last set by the live
+    ///   path).
+    /// - On success: `market_mode == Resolved`; every previously-used slot
+    ///   has `position_basis_q == 0`; aggregate `oi_eff_long_q` and
+    ///   `oi_eff_short_q` are both zero; `resolved_payout_*` snapshot
+    ///   fields are zero sentinels; `resolved_price` and
+    ///   `resolved_live_price` carry the engine's last live oracle price as
+    ///   a placeholder (refund mode has no settlement price, and the
+    ///   per-account payout math never consults these fields once every
+    ///   `position_basis_q == 0`).
+    /// - On any failure past the guard block, an `Err` propagates via `?`;
+    ///   per-account failures are atomic at the helper level.
     ///
     /// # Errors
     ///
@@ -9623,22 +9641,13 @@ impl RiskEngine {
     ///   active (matches `resolve_market_not_atomic`'s behavior).
     /// - `RiskError::Overflow` if `now_slot < self.current_slot` or
     ///   `now_slot < self.last_market_slot` (slot monotonicity).
-    /// - `RiskError::CorruptState` if account-table invariants do not hold
-    ///   on exit (the standard `assert_public_postconditions` gate).
-    ///
-    /// # Stability
-    ///
-    /// The signature, the precondition guards, and the contract documented
-    /// above are stable — callers may compile against them today. The body
-    /// past the guard block is intentionally a stub at this commit; the
-    /// PnL-zeroing loop, the mode transition, and the matching Kani harness
-    /// land in subsequent commits.
+    /// - `RiskError::CorruptState` if a per-account detach fails an
+    ///   invariant check, if either side's `oi_eff_*_q` is non-zero on
+    ///   exit, or if `assert_public_postconditions` rejects the post-state.
     pub fn resolve_market_refund_not_atomic(&mut self, now_slot: u64) -> Result<()> {
-        // Mirror the precondition checks from `resolve_market_not_atomic`.
-        // Refund mode skips the deviation-band check (there is no settlement
-        // price to deviate against) and the price-range validation, but the
-        // live-mode guard, the bankrupt-close gate, and the slot-monotonicity
-        // checks all apply identically.
+        // Precondition guards mirror `resolve_market_not_atomic`. Refund mode
+        // skips the deviation-band check and the resolved-price range check
+        // because there is no settlement price to validate.
         if self.market_mode != MarketMode::Live {
             return Err(RiskError::Unauthorized);
         }
@@ -9649,7 +9658,88 @@ impl RiskEngine {
         if now_slot < self.last_market_slot {
             return Err(RiskError::Overflow);
         }
-        todo!("zero PnL on every account, transition mode, assert postconditions")
+
+        // Pre-state snapshots for the drain-finalize decisions below.
+        // Captured before any mutation so they still reflect the pre-call
+        // view once the per-account detach loop has run.
+        let pre_mode_long = self.side_mode_long;
+        let pre_mode_short = self.side_mode_short;
+        let pre_stored_long = self.stored_pos_count_long;
+        let pre_stored_short = self.stored_pos_count_short;
+
+        // Per-account refund-detach. Walks every used slot and brings its
+        // per-account state coherent for refund mode: any open position is
+        // detached at zero unrealized PnL via the canonical
+        // `attach_effective_position(_, 0)` path; accounts with no open
+        // position are a no-op. Bounded by both the compile-time
+        // `MAX_ACCOUNTS` and the runtime `params.max_accounts`.
+        let cap = MAX_ACCOUNTS.min(self.params.max_accounts as usize);
+        for i in 0..cap {
+            if self.is_used(i) {
+                self.refund_detach_account(i as u16)?;
+            }
+        }
+
+        // Resolved bookkeeping. Mirrors the degenerate-branch slot updates
+        // in `resolve_market_not_atomic` — refund mode does not accrue, so
+        // `current_slot` and `last_market_slot` step forward directly.
+        self.current_slot = now_slot;
+        self.last_market_slot = now_slot;
+        self.market_mode = MarketMode::Resolved;
+        self.resolved_slot = now_slot;
+        // No settlement price; carry the engine's last live oracle price
+        // as a placeholder for downstream display and event emission.
+        self.resolved_price = self.last_oracle_price;
+        self.resolved_live_price = self.last_oracle_price;
+        // No price shift to attribute; refunded positions carry no terminal delta.
+        self.resolved_k_long_terminal_delta = 0;
+        self.resolved_k_short_terminal_delta = 0;
+
+        // Resolved-payout snapshot fields are zero sentinels — refund mode
+        // distributes nothing through the payout-ratio machinery.
+        self.resolved_payout_h_num = 0;
+        self.resolved_payout_h_den = 0;
+        self.resolved_payout_ready = 0;
+
+        // All positive PnL is now matured — matches the canonical resolve.
+        self.pnl_matured_pos_tot = self.pnl_pos_tot;
+
+        // Batch-zero aggregate OI. The per-account loop above already drained
+        // each side's contribution via `attach_effective_position(_, 0)`; this
+        // is the canonical "drain to zero at resolve" closing step that
+        // `resolve_market_not_atomic` performs unconditionally.
+        self.oi_eff_long_q = 0;
+        self.oi_eff_short_q = 0;
+
+        // Drain/finalize sides exactly as the canonical resolve does, gated
+        // on pre-call stored counts (zero-stored sides did not need a drain).
+        if pre_mode_long != SideMode::ResetPending && pre_stored_long > 0 {
+            self.begin_full_drain_reset(Side::Long)?;
+        }
+        if pre_mode_short != SideMode::ResetPending && pre_stored_short > 0 {
+            self.begin_full_drain_reset(Side::Short)?;
+        }
+        if self.side_mode_long == SideMode::ResetPending
+            && self.stale_account_count_long == 0
+            && self.stored_pos_count_long == 0
+        {
+            self.finalize_side_reset(Side::Long)?;
+        }
+        if self.side_mode_short == SideMode::ResetPending
+            && self.stale_account_count_short == 0
+            && self.stored_pos_count_short == 0
+        {
+            self.finalize_side_reset(Side::Short)?;
+        }
+
+        // Resolve additionally requires both sides == 0 (stronger than the
+        // bilateral-balance check enforced during live trading).
+        if self.oi_eff_long_q != 0 || self.oi_eff_short_q != 0 {
+            return Err(RiskError::CorruptState);
+        }
+
+        self.assert_public_postconditions()?;
+        Ok(())
     }
 
     /// Combined convenience: reconcile + terminal close if ready.
