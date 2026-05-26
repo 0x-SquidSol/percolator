@@ -333,6 +333,92 @@ fn proof_refund_single_account_with_position_resolves() {
 }
 
 // ============================================================================
+// Two-account bilateral — refund-mode resolution succeeds on a balanced
+// book (one long, one short, same magnitude). Exercises the per-account
+// loop iterating over multiple slots, the helper's with-position branch
+// on each, and the drain/finalize logic on both sides simultaneously.
+// ============================================================================
+
+/// On a Live market with two accounts holding mirrored positions (slot 0
+/// long, slot 1 short, symbolic equal magnitude), `resolve_market_refund_not_atomic`
+/// succeeds and produces a clean post-state on both accounts and both
+/// sides of the aggregate book. The per-account loop runs twice, detaching
+/// each position via `attach_effective_position(_, 0)`; the resolve body
+/// drains and finalizes both Long and Short sides through their
+/// `ResetPending → finalize_side_reset` sequences.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_refund_two_account_bilateral_resolves() {
+    let mut engine = build_symbolic_live_engine();
+
+    // Materialize slots 0 and 1 with symbolic-bounded deposits (independent
+    // amounts so the harness exercises the case where one trader is funded
+    // differently than their counterpart).
+    let deposit_a: u32 = kani::any();
+    let deposit_b: u32 = kani::any();
+    kani::assume(deposit_a >= 10_000 && deposit_a <= 1_000_000);
+    kani::assume(deposit_b >= 10_000 && deposit_b <= 1_000_000);
+    assert!(engine
+        .deposit_not_atomic(0u16, deposit_a as u128, DEFAULT_SLOT)
+        .is_ok());
+    assert!(engine
+        .deposit_not_atomic(1u16, deposit_b as u128, DEFAULT_SLOT)
+        .is_ok());
+
+    // Mirrored position pair: slot 0 long, slot 1 short, same symbolic
+    // magnitude. This is the realistic book shape — every long is matched
+    // by a short of equal size.
+    let basis: u32 = kani::any();
+    kani::assume(basis >= 1 && basis <= 1_000);
+    engine.set_position_basis_q(0, basis as i128).unwrap();
+    engine.set_position_basis_q(1, -(basis as i128)).unwrap();
+
+    // Canonical fresh-position ADL fields on both accounts.
+    engine.accounts[0].adl_a_basis = ADL_ONE;
+    engine.accounts[0].adl_k_snap = 0;
+    engine.accounts[0].adl_epoch_snap = engine.adl_epoch_long;
+    engine.accounts[1].adl_a_basis = ADL_ONE;
+    engine.accounts[1].adl_k_snap = 0;
+    engine.accounts[1].adl_epoch_snap = engine.adl_epoch_short;
+
+    // Preconditions: both accounts hold open positions, engine is Live.
+    assert!(engine.is_used(0) && engine.is_used(1));
+    assert!(engine.accounts[0].position_basis_q > 0);
+    assert!(engine.accounts[1].position_basis_q < 0);
+    assert!(matches!(engine.market_mode, MarketMode::Live));
+
+    let pre = RefundPreState::snapshot(&engine);
+    let pre_capital_a = engine.accounts[0].capital.get();
+    let pre_capital_b = engine.accounts[1].capital.get();
+    let pre_pnl_a = engine.accounts[0].pnl;
+    let pre_pnl_b = engine.accounts[1].pnl;
+
+    let now_slot = symbolic_monotone_slot(&engine);
+
+    assert!(engine.resolve_market_refund_not_atomic(now_slot).is_ok());
+
+    // Standard success baseline.
+    assert_refund_success_postconditions(&engine, &pre, now_slot);
+
+    // Per-account assertions on both accounts: slots stay used, positions
+    // detached, capital and pnl preserved.
+    assert!(engine.is_used(0) && engine.is_used(1));
+    assert!(engine.accounts[0].position_basis_q == 0);
+    assert!(engine.accounts[1].position_basis_q == 0);
+    assert!(engine.accounts[0].capital.get() == pre_capital_a);
+    assert!(engine.accounts[1].capital.get() == pre_capital_b);
+    assert!(engine.accounts[0].pnl == pre_pnl_a);
+    assert!(engine.accounts[1].pnl == pre_pnl_b);
+
+    // Aggregate: both sides drained fully — stored counts on both Long and
+    // Short are zero, which is jointly required by the engine's
+    // postcondition that OI on both sides reaches zero at resolve exit.
+    assert!(engine.stored_pos_count_long == 0);
+    assert!(engine.stored_pos_count_short == 0);
+}
+
+// ============================================================================
 // Empty-market preservation — refund-mode resolution does NOT touch the
 // fields documented as untouched by the contract. Catches refactors that
 // might erroneously write to these fields. Covers K-side state
