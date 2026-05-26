@@ -93,6 +93,10 @@ pub const MAX_ACCOUNTS: usize = 4096;
 pub const BITMAP_WORDS: usize = (MAX_ACCOUNTS + 63) / 64;
 pub const MAX_ROUNDING_SLACK: u128 = MAX_ACCOUNTS as u128;
 const _: () = assert!(MAX_ACCOUNTS.is_power_of_two());
+// Account indices are passed through u16 in several engine and matcher
+// entry points (e.g. `refund_detach_account(idx: u16)`). Make truncation
+// a build break if a future tier exceeds the u16 range.
+const _: () = assert!(MAX_ACCOUNTS <= u16::MAX as usize);
 
 // Liquidation Phase 1 budget is passed directly to keeper_crank_*.
 
@@ -9631,8 +9635,12 @@ impl RiskEngine {
     ///   a placeholder (refund mode has no settlement price, and the
     ///   per-account payout math never consults these fields once every
     ///   `position_basis_q == 0`).
-    /// - On any failure past the guard block, an `Err` propagates via `?`;
-    ///   per-account failures are atomic at the helper level.
+    /// - On any failure past the guard block, an `Err` propagates via `?`.
+    ///   On-chain atomicity is provided by Solana transaction abort: any
+    ///   partial state mutation by the per-account loop is reverted with
+    ///   the transaction. In off-chain contexts (Kani harnesses, stress
+    ///   tests, direct in-process callers) the post-`Err` engine state
+    ///   must be treated as observably-partial.
     ///
     /// # Errors
     ///
@@ -9673,6 +9681,16 @@ impl RiskEngine {
         // `attach_effective_position(_, 0)` path; accounts with no open
         // position are a no-op. Bounded by both the compile-time
         // `MAX_ACCOUNTS` and the runtime `params.max_accounts`.
+        //
+        // Phantom-dust note: the detach path accrues fractional remainder
+        // into `phantom_dust_potential_<side>_q` via
+        // `inc_phantom_dust_potential`. These accruals are inert under
+        // refund semantics — the Hunk-5 phantom-dust clear below handles
+        // sides whose `pre_stored == 0`; the
+        // `begin_full_drain_reset` / `finalize_side_reset` path handles
+        // sides that drained from non-zero stored counts; and
+        // `resolved_payout_ready = 0` (set below) defangs the
+        // resolved-payout-ratio consumer that would otherwise read dust.
         let cap = MAX_ACCOUNTS.min(self.params.max_accounts as usize);
         for i in 0..cap {
             if self.is_used(i) {
