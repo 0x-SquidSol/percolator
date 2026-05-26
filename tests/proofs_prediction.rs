@@ -248,6 +248,91 @@ fn proof_refund_single_account_no_position_resolves() {
 }
 
 // ============================================================================
+// Single-account with an open position — refund-mode resolution invokes the
+// helper's load-bearing branch: detach the open position at zero unrealized
+// PnL via `attach_effective_position(_, 0)`. Verifies the per-account state
+// after detach plus the standard success postconditions plus the
+// drain/finalize side-mode transition triggered by the populated side.
+// ============================================================================
+
+/// On a Live market with one account holding an open position (long or
+/// short, symbolic-sized), `resolve_market_refund_not_atomic` succeeds:
+/// the per-account loop visits the slot, `refund_detach_account` takes its
+/// with-position branch via `attach_effective_position(_, 0)`, and the
+/// resolve body's drain/finalize logic moves the affected side through
+/// `ResetPending` and `finalize_side_reset`. Post-call the account is
+/// still `is_used` with capital and pnl preserved, `position_basis_q`
+/// is zero, both sides of OI are zero, and both per-side stored counts
+/// are zero.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_refund_single_account_with_position_resolves() {
+    let mut engine = build_symbolic_live_engine();
+
+    // Materialize slot 0 with a sane symbolic-bounded deposit.
+    let deposit_amount: u32 = kani::any();
+    kani::assume(deposit_amount >= 10_000 && deposit_amount <= 1_000_000);
+    assert!(engine
+        .deposit_not_atomic(0u16, deposit_amount as u128, DEFAULT_SLOT)
+        .is_ok());
+
+    // Open a symbolic-bounded position. Side and magnitude are symbolic;
+    // ADL tracking fields use the canonical "fresh position" defaults
+    // (ADL_ONE basis, zero K-snap, current side epoch).
+    let side_long: bool = kani::any();
+    let basis: u32 = kani::any();
+    kani::assume(basis >= 1 && basis <= 1_000);
+    let signed_basis = if side_long {
+        basis as i128
+    } else {
+        -(basis as i128)
+    };
+    engine.set_position_basis_q(0, signed_basis).unwrap();
+    engine.accounts[0].adl_a_basis = ADL_ONE;
+    engine.accounts[0].adl_k_snap = 0;
+    engine.accounts[0].adl_epoch_snap = if side_long {
+        engine.adl_epoch_long
+    } else {
+        engine.adl_epoch_short
+    };
+
+    // Preconditions: account has an open position, engine is still Live.
+    assert!(engine.is_used(0));
+    assert!(engine.accounts[0].position_basis_q != 0);
+    assert!(matches!(engine.market_mode, MarketMode::Live));
+
+    let pre = RefundPreState::snapshot(&engine);
+    let pre_capital = engine.accounts[0].capital.get();
+    let pre_pnl = engine.accounts[0].pnl;
+
+    let now_slot = symbolic_monotone_slot(&engine);
+
+    assert!(engine.resolve_market_refund_not_atomic(now_slot).is_ok());
+
+    // Standard success baseline (mode, slots, sentinels, OI, pnl maturation).
+    assert_refund_success_postconditions(&engine, &pre, now_slot);
+
+    // With-position assertions.
+    //
+    // Per-account: detach completed cleanly. The slot stays `is_used` so
+    // the trader can later withdraw their capital through the existing
+    // terminal-close path; `position_basis_q` is zero; `capital` and `pnl`
+    // are preserved (refund-mode detach is zero-PnL).
+    assert!(engine.is_used(0));
+    assert!(engine.accounts[0].position_basis_q == 0);
+    assert!(engine.accounts[0].capital.get() == pre_capital);
+    assert!(engine.accounts[0].pnl == pre_pnl);
+
+    // Aggregate: per-side stored count is zero post-call (per-account
+    // decrement happened during the loop) and OI is zero (batch-zero in
+    // the resolve body). These are jointly required by the engine's
+    // resolve postcondition that OI on both sides reaches zero.
+    assert!(engine.stored_pos_count_long == 0);
+    assert!(engine.stored_pos_count_short == 0);
+}
+
+// ============================================================================
 // Empty-market preservation — refund-mode resolution does NOT touch the
 // fields documented as untouched by the contract. Catches refactors that
 // might erroneously write to these fields. Covers K-side state
