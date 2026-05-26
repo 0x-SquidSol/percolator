@@ -197,6 +197,56 @@ fn proof_refund_empty_market_resolves() {
 }
 
 // ============================================================================
+// Empty-market preservation — refund-mode resolution does NOT touch the
+// fields documented as untouched by the contract. Catches refactors that
+// might erroneously write to these fields. Covers K-side state
+// (`adl_coeff_*`), ADL multipliers (`adl_mult_*`), stale-account counters,
+// and the two bankrupt-close in-flight signals.
+// ============================================================================
+
+/// Refund mode promises NOT to touch `adl_coeff_long` / `adl_coeff_short`
+/// (the K-side state itself, distinct from the `resolved_k_*_terminal_delta`
+/// snapshot fields), `adl_mult_long` / `adl_mult_short`, the per-side
+/// stale-account counters, `active_close_present`, or
+/// `bankruptcy_hmax_lock_active` on the empty-market path. This harness
+/// pins those fields pre-call and asserts equality post-call so any future
+/// refactor that writes to one of them fails this proof.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_refund_empty_market_preserves_untouched_fields() {
+    let mut engine = build_symbolic_live_engine();
+    let pre = RefundPreState::snapshot(&engine);
+
+    // Extended snapshot of fields refund mode promises NOT to touch.
+    let pre_k_long = engine.adl_coeff_long;
+    let pre_k_short = engine.adl_coeff_short;
+    let pre_adl_mult_long = engine.adl_mult_long;
+    let pre_adl_mult_short = engine.adl_mult_short;
+    let pre_stale_long = engine.stale_account_count_long;
+    let pre_stale_short = engine.stale_account_count_short;
+    let pre_active_close = engine.active_close_present;
+    let pre_bankrupt_lock = engine.bankruptcy_hmax_lock_active;
+
+    let now_slot = symbolic_monotone_slot(&engine);
+
+    assert!(engine.resolve_market_refund_not_atomic(now_slot).is_ok());
+
+    // Standard success baseline (mode, slots, sentinels, OI, pnl).
+    assert_refund_success_postconditions(&engine, &pre, now_slot);
+
+    // Fields refund mode does NOT touch on the empty-market path.
+    assert!(engine.adl_coeff_long == pre_k_long);
+    assert!(engine.adl_coeff_short == pre_k_short);
+    assert!(engine.adl_mult_long == pre_adl_mult_long);
+    assert!(engine.adl_mult_short == pre_adl_mult_short);
+    assert!(engine.stale_account_count_long == pre_stale_long);
+    assert!(engine.stale_account_count_short == pre_stale_short);
+    assert!(engine.active_close_present == pre_active_close);
+    assert!(engine.bankruptcy_hmax_lock_active == pre_bankrupt_lock);
+}
+
+// ============================================================================
 // Precondition-rejection harnesses — each of the four guards at the head
 // of `resolve_market_refund_not_atomic` must reject with the documented
 // `Err` variant and leave the engine observably unchanged. The
