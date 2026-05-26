@@ -419,6 +419,106 @@ fn proof_refund_two_account_bilateral_resolves() {
 }
 
 // ============================================================================
+// End-to-end refund-then-close — proves the engine's reserve-shape invariant
+// holds across `resolve_market_refund_not_atomic` for every used account,
+// AND that the downstream `force_close_resolved_not_atomic` returns
+// `Closed(capital)` on the first call with the trader's deposit preserved.
+// Closes the audit-flagged gap on reserves consolidation after refund.
+// ============================================================================
+
+/// On a Live market with one account holding an open position, refund-mode
+/// resolution followed by `force_close_resolved_not_atomic(0)` produces
+/// a clean end-to-end refund:
+///
+/// 1. After the resolve returns Ok, the engine's reserve-shape invariant
+///    (`sched_remaining_q + pending_remaining_q == reserved_pnl`) holds
+///    for every account slot, used or unused — refund mode promises not
+///    to touch reserves, and this proof verifies it.
+/// 2. The downstream terminal-close call returns
+///    `ResolvedCloseResult::Closed(capital)` immediately (no
+///    ProgressOnly intermediate state). Capital equals the pre-refund
+///    deposit because refund-mode detach is zero-PnL.
+///
+/// This is the audit-flagged "reserves-shape conservation + terminal-
+/// close follow-through" pair that the planned harness sequence did not
+/// originally cover.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_refund_then_force_close_resolved_closes_cleanly() {
+    let mut engine = build_symbolic_live_engine();
+
+    // Materialize slot 0 and open a symbolic-side, symbolic-magnitude
+    // position. Same setup as the with-position resolve harness so the
+    // two are directly comparable.
+    let deposit_amount: u32 = kani::any();
+    kani::assume(deposit_amount >= 10_000 && deposit_amount <= 1_000_000);
+    assert!(engine
+        .deposit_not_atomic(0u16, deposit_amount as u128, DEFAULT_SLOT)
+        .is_ok());
+
+    let side_long: bool = kani::any();
+    let basis: u32 = kani::any();
+    kani::assume(basis >= 1 && basis <= 1_000);
+    let signed_basis = if side_long {
+        basis as i128
+    } else {
+        -(basis as i128)
+    };
+    engine.set_position_basis_q(0, signed_basis).unwrap();
+    engine.accounts[0].adl_a_basis = ADL_ONE;
+    engine.accounts[0].adl_k_snap = 0;
+    engine.accounts[0].adl_epoch_snap = if side_long {
+        engine.adl_epoch_long
+    } else {
+        engine.adl_epoch_short
+    };
+
+    let pre_capital = engine.accounts[0].capital.get();
+    let pre = RefundPreState::snapshot(&engine);
+    let now_slot = symbolic_monotone_slot(&engine);
+
+    // Phase 1: refund-mode resolve. Standard success baseline applies.
+    assert!(engine.resolve_market_refund_not_atomic(now_slot).is_ok());
+    assert_refund_success_postconditions(&engine, &pre, now_slot);
+
+    // Reserve-shape invariant holds for every slot post-refund. For unused
+    // slots the three fields are all zero so the equality is trivial; for
+    // slot 0 the equality is the actual invariant the engine maintains
+    // between scheduled / pending reserves and the matured-positive-PnL
+    // bucket.
+    let cap = MAX_ACCOUNTS.min(engine.params.max_accounts as usize);
+    let mut i = 0;
+    while i < cap {
+        let s = engine.accounts[i].sched_remaining_q;
+        let p = engine.accounts[i].pending_remaining_q;
+        let r = engine.accounts[i].reserved_pnl;
+        assert!(
+            s.checked_add(p).map(|sum| sum == r).unwrap_or(false),
+            "reserve-shape invariant must hold post-refund for every slot"
+        );
+        i += 1;
+    }
+
+    // Phase 2: terminal close. After refund, the account has
+    // `position_basis_q == 0` (helper detached) and `pnl == 0` (refund-mode
+    // detach is zero-PnL), so the function's ProgressOnly fast-paths do
+    // not fire and we land on the terminal-close branch immediately.
+    let close_result = engine.force_close_resolved_not_atomic(0).unwrap();
+    match close_result {
+        ResolvedCloseResult::Closed(c) => {
+            assert!(
+                c == pre_capital,
+                "terminal-close capital must equal the pre-refund deposit"
+            );
+        }
+        ResolvedCloseResult::ProgressOnly => {
+            panic!("force_close must close on first call for a refunded zero-PnL account");
+        }
+    }
+}
+
+// ============================================================================
 // Empty-market preservation — refund-mode resolution does NOT touch the
 // fields documented as untouched by the contract. Catches refactors that
 // might erroneously write to these fields. Covers K-side state
