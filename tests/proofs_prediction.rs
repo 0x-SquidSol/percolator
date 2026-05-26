@@ -197,6 +197,57 @@ fn proof_refund_empty_market_resolves() {
 }
 
 // ============================================================================
+// Single-account, no open position — refund-mode resolution succeeds on a
+// materialized account whose position basis is zero. The per-account loop
+// runs once, `refund_detach_account` short-circuits (no position to detach),
+// and the engine reaches Resolved with the account observably intact.
+// ============================================================================
+
+/// On a Live market with one materialized account that has no open position
+/// (deposit only, no trade), `resolve_market_refund_not_atomic` succeeds
+/// and leaves the account intact: still `is_used`, `position_basis_q == 0`,
+/// `capital` and `pnl` preserved. The per-account loop visits the slot but
+/// the helper's no-position branch is taken because `position_basis_q == 0`.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_refund_single_account_no_position_resolves() {
+    let mut engine = build_symbolic_live_engine();
+
+    // Materialize slot 0 via a symbolic deposit. No trade happens, so the
+    // account has capital but no open position.
+    let deposit_amount: u32 = kani::any();
+    kani::assume(deposit_amount >= 1_000 && deposit_amount <= 1_000_000);
+    assert!(engine
+        .deposit_not_atomic(0u16, deposit_amount as u128, DEFAULT_SLOT)
+        .is_ok());
+    assert!(engine.is_used(0));
+    assert!(engine.accounts[0].position_basis_q == 0);
+
+    let pre = RefundPreState::snapshot(&engine);
+    let pre_capital = engine.accounts[0].capital.get();
+    let pre_pnl = engine.accounts[0].pnl;
+    let pre_position_basis = engine.accounts[0].position_basis_q;
+
+    let now_slot = symbolic_monotone_slot(&engine);
+
+    assert!(engine.resolve_market_refund_not_atomic(now_slot).is_ok());
+
+    // Standard success baseline (mode, slots, sentinels, OI, pnl maturation).
+    assert_refund_success_postconditions(&engine, &pre, now_slot);
+
+    // Per-account assertions: slot stays used, no position was created or
+    // destroyed (it was zero pre-call), capital and pnl are preserved.
+    // These catch any future refactor that erroneously touches a
+    // no-position account during the refund-detach loop.
+    assert!(engine.is_used(0));
+    assert!(engine.accounts[0].position_basis_q == pre_position_basis);
+    assert!(engine.accounts[0].position_basis_q == 0);
+    assert!(engine.accounts[0].capital.get() == pre_capital);
+    assert!(engine.accounts[0].pnl == pre_pnl);
+}
+
+// ============================================================================
 // Empty-market preservation — refund-mode resolution does NOT touch the
 // fields documented as untouched by the contract. Catches refactors that
 // might erroneously write to these fields. Covers K-side state
