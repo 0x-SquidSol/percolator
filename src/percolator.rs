@@ -9711,6 +9711,25 @@ impl RiskEngine {
         self.oi_eff_long_q = 0;
         self.oi_eff_short_q = 0;
 
+        // PORT-parity with `resolve_market_not_atomic` (Hunk 5 / ENG-PORT-5a):
+        // phantom-dust zero on zero-stored sides. Mirrors the canonical pattern
+        // so refund-mode resolution cannot carry stale phantom-dust into the
+        // resolved post-state. Without this, markets with residual
+        // `phantom_dust_potential_<side>_q > 0` on a side whose
+        // `stored_pos_count` was zero pre-call can fail
+        // `assert_public_postconditions` spuriously. Non-zero-stored sides
+        // are reconciled by the `begin_full_drain_reset` /
+        // `finalize_side_reset` path below, which owns dust handling on the
+        // populated path.
+        if pre_stored_long == 0 {
+            self.set_phantom_dust_certified(Side::Long, 0);
+            self.set_phantom_dust_potential(Side::Long, 0);
+        }
+        if pre_stored_short == 0 {
+            self.set_phantom_dust_certified(Side::Short, 0);
+            self.set_phantom_dust_potential(Side::Short, 0);
+        }
+
         // Drain/finalize sides exactly as the canonical resolve does, gated
         // on pre-call stored counts (zero-stored sides did not need a drain).
         if pre_mode_long != SideMode::ResetPending && pre_stored_long > 0 {
