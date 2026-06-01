@@ -626,14 +626,20 @@ fn proof_goal27_finalize_path_independent() {
     let is_whole = h_snapshot_den > 0 && h_snapshot_num == h_snapshot_den;
     assert!(is_whole);
 
+    let mut _ctx_snap = percolator::InstructionContext::new();
     let finalized_a = engine.finalize_touched_account_post_live_with_snapshot(
         ctx1.touched_accounts[0] as usize,
         is_whole,
+        false,
+        &mut _ctx_snap,
     );
     assert!(finalized_a.is_ok());
+    let mut _ctx_snap2 = percolator::InstructionContext::new();
     let finalized_b = engine.finalize_touched_account_post_live_with_snapshot(
         ctx1.touched_accounts[1] as usize,
         is_whole,
+        false,
+        &mut _ctx_snap2,
     );
     assert!(finalized_b.is_ok());
 

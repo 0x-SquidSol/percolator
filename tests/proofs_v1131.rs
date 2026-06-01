@@ -1220,3 +1220,63 @@ fn proof_deposit_nonflat_no_sweep_no_resolve() {
     );
     assert!(engine.check_conservation());
 }
+
+// ############################################################################
+// Wave 12-M — keeper-crank funding-rate boundary harnesses (toly upstream port)
+// ############################################################################
+
+/// keeper_crank_not_atomic accepts the configured positive funding-rate
+/// boundary at the production crank boundary.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_keeper_crank_accepts_positive_boundary_funding_rate_on_prod_code() {
+    let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let supplied_rate = engine.params.max_abs_funding_e9_per_slot as i128;
+
+    let result = engine.keeper_crank_not_atomic(
+        DEFAULT_SLOT + 1,
+        DEFAULT_ORACLE,
+        &[],
+        0,
+        supplied_rate,
+        0,
+        100,
+        None,
+        0,
+    );
+    assert!(result.is_ok());
+    assert_eq!(engine.last_market_slot, DEFAULT_SLOT + 1);
+    kani::cover!(
+        result.is_ok() && engine.last_market_slot == DEFAULT_SLOT + 1,
+        "keeper accepts positive configured funding-rate boundary"
+    );
+}
+
+/// keeper_crank_not_atomic accepts the configured negative funding-rate
+/// boundary at the production crank boundary.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_keeper_crank_accepts_negative_boundary_funding_rate_on_prod_code() {
+    let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let supplied_rate = -(engine.params.max_abs_funding_e9_per_slot as i128);
+
+    let result = engine.keeper_crank_not_atomic(
+        DEFAULT_SLOT + 1,
+        DEFAULT_ORACLE,
+        &[],
+        0,
+        supplied_rate,
+        0,
+        100,
+        None,
+        0,
+    );
+    assert!(result.is_ok());
+    assert_eq!(engine.last_market_slot, DEFAULT_SLOT + 1);
+    kani::cover!(
+        result.is_ok() && engine.last_market_slot == DEFAULT_SLOT + 1,
+        "keeper accepts negative configured funding-rate boundary"
+    );
+}

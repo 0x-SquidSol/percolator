@@ -177,7 +177,7 @@ fn test_e2e_complete_user_journey() {
         engine
             .touch_account_live_local(alice as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     // The key invariant is conservation
@@ -211,7 +211,7 @@ fn test_e2e_complete_user_journey() {
         engine
             .touch_account_live_local(alice as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     // Alice withdraws some capital
@@ -273,19 +273,20 @@ fn test_e2e_funding_complete_cycle() {
     let alice_cap_before = engine.accounts[alice as usize].capital.get();
     let bob_cap_before = engine.accounts[bob as usize].capital.get();
 
-    // Apply a positive funding rate: longs pay shorts
-    // v12.16.4: rate passed directly to accrue_market_to via keeper_crank
+    // Apply a positive funding rate: longs pay shorts.
+    // Use rr_touch_limit=64 so the crank can make protective progress (required
+    // when equity_active_accrual=true under the toly-correct bounded-accrual path).
     engine.advance_slot(1);
     let slot1 = engine.current_slot;
     engine
-        .keeper_crank_not_atomic(slot1, oracle_price, &[], 64, 5_000i128, 0, 100, None, 0)
+        .keeper_crank_not_atomic(slot1, oracle_price, &[], 64, 5_000i128, 0, 100, None, 64)
         .unwrap();
 
     // Advance time so next accrue_market_to applies funding.
     engine.advance_slot(20);
     let slot2 = engine.current_slot;
 
-    // This crank accrues the market (which applies 20 slots of funding at rate 500)
+    // This crank accrues the market (which applies 20 slots of funding at rate 5000)
     // then touches both accounts (settle_side_effects realizes the K delta into PnL,
     // then settle_losses transfers negative PnL from capital).
     engine
@@ -298,7 +299,7 @@ fn test_e2e_funding_complete_cycle() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .unwrap();
 
@@ -400,11 +401,13 @@ fn test_e2e_negative_funding_rate() {
     let alice_cap_before = engine.accounts[alice as usize].capital.get();
     let bob_cap_before = engine.accounts[bob as usize].capital.get();
 
-    // Store negative rate: shorts pay longs (-500 bps/slot)
+    // Apply negative rate: shorts pay longs (-5000 bps/slot).
+    // Use rr_touch_limit=64 so the crank can make protective progress (required
+    // when equity_active_accrual=true under the toly-correct bounded-accrual path).
     engine.advance_slot(1);
     let slot1 = engine.current_slot;
     engine
-        .keeper_crank_not_atomic(slot1, oracle_price, &[], 64, -5_000i128, 0, 100, None, 0)
+        .keeper_crank_not_atomic(slot1, oracle_price, &[], 64, -5_000i128, 0, 100, None, 64)
         .unwrap();
 
     // Advance and settle
@@ -420,7 +423,7 @@ fn test_e2e_negative_funding_rate() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .unwrap();
 

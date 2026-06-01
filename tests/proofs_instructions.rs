@@ -697,7 +697,7 @@ fn t11_52_touch_account_full_restart_fee_seniority() {
         engine
             .touch_account_live_local(idx as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&mut ctx).unwrap();
     }
 
     assert!(engine.accounts[idx as usize].adl_k_snap == engine.adl_coeff_long);
@@ -1606,7 +1606,8 @@ fn proof_flat_close_shortfall_non_worsening() {
                 &0,
                 buffer_pre_equal,
                 0,
-                0
+                0,
+                false,
             )
             .is_ok(),
         "flat close may leave negative raw equity when shortfall does not worsen"
@@ -1622,7 +1623,8 @@ fn proof_flat_close_shortfall_non_worsening() {
                 &0,
                 buffer_pre_equal,
                 0,
-                0
+                0,
+                false,
             ),
             Err(RiskError::Undercollateralized)
         ),
@@ -1675,7 +1677,8 @@ fn proof_solvent_flat_close_succeeds() {
                 &new_eff_a,
                 buffer_pre,
                 0,
-                0
+                0,
+                false,
             )
             .is_ok(),
         "solvent long flat close must pass fee-neutral shortfall check"
@@ -1689,7 +1692,8 @@ fn proof_solvent_flat_close_succeeds() {
                 &new_eff_b,
                 buffer_pre,
                 0,
-                0
+                0,
+                false,
             )
             .is_ok(),
         "solvent short flat close must pass fee-neutral shortfall check"
@@ -2113,8 +2117,9 @@ fn proof_property_50_flat_only_auto_conversion() {
         engine.accounts[a as usize].position_basis_q != 0,
         "account must still have open position"
     );
+    let mut _ctx_snap = percolator::InstructionContext::new();
     engine
-        .finalize_touched_account_post_live_with_snapshot(a as usize, true)
+        .finalize_touched_account_post_live_with_snapshot(a as usize, true, false, &mut _ctx_snap)
         .unwrap();
     assert!(
         engine.accounts[a as usize].capital.get() == cap_before,
@@ -2142,7 +2147,8 @@ fn proof_property_50_flat_only_auto_conversion() {
         flat.accounts[a as usize].position_basis_q == 0,
         "flat branch fixture must be flat"
     );
-    flat.finalize_touched_account_post_live_with_snapshot(a as usize, true)
+    let mut _ctx_snap2 = percolator::InstructionContext::new();
+    flat.finalize_touched_account_post_live_with_snapshot(a as usize, true, false, &mut _ctx_snap2)
         .unwrap();
     assert!(
         flat.accounts[a as usize].capital.get() == cap_before + released_before,
@@ -2627,4 +2633,57 @@ fn v19_accrue_market_envelope_enforces_goal52_bound() {
     // State unchanged on rejection.
     assert_eq!(engine.last_oracle_price, p_last as u64);
     assert_eq!(engine.last_market_slot, 0);
+}
+
+// ############################################################################
+// Wave 12-M — dynamic trade-fee cap harness (toly upstream port)
+// ############################################################################
+
+/// Trade-fee bps exceeding `max_trading_fee_bps` must reject pre-mutation
+/// (atomic), leaving vault, c_tot, insurance, both capital balances, and
+/// both position basis_q unchanged.
+#[kani::proof]
+#[kani::unwind(12)]
+#[kani::solver(cadical)]
+fn proof_dynamic_trade_fee_above_cap_rejects_before_mutation() {
+    let mut params = zero_fee_params();
+    params.max_trading_fee_bps = 10;
+    let mut engine = RiskEngine::new_with_market(params, DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(a, 100_000, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(b, 100_000, DEFAULT_SLOT).unwrap();
+
+    let vault_before = engine.vault.get();
+    let c_tot_before = engine.c_tot.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let a_cap_before = engine.accounts[a as usize].capital.get();
+    let b_cap_before = engine.accounts[b as usize].capital.get();
+
+    let trade_result = engine.execute_trade_not_atomic(
+        a,
+        b,
+        DEFAULT_ORACLE,
+        DEFAULT_SLOT,
+        POS_SCALE as i128,
+        DEFAULT_ORACLE,
+        0i128,
+        11,
+        0,
+        100,
+        None,
+    );
+
+    assert_eq!(trade_result, Err(RiskError::Overflow));
+    assert_eq!(engine.vault.get(), vault_before);
+    assert_eq!(engine.c_tot.get(), c_tot_before);
+    assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+    assert_eq!(engine.accounts[a as usize].capital.get(), a_cap_before);
+    assert_eq!(engine.accounts[b as usize].capital.get(), b_cap_before);
+    assert_eq!(engine.accounts[a as usize].position_basis_q, 0);
+    assert_eq!(engine.accounts[b as usize].position_basis_q, 0);
+    kani::cover!(
+        engine.is_used(a as usize) && engine.is_used(b as usize),
+        "fee cap rejection is checked on real materialized trade parties"
+    );
 }

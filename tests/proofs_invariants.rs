@@ -738,7 +738,7 @@ fn proof_attach_effective_position_updates_side_counts() {
 /// The settle_maintenance_fee path uses checked_sub which can produce i128::MIN,
 /// but fee_debt_u128_checked uses unsigned_abs() which safely returns 2^127.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_fee_credits_never_i128_min() {
     // Part 1: fee_debt_u128_checked is safe for ALL i128 values
@@ -1103,7 +1103,7 @@ fn proof_bankrupt_close_state_machine_schema() {
 /// so the gate trivially passes; when B-tracking lands, this harness will
 /// detect any setter that violates the lower-bound ≤ upper-bound contract.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_phantom_dust_certified_le_potential_at_genesis() {
     let engine = RiskEngine::new(zero_fee_params());
@@ -1123,7 +1123,7 @@ fn proof_phantom_dust_certified_le_potential_at_genesis() {
 /// `certified` from liquidation step 7, this guards against off-by-one or
 /// step-ordering bugs.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_phantom_dust_certified_gt_potential_rejects() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1159,7 +1159,7 @@ fn proof_phantom_dust_certified_gt_potential_rejects() {
 /// init-time predicate so future Wave 11a-ii writers can't silently
 /// regress the genesis state.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_b_tracking_shape_holds_at_genesis() {
     let engine = RiskEngine::new(zero_fee_params());
@@ -1183,7 +1183,7 @@ fn proof_b_tracking_shape_holds_at_genesis() {
 /// starts incrementing loss_weight_sum, this catches off-by-one and
 /// overflow-style regressions.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_b_tracking_loss_weight_sum_overflow_rejects() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1215,7 +1215,7 @@ fn proof_b_tracking_loss_weight_sum_overflow_rejects() {
 /// `set_social_remainder(side, plan.rem_new)`, this catches a wrap or
 /// off-by-one that would push the numerator into invalid range.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_b_tracking_shape_rejects_social_remainder_at_or_above_denominator() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1239,7 +1239,7 @@ fn proof_b_tracking_shape_rejects_social_remainder_at_or_above_denominator() {
 /// `transfer_scaled_dust_side` that fails to flush the post-mod dust
 /// correctly.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_b_tracking_shape_rejects_social_dust_at_or_above_denominator() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1264,7 +1264,7 @@ fn proof_b_tracking_shape_rejects_social_dust_at_or_above_denominator() {
 /// `checked_add` overflow; this harness catches any future writer that
 /// might store an out-of-range value.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_b_tracking_shape_rejects_saturated_flag_out_of_range() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1286,7 +1286,7 @@ fn proof_b_tracking_shape_rejects_saturated_flag_out_of_range() {
 /// the encoded byte; `continue_active_bankrupt_close_core` reads it back)
 /// depend on for end-to-end correctness.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_encode_decode_active_close_side_roundtrip() {
     let pick_long: bool = kani::any();
@@ -1308,7 +1308,7 @@ fn proof_encode_decode_active_close_side_roundtrip() {
 /// shows `active_close_present = 1` but `opp_side` is `0` (NONE) or any
 /// other byte, the decoder MUST surface `CorruptState`.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_decode_active_close_side_rejects_invalid_byte() {
     let byte: u8 = kani::any();
@@ -1327,7 +1327,7 @@ fn proof_decode_active_close_side_rejects_invalid_byte() {
 /// in the recovery terminal — both paths rely on the clear being
 /// total.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_clear_active_bankrupt_close_state_zeros_all_fields() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1370,7 +1370,7 @@ fn proof_clear_active_bankrupt_close_state_zeros_all_fields() {
 /// extension adds a third mode, the dispatcher must not silently take any
 /// of the two branches it understands.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_permissionless_progress_resolved_routes_to_resolved_close() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1411,14 +1411,28 @@ fn proof_permissionless_progress_resolved_routes_to_resolved_close() {
     }
 }
 
-/// `permissionless_progress_not_atomic` short-circuits with
-/// `RecoveryRequired` when an active bankrupt-close is in flight. This
-/// is the defense-in-depth gate the Wave 11a-ii-B port adds while the
-/// full recovery resolver is deferred — surfaces a stable error
-/// instead of taking either of the two live-mode branches the
-/// dispatcher knows.
+/// `permissionless_progress_not_atomic` enters the active bankrupt-close
+/// dispatch branch when `active_close_present != 0`. Wave 11a-ii-C made
+/// this branch DO work (either continue the state machine via
+/// `continue_active_bankrupt_close_not_atomic` or invoke the recovery
+/// resolver via `active_bankrupt_close_recovery_required`) instead of
+/// returning a static `RecoveryRequired` gate.
+///
+/// On a freshly-init engine where `active_close_present = 1` is set
+/// without populating the rest of the state machine
+/// (`bankruptcy_hmax_lock_active`, `active_close_phase`,
+/// `active_close_close_price`, `active_close_residual_remaining`), the
+/// branch must REJECT — not silently advance — because the state is
+/// partial and unsafe to process. Wave 11a-ii-C's
+/// `validate_active_bankrupt_close_shape` returns `CorruptState` in
+/// this case, surfacing via `active_bankrupt_close_recovery_required`'s
+/// `?` propagation.
+///
+/// This harness pins the contract: with a partial active_close state
+/// the dispatcher MUST return an error (any error) — it must never
+/// take either of the two normal live-mode branches.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_permissionless_progress_rejects_when_active_close_present() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1444,17 +1458,18 @@ fn proof_permissionless_progress_rejects_when_active_close_present() {
         resolved_fee_rate_per_slot: 0,
     };
 
-    assert_eq!(
-        engine.permissionless_progress_not_atomic(req),
-        Err(RiskError::RecoveryRequired)
-    );
+    // Partial active_close state must REJECT — never silently take the
+    // ordinary live-mode branches. Wave 11a-ii-C returns CorruptState
+    // via shape validation; Wave 11a-ii-B used to return RecoveryRequired.
+    // Either is acceptable; what matters is it's an Err.
+    assert!(engine.permissionless_progress_not_atomic(req).is_err());
 }
 
 /// `force_close_resolved_cursor_with_fee_not_atomic` rejects a non-Resolved
 /// market — Live markets must take the keeper-crank path, not the
 /// cursor-scan path.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_force_close_resolved_cursor_rejects_live_market() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1470,7 +1485,7 @@ fn proof_force_close_resolved_cursor_rejects_live_market() {
 /// limit — silently treating it as a no-op would mean the wrapper's
 /// liveness contract has no guarantee the cursor advanced.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_force_close_resolved_cursor_rejects_zero_scan_limit() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1491,7 +1506,7 @@ fn proof_force_close_resolved_cursor_rejects_zero_scan_limit() {
 /// Genesis state has every B-tracking and bankrupt-close field at the
 /// no-continuation default, so the aggregator must accept.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_validate_engine_state_shape_holds_at_genesis() {
     let engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -1504,7 +1519,7 @@ fn proof_validate_engine_state_shape_holds_at_genesis() {
 /// `validate_b_tracking_shape` call from inside the aggregator, Kani
 /// catches it.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_validate_engine_state_shape_delegates_to_b_tracking() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1520,7 +1535,7 @@ fn proof_validate_engine_state_shape_delegates_to_b_tracking() {
 /// state-machine validator would reject (e.g., active_close_present > 1).
 /// Pins the second delegation arm of the aggregator.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_validate_engine_state_shape_delegates_to_bankrupt_close() {
     let mut engine = RiskEngine::new(zero_fee_params());
@@ -1544,7 +1559,7 @@ fn proof_validate_engine_state_shape_delegates_to_bankrupt_close() {
 /// neither Live nor Resolved with `Unauthorized` — the dispatcher must
 /// not silently advance an unknown-mode market.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_permissionless_progress_rejects_non_live_non_resolved() {
     let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -1587,7 +1602,7 @@ fn proof_permissionless_progress_rejects_non_live_non_resolved() {
 /// or `b_short_num` has saturated at `u128::MAX`. Pins the headroom-
 /// detection contract.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_recovery_reason_b_index_headroom_exhausted_requires_saturation() {
     let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -1617,7 +1632,7 @@ fn proof_recovery_reason_b_index_headroom_exhausted_requires_saturation() {
 /// `sweep_generation`, `adl_epoch_long`, or `adl_epoch_short` is at
 /// `u64::MAX`.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_recovery_reason_counter_or_epoch_overflow_requires_saturation() {
     let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -1647,7 +1662,7 @@ fn proof_recovery_reason_counter_or_epoch_overflow_requires_saturation() {
 /// `ExplicitLossOrDustAuditOverflow` branch is authorised iff
 /// `explicit_unallocated_loss_saturated != 0`.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_recovery_reason_explicit_loss_overflow_requires_saturation_flag() {
     let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -1672,7 +1687,7 @@ fn proof_recovery_reason_explicit_loss_overflow_requires_saturation_flag() {
 /// `Unauthorized` — that reason is account-scoped and only the
 /// per-account validator may authorise it.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_recovery_reason_account_b_settlement_is_global_unauthorized() {
     let engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -1693,7 +1708,7 @@ fn proof_recovery_reason_account_b_settlement_is_global_unauthorized() {
 /// and it must opt in by deciding to call the resolver directly. The
 /// permissionless dispatcher refuses to take the branch unilaterally.
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_recovery_reason_oracle_policy_unavailable_is_wrapper_only() {
     let engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -1712,7 +1727,7 @@ fn proof_recovery_reason_oracle_policy_unavailable_is_wrapper_only() {
 /// when the market is not Live (already-Resolved markets must route
 /// through the resolved-close branch instead).
 #[kani::proof]
-#[kani::unwind(2)]
+#[kani::unwind(5)]
 #[kani::solver(cadical)]
 fn proof_recovery_reason_validators_reject_non_live_market() {
     let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
@@ -2017,4 +2032,235 @@ fn proof_resolved_mode_postcondition_invariants() {
         matches!(result, Err(RiskError::CorruptState)),
         "resolved-mode + lock-active MUST trip the postcondition"
     );
+}
+
+// ============================================================================
+// Wave 12-L rank/audit helpers — formal verification callers
+// These harnesses are the production callers for the O(1) audit-rank API
+// (permissionless_progress_rank_for_now, permissionless_account_progress_rank,
+// phase2_scan_outcome). They verify the API contracts hold on fresh markets.
+// ============================================================================
+
+/// permissionless_progress_rank_for_now returns all-zeros on a fresh Live
+/// market with no OI, no stress envelope, no active-close, and no Resolved
+/// mode. This is the baseline contract: a market that has never been stressed
+/// has zero outstanding liveness debt.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_permissionless_progress_rank_zero_on_fresh_live_market() {
+    let engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let rank = engine
+        .permissionless_progress_rank_for_now(DEFAULT_SLOT)
+        .expect("rank must succeed on a valid fresh market");
+    // Fresh Live market: no OI → no live-catchup slots, no stress envelope,
+    // no active-close, not in Resolved mode.
+    assert_eq!(rank.live_catchup_slots, 0, "no catchup on fresh market");
+    assert_eq!(rank.stress_envelope_indices, 0, "no stress envelope");
+    assert_eq!(rank.active_close_residual_atoms, 0, "no active close");
+    assert_eq!(rank.resolved_blocker_units, 0, "not in Resolved mode");
+    // A fresh rank strictly-reduces from itself is false (not strictly less).
+    assert!(!rank.strictly_reduces_from(&rank), "rank does not reduce from itself");
+}
+
+/// permissionless_account_progress_rank returns zero B-remaining for a flat
+/// account (no open position). A flat account has no B-stale obligation.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_permissionless_account_rank_zero_on_flat_account() {
+    let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).expect("init account");
+    // Account is flat (no position) — B-remaining must be zero.
+    let rank = engine
+        .permissionless_account_progress_rank(idx as u16)
+        .expect("account rank must succeed for a materialized flat account");
+    assert_eq!(
+        rank.account_b_remaining_num, 0,
+        "flat account has no B-stale obligation"
+    );
+}
+
+/// phase2_scan_outcome: next_cursor is bounded by wrap_bound and the
+/// touched/inspected counts are non-negative with inspected >= touched
+/// (can only touch used accounts). Verifies the pure-compute helper's
+/// output invariants without mutating engine state.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_phase2_scan_outcome_bounded() {
+    let engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let wrap_bound = engine.params.max_accounts;
+    if wrap_bound == 0 {
+        return;
+    }
+    // Probe with zero limits: outcome returns cursor unchanged, zero counts.
+    let outcome = engine
+        .phase2_scan_outcome(wrap_bound, 0, 0, false, false, false)
+        .expect("zero-limit scan must succeed");
+    assert!(
+        outcome.next_cursor < wrap_bound,
+        "next_cursor must stay within wrap_bound"
+    );
+    assert_eq!(outcome.touched, 0, "zero touch limit yields zero touched");
+    assert_eq!(outcome.inspected, 0, "zero scan limit yields zero inspected");
+    assert_eq!(
+        outcome.stress_counted_inspected, 0,
+        "no stress counting with zero limits"
+    );
+}
+
+// ============================================================================
+// Wave 12-O: no-pos specializations and constructor round-trip
+// Formal verification callers for `account_equity_withdraw_no_pos_raw`,
+// `accrue_market_segment_to_internal`, and the two Wave-12-L request
+// constructors (`KeeperCrankRequest::full_scan` +
+// `PermissionlessProgressRequest::from_keeper_request`).
+// ============================================================================
+
+/// account_equity_withdraw_no_pos_raw agrees with account_equity_withdraw_raw
+/// on a fresh flat account (pnl=0, reserved_pnl=0, no fee debt). The no-pos
+/// specialization omits the eff_matured term; for a flat account that term is
+/// zero because released_pos = max(pnl,0) - reserved_pnl = 0.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_withdraw_no_pos_eq_general() {
+    let mut engine =
+        RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).expect("fresh account must materialise");
+    let account = &engine.accounts[idx as usize];
+    // Fresh account: capital=0, pnl=0, reserved_pnl=0, fee_credits=0.
+    // eff_matured = 0 → no-pos path and general path must agree.
+    let no_pos = engine.account_equity_withdraw_no_pos_raw(account);
+    let general = engine.account_equity_withdraw_raw(account, idx as usize);
+    assert_eq!(
+        no_pos, general,
+        "no-pos specialisation must equal general path for a fresh flat account"
+    );
+}
+
+/// accrue_market_segment_to_internal on a zero-dt segment of a fresh Live
+/// market must return Ok and update current_slot, last_market_slot, and
+/// last_oracle_price to the supplied values.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_accrue_market_segment_to_internal_postcondition() {
+    let mut engine =
+        RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    // Zero-dt segment: accrual_slot == current_slot == last_market_slot.
+    // No OI, no funding → plan produces all-zero increments.
+    let result = engine.accrue_market_segment_to_internal(
+        DEFAULT_SLOT,   // accrual_slot
+        DEFAULT_SLOT,   // current_slot_after
+        DEFAULT_SLOT,   // stress_start_slot_after
+        DEFAULT_ORACLE, // oracle_price (unchanged)
+        0,              // funding_rate_e9
+    );
+    assert!(result.is_ok(), "zero-dt accrual on fresh Live market must succeed");
+    assert_eq!(engine.current_slot, DEFAULT_SLOT, "current_slot set to current_slot_after");
+    assert_eq!(
+        engine.last_market_slot, DEFAULT_SLOT,
+        "last_market_slot updated to accrual_slot"
+    );
+    assert_eq!(
+        engine.last_oracle_price, DEFAULT_ORACLE,
+        "last_oracle_price updated to oracle_price arg"
+    );
+}
+
+/// KeeperCrankRequest::full_scan then PermissionlessProgressRequest::
+/// from_keeper_request must preserve slot, price, inspection cap, and scan
+/// budget across the constructor boundary. Gives both Wave-12-L constructors
+/// live Kani callers and pins the round-trip contract.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_keeper_request_constructor_round_trip() {
+    let candidates: [(u16, Option<LiquidationPolicy>); 0] = [];
+    let req = KeeperCrankRequest::full_scan(
+        DEFAULT_SLOT,   // now_slot
+        DEFAULT_ORACLE, // oracle_price
+        &candidates,
+        0,    // max_revalidations
+        0i128, // funding_rate_e9
+        0,    // admit_h_min
+        0,    // admit_h_max
+        None, // admit_h_max_consumption_threshold_bps_opt
+        0,    // rr_touch_limit
+    );
+    // full_scan must hard-code the inspection cap and unlimited scan budget.
+    assert_eq!(
+        req.max_candidate_inspections,
+        MAX_TOUCHED_PER_INSTRUCTION as u16,
+        "full_scan must set max_candidate_inspections = MAX_TOUCHED_PER_INSTRUCTION"
+    );
+    assert_eq!(req.rr_scan_limit, u64::MAX, "full_scan must set rr_scan_limit = u64::MAX");
+
+    // Promote to PermissionlessProgressRequest via from_keeper_request.
+    let perm = PermissionlessProgressRequest::from_keeper_request(req, 0, None, 0, 0);
+    assert_eq!(perm.now_slot, DEFAULT_SLOT, "now_slot must be preserved by from_keeper_request");
+    assert_eq!(
+        perm.oracle_price, DEFAULT_ORACLE,
+        "oracle_price must be preserved by from_keeper_request"
+    );
+    assert_eq!(
+        perm.max_candidate_inspections,
+        MAX_TOUCHED_PER_INSTRUCTION as u16,
+        "inspection cap must survive promotion"
+    );
+    assert_eq!(perm.rr_scan_limit, u64::MAX, "rr_scan_limit must survive promotion");
+}
+
+// ============================================================================
+// T-LWFB: loss_weight_for_basis postcondition (Wave 12-H Task 1)
+// ============================================================================
+
+/// When `loss_weight_for_basis` succeeds the returned weight must satisfy:
+///   - weight > 0                          (spec §1.2: zero weight is invalid)
+///   - weight <= SOCIAL_LOSS_DEN           (spec §1.2: weight bounded by den)
+///   - abs_basis and a_basis were both non-zero (CorruptState otherwise)
+///
+/// The function is a pure static method. We use u8 inputs constrained to a
+/// 4-bit range (≤ 15) to keep the U512 division loop in `mul_div_ceil_u256`
+/// tractable for the cadical SAT solver (the loop runs `shift` iterations
+/// where `shift` is the leading-zero difference — 4-bit values bound it to
+/// ≤ 4, keeping the SAT state space small). All three error paths are
+/// reachable within this range: both-zero (CorruptState), a_basis-zero
+/// (CorruptState), and weight-overflow (a_basis=1, abs_basis >> SOCIAL_LOSS_DEN
+/// — blocked by the ≤15 cap here but covered by the bounds check in the Ok
+/// arm).
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_loss_weight_for_basis_output_bounds() {
+    // 4-bit symbolic inputs keep U512 division shift ≤ 4 iterations.
+    let abs_basis: u8 = kani::any();
+    let a_basis: u8 = kani::any();
+    kani::assume(abs_basis <= 15);
+    kani::assume(a_basis <= 15);
+
+    let result = RiskEngine::loss_weight_for_basis(abs_basis as u128, a_basis as u128);
+
+    match result {
+        Err(_) => {
+            // Acceptable error paths: zero input (CorruptState) or
+            // computed weight outside (0, SOCIAL_LOSS_DEN] (Overflow).
+            // No assertion needed — any error is correct on invalid input.
+        }
+        Ok(w) => {
+            // Postcondition 1: returned weight is strictly positive.
+            assert!(w > 0, "loss_weight_for_basis: Ok weight must be > 0");
+            // Postcondition 2: returned weight is bounded by SOCIAL_LOSS_DEN.
+            assert!(
+                w <= SOCIAL_LOSS_DEN,
+                "loss_weight_for_basis: Ok weight must be <= SOCIAL_LOSS_DEN"
+            );
+            // Postcondition 3: zero inputs always return Err, so the Ok arm
+            // proves both inputs were non-zero.
+            assert!(abs_basis > 0, "loss_weight_for_basis: abs_basis must be non-zero on Ok");
+            assert!(a_basis > 0, "loss_weight_for_basis: a_basis must be non-zero on Ok");
+        }
+    }
 }

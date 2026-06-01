@@ -562,7 +562,7 @@ fn test_haircut_ratio_with_surplus() {
         engine
             .touch_account_live_local(b as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     let (h_num, h_den) = engine.haircut_ratio();
@@ -727,7 +727,7 @@ fn test_cohort_reserve_set_on_new_profit() {
             h_lock,
             h_lock,
             None,
-            0,
+            64,
         )
         .expect("crank");
     {
@@ -736,7 +736,7 @@ fn test_cohort_reserve_set_on_new_profit() {
         engine
             .touch_account_live_local(a as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     // If PnL is positive, reserved_pnl should be nonzero (cohort-based warmup with h_lock>0)
@@ -778,7 +778,7 @@ fn test_warmup_full_conversion_after_period() {
             h_lock,
             h_lock,
             None,
-            0,
+            64,
         )
         .expect("crank");
     {
@@ -788,7 +788,7 @@ fn test_warmup_full_conversion_after_period() {
         engine
             .touch_account_live_local(a as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&mut ctx).unwrap();
     }
 
     // Close position so profit conversion can happen (only for flat accounts)
@@ -814,7 +814,7 @@ fn test_warmup_full_conversion_after_period() {
             h_lock,
             h_lock,
             None,
-            0,
+            64,
         )
         .expect("crank2");
     {
@@ -824,7 +824,7 @@ fn test_warmup_full_conversion_after_period() {
         engine
             .touch_account_live_local(a as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&mut ctx).unwrap();
     }
 
     let capital_final = engine.accounts[a as usize].capital.get();
@@ -1277,22 +1277,11 @@ fn reset_leaves_future_mark_headroom_after_a_restored_to_adl_one() {
 
 #[test]
 fn adl_k_write_preserves_future_mark_headroom() {
-    // Regression (reviewer pass 8): enqueue_adl's K-overflow fallback
-    // only catches the moment where the ADL K add itself overflows i128.
-    // A K value CAN still fit i128 yet land close enough to the boundary
-    // that the next valid oracle move makes accrue_market_to overflow K.
-    //
-    // After an ADL write, for any valid future oracle step
-    // |delta_p| <= MAX_ORACLE_PRICE, the resulting K (side s) MUST fit
-    // i128. The invariant is:
-    //     |K_s| + A_s * MAX_ORACLE_PRICE <= i128::MAX
-    // (A_s cannot increase; new A_s <= old A_s.)
-    //
-    // If the ADL K write would violate this, the deficit MUST route
-    // through record_uninsured_protocol_loss instead, matching the
-    // existing "overflow → implicit haircut" policy.
-    // v12.19: start at a high P_last so a small envelope-compliant move
-    // can be applied post-ADL to test mark-to-market headroom.
+    // v12.20.6: bankruptcy residual routes through B, not K. A residual
+    // booking must not push K/F headroom toward a later accrue overflow.
+    // The deficit d=1 is fully booked in one B-chunk, leaving remainder=0
+    // so active_close_present stays 0 and a subsequent envelope-compliant
+    // accrue_market_to must succeed.
     let mut params = default_params();
     params.max_trading_fee_bps = 0;
     params.liquidation_fee_bps = 0;
@@ -1309,26 +1298,29 @@ fn adl_k_write_preserves_future_mark_headroom() {
     engine.oi_eff_long_q = 2;
     engine.oi_eff_short_q = 2;
     let mut ctx = percolator::InstructionContext::new();
-    let a_ps = ADL_ONE.checked_mul(POS_SCALE).unwrap();
-    // Pick d so delta_k_abs ~ i128::MAX: ADL pushes K_short near the edge.
-    let d = ((i128::MAX as u128) / a_ps) * 2;
+    let old_k_short = engine.adl_coeff_short;
+    // Use d=1: fully booked in one B-chunk, K untouched.
+    let d = 1u128;
     engine
         .enqueue_adl(&mut ctx, percolator::Side::Long, 1, d)
         .expect("enqueue_adl");
 
-    // Post-ADL: either the deficit was routed through
-    // record_uninsured_protocol_loss (adl_coeff_short unchanged near 0),
-    // OR it was written to K but with enough headroom that mark-to-market
-    // at next-slot envelope-compliant move still works.
-    // v12.19: move by (cap = 3 bps/slot * 1 slot * init_px = 30 units).
-    // Use delta of 30 (30/100000 = 3 bps) exactly at cap.
+    // K must be unchanged (social residual goes through B, not K).
+    assert_eq!(
+        engine.adl_coeff_short, old_k_short,
+        "bankruptcy residual must not mutate K"
+    );
+    // B accumulator for the short side must have grown.
+    assert!(engine.b_short_num > 0, "bankruptcy residual must book through B");
+
+    // A subsequent envelope-compliant accrue_market_to must succeed.
+    // Move by (cap = 3 bps/slot * 1 slot * init_px = 30 units).
     let next_px = init_px + 30;
     let r = engine.accrue_market_to(1, next_px, 0);
     assert!(
         r.is_ok(),
-        "after enqueue_adl, a subsequent envelope-compliant accrue_market_to \
-         must not overflow K — either ADL must leave enough headroom or route \
-         the deficit through uninsured loss (got {:?})",
+        "after B residual booking, a subsequent envelope-compliant accrue_market_to \
+         must not overflow K (got {:?})",
         r
     );
 }
@@ -2208,7 +2200,7 @@ fn test_close_account_after_trade_and_unwind() {
         engine
             .touch_account_live_local(a as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     // PnL should be zero or converted by now
@@ -2282,7 +2274,7 @@ fn test_insurance_absorbs_loss_on_liquidation() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .expect("crank");
 
@@ -2529,7 +2521,7 @@ fn test_conservation_maintained_through_lifecycle() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .expect("crank2");
     assert!(engine.check_conservation());
@@ -2611,7 +2603,7 @@ fn test_fee_seniority_after_restart_on_new_profit_in_trade() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .expect("crank2");
     assert!(engine.check_conservation());
@@ -3083,17 +3075,22 @@ fn accrue_market_to_zero_oi_fast_forwards_price_without_cap() {
 
 #[test]
 fn keeper_crank_phase2_advances_cursor_by_window_size() {
-    // Property 93: Phase 2 advances rr_cursor_position by exactly
-    // min(rr_window_size, params.max_accounts - rr_cursor_position).
+    // In the toly-correct Phase 2 implementation, rr_touch_limit is a TOUCH budget
+    // (max materialized accounts to touch), not a scan budget. The scan budget is
+    // rr_scan_limit (set to u64::MAX by full_scan). On a fresh engine with no used
+    // accounts, phase2_scan_outcome scans all wrap_bound=64 slots, finds none used
+    // (touched=0 < rr_touch_limit=5), and wraps to cursor=0 with sweep_generation+1.
     let mut engine = RiskEngine::new(default_params());
     assert_eq!(engine.rr_cursor_position, 0);
     let _ = engine
         .keeper_crank_not_atomic(1, 1000, &[], 0, 0, 1, 100, None, 5)
         .unwrap();
+    // Cursor wraps to 0 (no used accounts → scan runs to wrap_bound), generation +1.
     assert_eq!(
-        engine.rr_cursor_position, 5,
-        "rr_cursor_position must advance by rr_window_size"
+        engine.rr_cursor_position, 0,
+        "empty engine: phase2 scans all slots and wraps to 0"
     );
+    assert_eq!(engine.sweep_generation, 1, "generation advances on wrap");
 }
 
 #[test]
@@ -3113,12 +3110,16 @@ fn keeper_crank_phase2_window_zero_is_noop_on_cursor() {
 
 #[test]
 fn keeper_crank_phase2_wraparound_advances_generation_and_resets_consumption() {
-    // Property 94: at cursor wraparound, sweep_generation += 1 and
-    // price_move_consumed_bps_this_generation resets to 0 atomically.
+    // At cursor wraparound, sweep_generation += 1 and rr_cursor_position resets to 0.
+    // In the toly-correct Phase 2 implementation, price_move_consumed_bps_this_generation
+    // is a legacy field (stress tracking moved to stress_consumed_bps_e9_since_envelope);
+    // it is no longer reset on wrap by the crank body.
     // Wrap bound is params.max_accounts.
     let mut engine = RiskEngine::new(default_params());
     let wrap = engine.params.max_accounts;
-    // Place cursor one below the wrap bound so a 1-window hit triggers wrap.
+    // Place cursor one below the wrap bound so a 1-slot scan triggers wrap.
+    // With rr_touch_limit=1 and the empty slot at wrap-1: scan finds no used account,
+    // advances to i=wrap → wraps. next_cursor=0, wrapped=true.
     engine.rr_cursor_position = wrap - 1;
     engine.sweep_generation = 7;
     engine.price_move_consumed_bps_this_generation = 123;
@@ -3131,9 +3132,12 @@ fn keeper_crank_phase2_wraparound_advances_generation_and_resets_consumption() {
         "cursor wraps to 0 at params.max_accounts"
     );
     assert_eq!(engine.sweep_generation, 8, "generation +1 on wrap");
+    // price_move_consumed_bps_this_generation is a legacy field no longer reset by the
+    // toly-aligned crank body; stress tracking uses stress_consumed_bps_e9_since_envelope.
+    // Value is unchanged from pre-crank.
     assert_eq!(
-        engine.price_move_consumed_bps_this_generation, 0,
-        "consumption resets to 0 on wrap"
+        engine.price_move_consumed_bps_this_generation, 123,
+        "legacy consumption field is not reset by toly-aligned crank"
     );
 }
 
@@ -3426,23 +3430,29 @@ fn admit_gate_generation_reset_recovers_h_min_after_saturation() {
         .settle_account_not_atomic(long_1, 1_001, 1, 0, H_MIN, H_MAX, Some(THRESHOLD_BPS))
         .unwrap();
     assert!(
-        engine.price_move_consumed_bps_this_generation
-            >= THRESHOLD_BPS * PRICE_MOVE_CONSUMPTION_SCALE
+        engine.stress_consumed_bps_e9_since_envelope
+            >= THRESHOLD_BPS * PRICE_MOVE_CONSUMPTION_SCALE,
+        "price move must push stress_consumed above the threshold"
     );
+    // When stress is active, fresh PnL is routed to the pending bucket.
     assert_eq!(
-        engine.accounts[long_1 as usize].sched_horizon, H_MAX,
-        "saturated price budget must lock fresh reserve at h_max"
+        engine.accounts[long_1 as usize].pending_horizon, H_MAX,
+        "saturated stress budget must lock fresh reserve at h_max and keep it pending"
     );
     assert!(engine.accounts[long_1 as usize].reserved_pnl > 0);
 
-    // Round-robin wrap advances the generation and clears consumption.
+    // A full post-stress round-robin envelope advances generation and clears consumption.
     let generation_before = engine.sweep_generation;
-    engine.rr_cursor_position = engine.params.max_accounts - 1;
+    engine.rr_cursor_position = 0;
+    let full_envelope = engine.params.max_accounts;
     engine
-        .keeper_crank_not_atomic(2, 1_001, &[], 0, 0, H_MIN, H_MAX, Some(THRESHOLD_BPS), 1)
+        .keeper_crank_not_atomic(2, 1_001, &[], 0, 0, H_MIN, H_MAX, Some(THRESHOLD_BPS), full_envelope)
         .unwrap();
-    assert_eq!(engine.sweep_generation, generation_before + 1);
-    assert_eq!(engine.price_move_consumed_bps_this_generation, 0);
+    assert_eq!(engine.sweep_generation, generation_before + 1, "generation +1 on wrap");
+    assert_eq!(
+        engine.stress_consumed_bps_e9_since_envelope, 0,
+        "full envelope scan must clear stress consumption"
+    );
 
     // Open a fresh independent position at the post-reset price. The next move
     // from 1001 to 1000 is below a 10 bps threshold, so the short's positive
@@ -3466,7 +3476,7 @@ fn admit_gate_generation_reset_recovers_h_min_after_saturation() {
         .settle_account_not_atomic(short_2, 1_000, 3, 0, H_MIN, H_MAX, Some(THRESHOLD_BPS))
         .unwrap();
     assert!(
-        engine.price_move_consumed_bps_this_generation
+        engine.stress_consumed_bps_e9_since_envelope
             < THRESHOLD_BPS * PRICE_MOVE_CONSUMPTION_SCALE,
         "post-reset move should remain below the finite threshold"
     );
@@ -3793,7 +3803,7 @@ fn test_conservation_full_lifecycle() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .unwrap();
     assert!(
@@ -3822,7 +3832,7 @@ fn test_conservation_full_lifecycle() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .unwrap();
     assert!(
@@ -4425,7 +4435,7 @@ fn test_property_50_flat_only_auto_conversion() {
         engine.accrue_market_to(slot + 1, oracle, 0).unwrap();
         engine.current_slot = slot + 1;
         engine.touch_account_live_local(idx_a, &mut ctx).unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     let pnl_after = engine.accounts[idx_a].pnl;
@@ -4475,7 +4485,7 @@ fn test_property_50_flat_only_auto_conversion() {
         engine.accrue_market_to(slot + 2, oracle, 0).unwrap();
         engine.current_slot = slot + 2;
         engine.touch_account_live_local(idx_a, &mut ctx).unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     // After flat touch, released profit should have been converted to capital
@@ -4900,12 +4910,12 @@ fn test_force_close_resolved_with_negative_pnl() {
             200,
             900,
             &[] as &[(u16, Option<LiquidationPolicy>)],
-            0,
+            64,
             0i128,
             0,
             100,
             None,
-            0,
+            64,
         )
         .unwrap();
     engine
@@ -5199,7 +5209,7 @@ fn test_force_close_same_epoch_negative_k_pair_pnl() {
             0,
             100,
             None,
-            0,
+            64,
         )
         .unwrap();
     engine
@@ -5901,7 +5911,7 @@ fn test_finalize_whole_only_conversion() {
 
     let mut ctx = InstructionContext::new_with_admission(50, 50);
     ctx.add_touched(idx);
-    engine.finalize_touched_accounts_post_live(&ctx);
+    engine.finalize_touched_accounts_post_live(&mut ctx);
 
     // Whole-only: h = min(residual, matured) / matured
     // residual = 111_000 - 100_000 - 1_000 = 10_000
@@ -5940,7 +5950,7 @@ fn test_finalize_no_conversion_under_haircut() {
 
     let mut ctx = InstructionContext::new_with_admission(50, 50);
     ctx.add_touched(idx);
-    engine.finalize_touched_accounts_post_live(&ctx);
+    engine.finalize_touched_accounts_post_live(&mut ctx);
 
     // Under haircut: NO auto-conversion
     assert_eq!(
@@ -7839,7 +7849,7 @@ fn funding_basic_sign_convention() {
     engine
         .touch_account_live_local(b as usize, &mut ctx)
         .unwrap();
-    engine.finalize_touched_accounts_post_live(&ctx);
+    engine.finalize_touched_accounts_post_live(&mut ctx);
 
     engine
         .settle_account_not_atomic(b, oracle, slot + 10, 5_000i128, 0, 100, None)
@@ -8084,7 +8094,7 @@ fn test_funding_partition_invariance() {
     let mut ctx_a = InstructionContext::new_with_admission(0, 100);
     ea.touch_account_live_local(a1 as usize, &mut ctx_a)
         .unwrap();
-    ea.finalize_touched_accounts_post_live(&ctx_a);
+    ea.finalize_touched_accounts_post_live(&mut ctx_a);
     let cap_a = ea.accounts[a1 as usize].capital.get();
 
     // --- Engine B: two accrues of 1 slot each ---
@@ -8102,7 +8112,7 @@ fn test_funding_partition_invariance() {
     let mut ctx_b = InstructionContext::new_with_admission(0, 100);
     eb.touch_account_live_local(b1 as usize, &mut ctx_b)
         .unwrap();
-    eb.finalize_touched_accounts_post_live(&ctx_b);
+    eb.finalize_touched_accounts_post_live(&mut ctx_b);
     let cap_b = eb.accounts[b1 as usize].capital.get();
 
     // Check K and F state for both engines

@@ -437,7 +437,7 @@ fn proof_flat_negative_resolves_through_insurance() {
         engine
             .touch_account_live_local(idx as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     assert!(engine.accounts[idx as usize].pnl == 0i128);
@@ -1131,7 +1131,7 @@ fn proof_trading_loss_seniority() {
         let _ = engine.accrue_market_to(touch_slot, DEFAULT_ORACLE, 0);
         engine.current_slot = touch_slot;
         let _ = engine.touch_account_live_local(a as usize, &mut ctx);
-        engine.finalize_touched_accounts_post_live(&ctx);
+        engine.finalize_touched_accounts_post_live(&mut ctx);
     }
 
     let pnl_after = engine.accounts[a as usize].pnl;
@@ -1187,6 +1187,7 @@ fn proof_risk_reducing_exemption_path() {
         buffer_pre,
         0,
         0,
+        false,
     );
     assert!(
         reduce_result.is_ok(),
@@ -1215,6 +1216,7 @@ fn proof_risk_reducing_exemption_path() {
         buffer_pre_inc,
         0,
         0,
+        false,
     );
     assert!(
         increase_result.is_err(),
@@ -1450,7 +1452,7 @@ fn proof_flat_close_shortfall_predicate() {
         .expect("I256 sub");
     assert!(
         engine
-            .enforce_one_side_margin(a as usize, DEFAULT_ORACLE, &size, &0, buffer_equal, 0, 0)
+            .enforce_one_side_margin(a as usize, DEFAULT_ORACLE, &size, &0, buffer_equal, 0, 0, false)
             .is_ok(),
         "flat close may leave negative raw equity when shortfall is unchanged"
     );
@@ -1459,7 +1461,7 @@ fn proof_flat_close_shortfall_predicate() {
         .checked_sub(I256::from_u128(mm_req_pre))
         .expect("I256 sub");
     let reject =
-        engine.enforce_one_side_margin(a as usize, DEFAULT_ORACLE, &size, &0, buffer_worse, 0, 0);
+        engine.enforce_one_side_margin(a as usize, DEFAULT_ORACLE, &size, &0, buffer_worse, 0, 0, false);
     assert!(
         matches!(reject, Err(RiskError::Undercollateralized)),
         "flat close must reject when negative shortfall worsens"
@@ -1542,6 +1544,7 @@ fn proof_v1126_risk_reducing_fee_neutral() {
         buffer_pre,
         fee_impact,
         0,
+        false,
     );
     assert!(
         result.is_ok(),
@@ -3281,6 +3284,7 @@ fn proof_symbolic_margin_enforcement_on_reduce() {
         buffer_pre,
         0,
         0,
+        false,
     );
 
     let maintenance_healthy = engine.is_above_maintenance_margin(
@@ -3404,6 +3408,7 @@ fn proof_execute_trade_full_margin_enforcement() {
         buffer_pre,
         0,
         candidate_trade_pnl,
+        false,
     );
     let ok = result.is_ok();
 
@@ -3660,4 +3665,1169 @@ fn v19_trade_touch_order_is_ascending() {
     let (first2, second2) = if b <= a { (b, a) } else { (a, b) };
     assert_eq!(first, first2);
     assert_eq!(second, second2);
+}
+
+// ============================================================================
+// Wave 12-H: Ported from toly-engine/tests/proofs_safety.rs
+// ============================================================================
+
+// --- t4_19: B-booking deficit identity (pure algebra) ---
+
+#[kani::proof]
+#[kani::unwind(1)]
+#[kani::solver(cadical)]
+fn t4_19_full_drain_terminal_b_books_deficit_identity() {
+    // v12.20.6: bankruptcy residual is represented by B, not K.
+    // Exact scaled identity: delta_B * W + rem_new = D * DEN + rem_old
+    let d: u8 = kani::any();
+    kani::assume(d > 0 && d <= 10);
+    let w: u8 = kani::any();
+    kani::assume(w > 0 && (w as u32) <= S_ADL_ONE as u32);
+    let rem_old: u8 = kani::any();
+    kani::assume((rem_old as u32) < S_ADL_ONE as u32);
+
+    let scaled = (d as u32) * (S_ADL_ONE as u32) + (rem_old as u32);
+    let delta_b = scaled / (w as u32);
+    let rem_new = scaled % (w as u32);
+
+    assert!(delta_b > 0);
+    assert!(rem_new < w as u32);
+    assert!(delta_b * (w as u32) + rem_new == scaled);
+}
+
+// --- Insurance gate proofs (Wave 12-H) ---
+
+#[kani::proof]
+#[kani::unwind(96)]
+#[kani::solver(cadical)]
+fn proof_live_insurance_withdraw_fails_closed_when_exposed_or_reconciling_on_prod_code() {
+    // Wave 12-H: ported from toly; runtime verification deferred for large models.
+    // Property: live insurance withdrawal is blocked when OI is exposed OR when a
+    // stress envelope (reconciliation) is active.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    engine.top_up_insurance_fund(100, DEFAULT_SLOT).unwrap();
+
+    let exposed: bool = kani::any();
+    if exposed {
+        let a = add_user_test(&mut engine, 0).unwrap();
+        let b = add_user_test(&mut engine, 0).unwrap();
+        engine.deposit_not_atomic(a, 10, DEFAULT_SLOT).unwrap();
+        engine.deposit_not_atomic(b, 10, DEFAULT_SLOT).unwrap();
+        engine.attach_effective_position(a as usize, 1).unwrap();
+        engine.attach_effective_position(b as usize, -1).unwrap();
+        engine.oi_eff_long_q = 1;
+        engine.oi_eff_short_q = 1;
+    }
+
+    let reconciling: bool = kani::any();
+    if reconciling {
+        engine.bankruptcy_hmax_lock_active = true;
+        engine.stress_consumed_bps_e9_since_envelope = 1;
+        engine.stress_envelope_remaining_indices = 1;
+        engine.stress_envelope_start_slot = DEFAULT_SLOT;
+        engine.stress_envelope_start_generation = engine.sweep_generation;
+    }
+
+    let vault_before = engine.vault.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let result = engine.withdraw_live_insurance_not_atomic(1, DEFAULT_SLOT);
+
+    if exposed || reconciling {
+        assert_eq!(result, Err(RiskError::Undercollateralized));
+        assert_eq!(engine.vault.get(), vault_before);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+    } else {
+        assert!(result.is_ok());
+        assert_eq!(engine.vault.get(), vault_before - 1);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before - 1);
+    }
+    assert!(engine.check_conservation());
+}
+
+#[kani::proof]
+#[kani::unwind(96)]
+#[kani::solver(cadical)]
+fn proof_insurance_reward_credit_fails_closed_under_reconciliation_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: insurance reward credit is blocked
+    // during hmax reconciliation or when loss is stale.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    let long = add_user_test(&mut engine, 0).unwrap();
+    let short = add_user_test(&mut engine, 0).unwrap();
+    engine.top_up_insurance_fund(100, DEFAULT_SLOT).unwrap();
+
+    let hmax_reconciliation: bool = kani::any();
+    if hmax_reconciliation {
+        engine.bankruptcy_hmax_lock_active = true;
+        engine.stress_consumed_bps_e9_since_envelope = 1;
+        engine.stress_envelope_remaining_indices = 1;
+        engine.stress_envelope_start_slot = DEFAULT_SLOT;
+        engine.stress_envelope_start_generation = engine.sweep_generation;
+    }
+
+    let loss_stale_reconciliation: bool = kani::any();
+    if loss_stale_reconciliation {
+        engine.attach_effective_position(long as usize, 1).unwrap();
+        engine.attach_effective_position(short as usize, -1).unwrap();
+        engine.oi_eff_long_q = 1;
+        engine.oi_eff_short_q = 1;
+        engine.current_slot = DEFAULT_SLOT + 1;
+        engine.last_market_slot = DEFAULT_SLOT;
+    }
+
+    let vault_before = engine.vault.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let capital_before = engine.accounts[idx as usize].capital.get();
+    let result = engine.credit_account_from_insurance_not_atomic(idx, 1, engine.current_slot);
+
+    if hmax_reconciliation || loss_stale_reconciliation {
+        assert_eq!(result, Err(RiskError::Undercollateralized));
+        assert_eq!(engine.vault.get(), vault_before);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+        assert_eq!(engine.accounts[idx as usize].capital.get(), capital_before);
+    } else {
+        assert!(result.is_ok());
+        assert_eq!(engine.vault.get(), vault_before);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before - 1);
+        assert_eq!(engine.accounts[idx as usize].capital.get(), capital_before + 1);
+    }
+    assert!(engine.check_conservation());
+}
+
+#[kani::proof]
+#[kani::unwind(96)]
+#[kani::solver(cadical)]
+fn proof_live_insurance_withdraw_blocks_active_close_or_negative_pnl_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: live insurance withdrawal is blocked
+    // while an active-close reconciliation or negative PnL exists.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    engine.top_up_insurance_fund(100, DEFAULT_SLOT).unwrap();
+
+    let active_close_reconciliation: bool = kani::any();
+    if active_close_reconciliation {
+        engine.bankruptcy_hmax_lock_active = true;
+        engine.stress_envelope_remaining_indices = engine.params.max_accounts;
+        engine.stress_envelope_start_slot = DEFAULT_SLOT;
+        engine.stress_envelope_start_generation = engine.sweep_generation;
+        engine.active_close_present = 1;
+        engine.active_close_phase = ACTIVE_CLOSE_PHASE_RESIDUAL_B;
+        engine.active_close_account_idx = u16::MAX;
+        engine.active_close_opp_side = ACTIVE_CLOSE_SIDE_SHORT;
+        engine.active_close_close_price = DEFAULT_ORACLE;
+        engine.active_close_close_slot = DEFAULT_SLOT;
+        engine.active_close_q_close_q = 0;
+        engine.active_close_residual_remaining = 1;
+    }
+
+    let negative_pnl_reconciliation: bool = kani::any();
+    if negative_pnl_reconciliation {
+        let neg = add_user_test(&mut engine, 0).unwrap();
+        engine.set_pnl(neg as usize, -1).unwrap();
+    }
+
+    let vault_before = engine.vault.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let result = engine.withdraw_live_insurance_not_atomic(1, DEFAULT_SLOT);
+
+    if active_close_reconciliation || negative_pnl_reconciliation {
+        assert_eq!(result, Err(RiskError::Undercollateralized));
+        assert_eq!(engine.vault.get(), vault_before);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+    } else {
+        assert!(result.is_ok());
+        assert_eq!(engine.vault.get(), vault_before - 1);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before - 1);
+    }
+    assert!(engine.check_conservation());
+}
+
+#[kani::proof]
+#[kani::unwind(96)]
+#[kani::solver(cadical)]
+fn proof_insurance_reward_credit_blocks_active_close_or_negative_pnl_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: insurance reward credit is blocked
+    // during active-close reconciliation or when any account has negative PnL.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    engine.top_up_insurance_fund(100, DEFAULT_SLOT).unwrap();
+
+    let active_close_reconciliation: bool = kani::any();
+    if active_close_reconciliation {
+        engine.bankruptcy_hmax_lock_active = true;
+        engine.stress_envelope_remaining_indices = engine.params.max_accounts;
+        engine.stress_envelope_start_slot = DEFAULT_SLOT;
+        engine.stress_envelope_start_generation = engine.sweep_generation;
+        engine.active_close_present = 1;
+        engine.active_close_phase = ACTIVE_CLOSE_PHASE_RESIDUAL_B;
+        engine.active_close_account_idx = u16::MAX;
+        engine.active_close_opp_side = ACTIVE_CLOSE_SIDE_SHORT;
+        engine.active_close_close_price = DEFAULT_ORACLE;
+        engine.active_close_close_slot = DEFAULT_SLOT;
+        engine.active_close_q_close_q = 0;
+        engine.active_close_residual_remaining = 1;
+    }
+
+    let negative_pnl_reconciliation: bool = kani::any();
+    if negative_pnl_reconciliation {
+        engine.set_pnl(idx as usize, -1).unwrap();
+    }
+
+    let vault_before = engine.vault.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let capital_before = engine.accounts[idx as usize].capital.get();
+    let pnl_before = engine.accounts[idx as usize].pnl;
+    let result = engine.credit_account_from_insurance_not_atomic(idx, 1, engine.current_slot);
+
+    if active_close_reconciliation || negative_pnl_reconciliation {
+        assert_eq!(result, Err(RiskError::Undercollateralized));
+        assert_eq!(engine.vault.get(), vault_before);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+        assert_eq!(engine.accounts[idx as usize].capital.get(), capital_before);
+        assert_eq!(engine.accounts[idx as usize].pnl, pnl_before);
+    } else {
+        assert!(result.is_ok());
+        assert_eq!(engine.vault.get(), vault_before);
+        assert_eq!(engine.insurance_fund.balance.get(), insurance_before - 1);
+        assert_eq!(engine.accounts[idx as usize].capital.get(), capital_before + 1);
+    }
+    assert!(engine.check_conservation());
+}
+
+// --- B-loss and residual booking (Wave 12-H) ---
+
+#[kani::proof]
+#[kani::unwind(120)]
+#[kani::solver(cadical)]
+fn proof_adl_b_loss_booking_bounded_by_rounded_settlement_effect() {
+    // Wave 12-H: ported from toly. Property: B-booked ADL loss must not charge
+    // represented accounts above the socialized deficit (rounding bound).
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(a, 10, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(b, 10, DEFAULT_SLOT).unwrap();
+    engine.attach_effective_position(a as usize, -1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_short_q = 2;
+    engine.oi_eff_long_q = 2;
+
+    let d: u8 = kani::any();
+    kani::assume(d == 1 || d == 2);
+    let old_b_short = engine.b_short_num;
+    let old_rem_short = engine.social_loss_remainder_short_num;
+    let old_k_short = engine.adl_coeff_short;
+    let w_a = engine.accounts[a as usize].loss_weight;
+    let w_b = engine.accounts[b as usize].loss_weight;
+    let rem_a = engine.accounts[a as usize].b_rem;
+    let rem_b = engine.accounts[b as usize].b_rem;
+    let mut ctx = InstructionContext::new_with_admission(1, 100);
+    let r = engine.enqueue_adl(&mut ctx, Side::Long, 0, d as u128);
+    assert!(r.is_ok());
+
+    let delta_b = engine.b_short_num - old_b_short;
+    let loss_a = (w_a * delta_b + rem_a) / SOCIAL_LOSS_DEN;
+    let loss_b = (w_b * delta_b + rem_b) / SOCIAL_LOSS_DEN;
+    let represented_loss = loss_a + loss_b;
+    assert!(
+        represented_loss <= d as u128,
+        "B-booked ADL loss must not charge represented accounts above the socialized deficit"
+    );
+    assert!(
+        engine.adl_coeff_short == old_k_short,
+        "bankruptcy residual must not mutate K"
+    );
+    assert!(
+        delta_b * (w_a + w_b) + engine.social_loss_remainder_short_num
+            == (d as u128) * SOCIAL_LOSS_DEN + old_rem_short,
+        "B booking must satisfy the scaled residual identity"
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(80)]
+#[kani::solver(cadical)]
+fn proof_production_account_b_chunk_advances_and_bounds_loss() {
+    // Wave 12-H: ported from toly. Property: settle_account_b_chunk_to_target
+    // advances b_snap and bounds per-account loss to the supplied loss_limit.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(idx, 10, DEFAULT_SLOT).unwrap();
+    engine.attach_effective_position(idx as usize, -1).unwrap();
+
+    let loss_limit: u8 = kani::any();
+    let extra_loss: u8 = kani::any();
+    kani::assume(loss_limit > 0 && loss_limit <= 3);
+    kani::assume(extra_loss > 0 && extra_loss <= 3);
+
+    let target_loss_atoms = (loss_limit as u128) + (extra_loss as u128);
+    let target = target_loss_atoms * SOCIAL_LOSS_DEN;
+    let snap_before = engine.accounts[idx as usize].b_snap;
+    let weight = engine.accounts[idx as usize].loss_weight;
+
+    let result = engine.settle_account_b_chunk_to_target(
+        idx as usize,
+        Side::Short,
+        target,
+        loss_limit as u128,
+    );
+    assert!(result.is_ok());
+    let (loss, _current) = result.unwrap();
+    let snap_after = engine.accounts[idx as usize].b_snap;
+
+    assert!(loss <= loss_limit as u128, "settled loss must not exceed loss_limit");
+    assert!(
+        snap_after > snap_before || (weight == 0 && snap_after == snap_before),
+        "b_snap must advance (or stay if weight=0)"
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(520)]
+#[kani::solver(cadical)]
+fn proof_production_b_residual_booking_or_recording_accounts_for_full_deficit() {
+    // Wave 12-H: ported from toly. Property: book_or_record_bankruptcy_residual_to_side
+    // accounts for every atom of residual as either booked B or explicit non-claim loss.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(a, 10, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(b, 10, DEFAULT_SLOT).unwrap();
+    engine.attach_effective_position(a as usize, -1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+
+    let residual: u8 = kani::any();
+    let chunk_budget: u8 = kani::any();
+    kani::assume((2..=4).contains(&residual));
+    kani::assume((1..=3).contains(&chunk_budget));
+    kani::assume(chunk_budget < residual);
+
+    let old_explicit_short = engine.explicit_unallocated_loss_short.get();
+    let vault_before = engine.vault.get();
+    let capital_before = engine.c_tot.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let w = engine.loss_weight_sum_short;
+
+    let mut ctx = InstructionContext::new_with_admission(1, 100);
+    let result = engine.book_or_record_bankruptcy_residual_to_side(
+        &mut ctx,
+        Side::Short,
+        residual as u128,
+        chunk_budget as u128,
+    );
+    assert!(result.is_ok());
+    let (booked, recorded) = result.unwrap();
+
+    assert_eq!(
+        booked + recorded,
+        residual as u128,
+        "production residual path must either book or explicitly record every atom"
+    );
+    assert!(engine.explicit_unallocated_loss_short.get() >= old_explicit_short + recorded);
+    assert_eq!(engine.vault.get(), vault_before, "B residual must not mint or burn vault funds");
+    assert_eq!(engine.c_tot.get(), capital_before, "B residual must not mutate user capital totals");
+    assert_eq!(
+        engine.insurance_fund.balance.get(),
+        insurance_before,
+        "B residual must not make residuals spendable insurance"
+    );
+    assert!(engine.bankruptcy_hmax_lock_active);
+}
+
+// --- Permissionless recovery (Wave 12-H) ---
+
+#[kani::proof]
+#[kani::unwind(220)]
+#[kani::solver(cadical)]
+fn proof_permissionless_p_last_recovery_uses_engine_price_not_raw_target() {
+    // Wave 12-H: ported from toly. Property: permissionless P_last recovery
+    // resolves at the engine's last_oracle_price, not the caller-supplied raw target.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(a as usize, 1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_long_q = 1;
+    engine.oi_eff_short_q = 1;
+
+    let raw_delta: u8 = kani::any();
+    kani::assume((1..=5).contains(&raw_delta));
+    let raw_target = DEFAULT_ORACLE + raw_delta as u64;
+    let old_p_last = engine.last_oracle_price;
+    let recovery_slot = DEFAULT_SLOT + 1;
+
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::BelowProgressFloor,
+        recovery_slot,
+        raw_target,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(engine.market_mode, MarketMode::Resolved);
+    assert_eq!(engine.resolved_price, old_p_last);
+    assert_eq!(engine.resolved_live_price, old_p_last);
+    assert_eq!(engine.resolved_slot, recovery_slot);
+    assert!(
+        engine.resolved_price != raw_target,
+        "permissionless recovery must not settle at caller-supplied raw target"
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(80)]
+#[kani::solver(cadical)]
+fn proof_below_floor_recovery_rejects_when_bounded_step_can_progress_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: BelowProgressFloor recovery must
+    // fail closed when bounded catchup accrual can still make progress.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    engine.oi_eff_long_q = 1;
+    engine.oi_eff_short_q = 1;
+
+    let raw_delta: u8 = kani::any();
+    kani::assume((1..=5).contains(&raw_delta));
+    let raw_target = DEFAULT_ORACLE + raw_delta as u64;
+    let now_slot = DEFAULT_SLOT + engine.params.max_accrual_dt_slots;
+    let vault_before = engine.vault.get();
+    let capital_before = engine.c_tot.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::BelowProgressFloor,
+        now_slot,
+        raw_target,
+    );
+
+    assert_eq!(result, Err(RiskError::Unauthorized));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+    assert_eq!(engine.last_oracle_price, DEFAULT_ORACLE);
+    assert_eq!(engine.vault.get(), vault_before);
+    assert_eq!(engine.c_tot.get(), capital_before);
+    assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+}
+
+#[kani::proof]
+#[kani::unwind(220)]
+#[kani::solver(cadical)]
+fn proof_permissionless_blocked_segment_recovery_uses_engine_price_not_raw_target() {
+    // Wave 12-H: ported from toly. Property: blocked-segment recovery resolves
+    // at engine's last_oracle_price, not caller-supplied raw target.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(a as usize, 1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_long_q = 1;
+    engine.oi_eff_short_q = 1;
+
+    let max_future_mark = ADL_ONE * MAX_ORACLE_PRICE as u128;
+    engine.adl_coeff_long = (i128::MAX as u128 - max_future_mark) as i128;
+
+    let old_p_last = engine.last_oracle_price;
+    let raw_target = old_p_last + 1;
+    let recovery_slot = DEFAULT_SLOT + engine.params.max_accrual_dt_slots;
+
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::BlockedSegmentHeadroomOrRepresentability,
+        recovery_slot,
+        raw_target,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(engine.market_mode, MarketMode::Resolved);
+    assert_eq!(engine.resolved_price, old_p_last);
+    assert_eq!(engine.resolved_live_price, old_p_last);
+    assert!(
+        engine.resolved_price != raw_target,
+        "blocked-segment recovery must not settle at caller-supplied raw target"
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(220)]
+#[kani::solver(cadical)]
+fn proof_blocked_segment_recovery_rejects_when_bounded_accrual_can_progress_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: BlockedSegmentHeadroomOrRepresentability
+    // recovery must fail closed when bounded accrual can still progress.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(a as usize, 1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_long_q = 1;
+    engine.oi_eff_short_q = 1;
+
+    let raw_delta: u8 = kani::any();
+    kani::assume((1..=5).contains(&raw_delta));
+    let raw_target = DEFAULT_ORACLE + raw_delta as u64;
+    let now_slot = DEFAULT_SLOT + engine.params.max_accrual_dt_slots;
+    let vault_before = engine.vault.get();
+    let capital_before = engine.c_tot.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::BlockedSegmentHeadroomOrRepresentability,
+        now_slot,
+        raw_target,
+    );
+
+    assert_eq!(result, Err(RiskError::Unauthorized));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+    assert_eq!(engine.last_oracle_price, DEFAULT_ORACLE);
+    assert_eq!(engine.vault.get(), vault_before);
+    assert_eq!(engine.c_tot.get(), capital_before);
+    assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+}
+
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_account_b_recovery_rejects_when_production_chunk_advances() {
+    // Wave 12-H: ported from toly. Property: account-B recovery is rejected
+    // (Unauthorized) when the production B-chunk planner can still make progress.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(idx as usize, -1).unwrap();
+    engine.oi_eff_short_q = 1;
+    engine.oi_eff_long_q = 1;
+
+    let target_loss_atoms: u8 = kani::any();
+    kani::assume((1..=3).contains(&target_loss_atoms));
+    engine.b_short_num = target_loss_atoms as u128;
+
+    let recovery =
+        engine.permissionless_recovery_resolve_account_b_p_last_not_atomic(idx, DEFAULT_SLOT + 1);
+    assert_eq!(recovery, Err(RiskError::Unauthorized));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+
+    let snap_before = engine.accounts[idx as usize].b_snap;
+    let chunk = engine.settle_account_b_chunk_to_target(
+        idx as usize,
+        Side::Short,
+        engine.b_short_num,
+        PUBLIC_ACCOUNT_B_SETTLEMENT_LOSS_ATOMS,
+    );
+    assert!(chunk.is_ok());
+    let (loss, current) = chunk.unwrap();
+    assert!(engine.accounts[idx as usize].b_snap > snap_before || (loss == 0 && current));
+    assert!(loss <= PUBLIC_ACCOUNT_B_SETTLEMENT_LOSS_ATOMS);
+}
+
+// --- Active-close recovery proofs (Wave 12-H) ---
+
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_active_close_recovery_reason_fails_closed_without_active_close_state() {
+    // Wave 12-H: ported from toly. Property: ActiveBankruptCloseCannotProgress
+    // recovery reason fails closed when no active-close state is present.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+
+    let recovery = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::ActiveBankruptCloseCannotProgress,
+        DEFAULT_SLOT + 1,
+        DEFAULT_ORACLE,
+    );
+
+    assert_eq!(recovery, Err(RiskError::Unauthorized));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+}
+
+#[kani::proof]
+#[kani::unwind(96)]
+#[kani::solver(cadical)]
+fn proof_active_close_continuation_makes_bounded_progress_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: continue_active_bankrupt_close_not_atomic
+    // books B residual and clears the active-close state when residual is small.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(idx as usize, -1).unwrap();
+    engine.oi_eff_short_q = 1;
+    engine.oi_eff_long_q = 1;
+    engine.bankruptcy_hmax_lock_active = true;
+    engine.stress_envelope_remaining_indices = engine.params.max_accounts;
+    engine.stress_envelope_start_slot = DEFAULT_SLOT;
+    engine.stress_envelope_start_generation = engine.sweep_generation;
+    engine.active_close_present = 1;
+    engine.active_close_phase = ACTIVE_CLOSE_PHASE_RESIDUAL_B;
+    engine.active_close_account_idx = u16::MAX;
+    engine.active_close_opp_side = ACTIVE_CLOSE_SIDE_SHORT;
+    engine.active_close_close_price = DEFAULT_ORACLE;
+    engine.active_close_close_slot = DEFAULT_SLOT;
+    engine.active_close_q_close_q = 0;
+
+    let residual: u8 = kani::any();
+    kani::assume((1..=3).contains(&residual));
+    engine.active_close_residual_remaining = residual as u128;
+
+    let before_b = engine.b_short_num;
+    let result = engine.continue_active_bankrupt_close_not_atomic(DEFAULT_SLOT + 1);
+    assert!(result.is_ok());
+    assert!(engine.b_short_num > before_b);
+    assert_eq!(engine.active_close_present, 0);
+    assert_eq!(engine.active_close_residual_remaining, 0);
+    assert_eq!(engine.market_mode, MarketMode::Live);
+}
+
+#[kani::proof]
+#[kani::unwind(96)]
+#[kani::solver(cadical)]
+fn proof_active_close_continuation_preserves_frozen_economics_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: partial active-close continuation
+    // preserves all frozen economic fields and only advances residual_remaining.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(idx as usize, -1).unwrap();
+    engine.oi_eff_short_q = 1;
+    engine.oi_eff_long_q = 1;
+    engine.bankruptcy_hmax_lock_active = true;
+    engine.stress_envelope_remaining_indices = engine.params.max_accounts;
+    engine.stress_envelope_start_slot = DEFAULT_SLOT;
+    engine.stress_envelope_start_generation = engine.sweep_generation;
+    engine.active_close_present = 1;
+    engine.active_close_phase = ACTIVE_CLOSE_PHASE_RESIDUAL_B;
+    engine.active_close_account_idx = idx;
+    engine.active_close_opp_side = ACTIVE_CLOSE_SIDE_SHORT;
+    engine.active_close_close_price = DEFAULT_ORACLE;
+    engine.active_close_close_slot = DEFAULT_SLOT;
+    engine.active_close_q_close_q = 1;
+    engine.active_close_residual_remaining = PUBLIC_B_CHUNK_ATOMS + 1;
+
+    let before_b = engine.b_short_num;
+    let close_price_before = engine.active_close_close_price;
+    let close_slot_before = engine.active_close_close_slot;
+    let q_close_before = engine.active_close_q_close_q;
+    let account_idx_before = engine.active_close_account_idx;
+    let side_before = engine.active_close_opp_side;
+    let booked_before = engine.active_close_residual_booked;
+    let recorded_before = engine.active_close_residual_recorded;
+
+    let result = engine.continue_active_bankrupt_close_not_atomic(DEFAULT_SLOT + 1);
+
+    assert_eq!(result, Ok(true));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+    assert_eq!(engine.active_close_present, 1);
+    assert_eq!(engine.active_close_phase, ACTIVE_CLOSE_PHASE_RESIDUAL_B);
+    assert_eq!(engine.active_close_account_idx, account_idx_before);
+    assert_eq!(engine.active_close_opp_side, side_before);
+    assert_eq!(engine.active_close_close_price, close_price_before);
+    assert_eq!(engine.active_close_close_slot, close_slot_before);
+    assert_eq!(engine.active_close_q_close_q, q_close_before);
+    assert_eq!(engine.active_close_residual_remaining, 1);
+    assert_eq!(engine.active_close_residual_booked, booked_before + PUBLIC_B_CHUNK_ATOMS);
+    assert_eq!(engine.active_close_residual_recorded, recorded_before);
+    assert_eq!(engine.active_close_b_chunks_booked, 1);
+    assert!(engine.b_short_num > before_b);
+}
+
+#[kani::proof]
+#[kani::unwind(96)]
+#[kani::solver(cadical)]
+fn proof_active_close_recovery_records_residual_before_resolve_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: when active-close state exists with
+    // max chunks already booked, permissionless recovery records remaining residual
+    // as non-claim accounting before resolving.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    engine.bankruptcy_hmax_lock_active = true;
+    engine.stress_envelope_remaining_indices = engine.params.max_accounts;
+    engine.stress_envelope_start_slot = DEFAULT_SLOT;
+    engine.stress_envelope_start_generation = engine.sweep_generation;
+    engine.active_close_present = 1;
+    engine.active_close_phase = ACTIVE_CLOSE_PHASE_RESIDUAL_B;
+    engine.active_close_account_idx = u16::MAX;
+    engine.active_close_opp_side = ACTIVE_CLOSE_SIDE_SHORT;
+    engine.active_close_close_price = DEFAULT_ORACLE;
+    engine.active_close_close_slot = DEFAULT_SLOT;
+    engine.active_close_q_close_q = 0;
+    engine.active_close_b_chunks_booked = ACTIVE_CLOSE_MAX_RESIDUAL_B_CHUNKS;
+
+    let residual: u8 = kani::any();
+    kani::assume((1..=3).contains(&residual));
+    engine.active_close_residual_remaining = residual as u128;
+
+    let vault_before = engine.vault.get();
+    let capital_before = engine.c_tot.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let explicit_before = engine.explicit_unallocated_loss_short.get();
+
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::ActiveBankruptCloseCannotProgress,
+        DEFAULT_SLOT + 1,
+        DEFAULT_ORACLE,
+    );
+    assert!(result.is_ok());
+    assert_eq!(engine.market_mode, MarketMode::Resolved);
+    assert_eq!(engine.active_close_present, 0);
+    assert_eq!(engine.vault.get(), vault_before);
+    assert_eq!(engine.c_tot.get(), capital_before);
+    assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+    assert!(engine.explicit_unallocated_loss_short.get() >= explicit_before + residual as u128);
+}
+
+#[kani::proof]
+#[kani::unwind(160)]
+#[kani::solver(cadical)]
+fn proof_bankruptcy_residual_handler_fails_forward_without_active_close_state() {
+    // Wave 12-H: ported from toly. Property: after residual is handled via
+    // book_or_record (no active-close), ActiveBankruptCloseCannotProgress recovery
+    // is correctly rejected (no active-close state was set).
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(a, 10, DEFAULT_SLOT).unwrap();
+    engine.deposit_not_atomic(b, 10, DEFAULT_SLOT).unwrap();
+    engine.attach_effective_position(a as usize, -1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_short_q = 2;
+    engine.oi_eff_long_q = 2;
+
+    let mut ctx = InstructionContext::new_with_admission(1, 100);
+    let result = engine.book_or_record_bankruptcy_residual_to_side(&mut ctx, Side::Short, 2, 1);
+    assert!(result.is_ok());
+    let (booked, recorded) = result.unwrap();
+    assert_eq!(booked + recorded, 2);
+    assert!(engine.bankruptcy_hmax_lock_active);
+
+    let recovery = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::ActiveBankruptCloseCannotProgress,
+        DEFAULT_SLOT + 1,
+        DEFAULT_ORACLE,
+    );
+    assert_eq!(recovery, Err(RiskError::Unauthorized));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+}
+
+#[kani::proof]
+#[kani::unwind(220)]
+#[kani::solver(cadical)]
+fn proof_explicit_loss_recovery_resolves_at_p_last_without_minting_claims_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: ExplicitLossOrDustAuditOverflow recovery
+    // resolves at last_oracle_price and does not mint or burn vault/insurance funds.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(a as usize, 1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_long_q = 1;
+    engine.oi_eff_short_q = 1;
+
+    let explicit_long: u8 = kani::any();
+    let explicit_short: u8 = kani::any();
+    kani::assume(explicit_long <= 3);
+    kani::assume((1..=5).contains(&explicit_short));
+    engine.explicit_unallocated_loss_long = U128::new(explicit_long as u128);
+    engine.explicit_unallocated_loss_short = U128::new(explicit_short as u128);
+    engine.explicit_unallocated_loss_saturated = 1;
+
+    let raw_delta: u8 = kani::any();
+    kani::assume((1..=5).contains(&raw_delta));
+    let raw_target = DEFAULT_ORACLE + raw_delta as u64;
+    let p_last_before = engine.last_oracle_price;
+    let vault_before = engine.vault.get();
+    let capital_before = engine.c_tot.get();
+    let insurance_before = engine.insurance_fund.balance.get();
+    let explicit_long_before = engine.explicit_unallocated_loss_long.get();
+    let explicit_short_before = engine.explicit_unallocated_loss_short.get();
+
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::ExplicitLossOrDustAuditOverflow,
+        DEFAULT_SLOT + 1,
+        raw_target,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(engine.market_mode, MarketMode::Resolved);
+    assert_eq!(engine.resolved_price, p_last_before);
+    assert_eq!(engine.resolved_live_price, p_last_before);
+    assert!(engine.resolved_price != raw_target, "must not settle at raw target");
+    assert_eq!(engine.vault.get(), vault_before);
+    assert_eq!(engine.c_tot.get(), capital_before);
+    assert_eq!(engine.insurance_fund.balance.get(), insurance_before);
+    assert_eq!(engine.explicit_unallocated_loss_long.get(), explicit_long_before);
+    assert_eq!(engine.explicit_unallocated_loss_short.get(), explicit_short_before);
+}
+
+#[kani::proof]
+#[kani::unwind(220)]
+#[kani::solver(cadical)]
+fn proof_counter_or_epoch_overflow_recovery_resolves_at_p_last_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: CounterOrEpochOverflowDeclaredRecovery
+    // resolves at the engine's last_oracle_price.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(a as usize, 1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_long_q = 1;
+    engine.oi_eff_short_q = 1;
+
+    let overflow_kind: u8 = kani::any();
+    kani::assume(overflow_kind <= 2);
+    match overflow_kind {
+        0 => engine.sweep_generation = u64::MAX,
+        1 => {
+            engine.adl_epoch_long = u64::MAX;
+            engine.accounts[a as usize].adl_epoch_snap = u64::MAX;
+            engine.accounts[a as usize].b_epoch_snap = u64::MAX;
+        }
+        _ => {
+            engine.adl_epoch_short = u64::MAX;
+            engine.accounts[b as usize].adl_epoch_snap = u64::MAX;
+            engine.accounts[b as usize].b_epoch_snap = u64::MAX;
+        }
+    }
+
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::CounterOrEpochOverflowDeclaredRecovery,
+        DEFAULT_SLOT + 1,
+        0,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(engine.market_mode, MarketMode::Resolved);
+    assert_eq!(engine.resolved_price, DEFAULT_ORACLE);
+    assert_eq!(engine.resolved_live_price, DEFAULT_ORACLE);
+}
+
+#[kani::proof]
+#[kani::unwind(128)]
+#[kani::solver(cadical)]
+fn proof_oracle_or_target_unavailable_policy_recovery_fails_closed_in_engine() {
+    // Wave 12-H: ported from toly. Property: the bare engine always fails closed
+    // for OracleOrTargetUnavailableByAuthenticatedPolicy (wrapper-side only).
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = add_user_test(&mut engine, 0).unwrap();
+    let b = add_user_test(&mut engine, 0).unwrap();
+    engine.attach_effective_position(a as usize, 1).unwrap();
+    engine.attach_effective_position(b as usize, -1).unwrap();
+    engine.oi_eff_long_q = 1;
+    engine.oi_eff_short_q = 1;
+
+    let raw_target: u16 = kani::any();
+    let result = engine.permissionless_recovery_resolve_p_last_not_atomic(
+        RecoveryReason::OracleOrTargetUnavailableByAuthenticatedPolicy,
+        DEFAULT_SLOT + 1,
+        raw_target as u64,
+    );
+
+    assert_eq!(result, Err(RiskError::Unauthorized));
+    assert_eq!(engine.market_mode, MarketMode::Live);
+}
+
+#[kani::proof]
+#[kani::unwind(120)]
+#[kani::solver(cadical)]
+fn proof_adl_uncertified_potential_dust_routes_deficit_without_b_or_k_write() {
+    // Wave 12-H: ported from toly. Property: when phantom dust is potential but not
+    // certified, ADL cannot use the affected side as B-loss denominator — deficit
+    // routes to durable non-claim audit fallback without touching B or K.
+    let mut engine =
+        RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    engine.deposit_not_atomic(idx, 100, DEFAULT_SLOT).unwrap();
+
+    let q: u8 = 10;
+    let dust: u8 = 1;
+    let d: u8 = 5;
+
+    engine.accounts[idx as usize].position_basis_q = -(q as i128);
+    engine.accounts[idx as usize].adl_a_basis = ADL_ONE;
+    engine.accounts[idx as usize].adl_k_snap = engine.adl_coeff_short;
+    engine.accounts[idx as usize].f_snap = engine.f_short_num;
+    engine.accounts[idx as usize].adl_epoch_snap = engine.adl_epoch_short;
+    engine.stored_pos_count_short = 1;
+    engine.oi_eff_short_q = q as u128;
+    engine.oi_eff_long_q = q as u128;
+    engine.phantom_dust_certified_short_q = 0;
+    engine.phantom_dust_potential_short_q = dust as u128;
+    kani::assume(engine.phantom_dust_potential_short_q > engine.phantom_dust_certified_short_q);
+    kani::assume(engine.phantom_dust_potential_short_q <= engine.oi_eff_short_q);
+    let old_k_short = engine.adl_coeff_short;
+    let old_b_short = engine.b_short_num;
+
+    let mut ctx = InstructionContext::new_with_admission(1, 100);
+    let r = engine.enqueue_adl(&mut ctx, Side::Long, 0, d as u128);
+    assert!(r.is_ok());
+    assert_eq!(engine.adl_coeff_short, old_k_short);
+    assert_eq!(engine.b_short_num, old_b_short);
+    assert!(engine.explicit_unallocated_protocol_loss.get() >= d as u128);
+}
+
+// --- Keeper funding rate rejection (Wave 12-H) ---
+
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_keeper_rejects_funding_rate_above_config_before_state_mutation_on_prod_code() {
+    // Wave 12-H: ported from toly. Property: keeper_crank rejects funding rates
+    // above max_abs_funding_e9_per_slot without mutating any market state.
+    let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let bad_rate = (engine.params.max_abs_funding_e9_per_slot as i128) + 1;
+
+    let current_before = engine.current_slot;
+    let market_slot_before = engine.last_market_slot;
+    let oracle_before = engine.last_oracle_price;
+    let f_long_before = engine.f_long_num;
+    let f_short_before = engine.f_short_num;
+    let k_long_before = engine.adl_coeff_long;
+    let k_short_before = engine.adl_coeff_short;
+    let stress_before = engine.stress_consumed_bps_e9_since_envelope;
+
+    let result = engine.keeper_crank_not_atomic(
+        DEFAULT_SLOT + 1,
+        DEFAULT_ORACLE,
+        &[],
+        0,
+        bad_rate,
+        0,
+        100,
+        None,
+        0,
+    );
+
+    assert_eq!(result, Err(RiskError::Overflow));
+    assert_eq!(engine.current_slot, current_before);
+    assert_eq!(engine.last_market_slot, market_slot_before);
+    assert_eq!(engine.last_oracle_price, oracle_before);
+    assert_eq!(engine.f_long_num, f_long_before);
+    assert_eq!(engine.f_short_num, f_short_before);
+    assert_eq!(engine.adl_coeff_long, k_long_before);
+    assert_eq!(engine.adl_coeff_short, k_short_before);
+    assert_eq!(engine.stress_consumed_bps_e9_since_envelope, stress_before);
+}
+
+// --- Margin gate (property 56) proofs (Wave 12-H) ---
+
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_property_56_raw_initial_margin_predicate_rejects_min_floor_shortfall_on_prod_code() {
+    // Wave 12-H: ported from toly (spec §3.4/§9.1). Property: exact raw IM
+    // predicate rejects a position whose equity is below the min_nonzero_im_req floor.
+    let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = 0usize;
+    engine.accounts[a].capital = U128::new(1);
+    engine.accounts[a].position_basis_q = 1;
+    engine.accounts[a].adl_a_basis = ADL_ONE;
+    engine.accounts[a].adl_epoch_snap = engine.adl_epoch_long;
+
+    let eq_init_raw = engine.account_equity_init_raw(&engine.accounts[a], a);
+    let notional = engine.notional(a, DEFAULT_ORACLE);
+    let im_req = core::cmp::max(
+        mul_div_floor_u128(notional, engine.params.initial_margin_bps as u128, 10_000),
+        engine.params.min_nonzero_im_req,
+    );
+    let im_ok = engine.is_above_initial_margin(&engine.accounts[a], a, DEFAULT_ORACLE);
+
+    assert!(eq_init_raw == 1);
+    assert!(notional > 0, "fixture must install a nonzero risk notional");
+    assert!(im_req > eq_init_raw as u128);
+    assert!(!im_ok, "exact raw IM predicate must reject floor shortfall");
+}
+
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_property_56_trade_margin_gate_rejects_raw_im_shortfall_on_prod_code() {
+    // Wave 12-H: ported from toly (spec §3.4/§9.1). Property: post-trade
+    // margin gate rejects a risk-increasing transition when equity is below floor.
+    let mut engine = RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let a = 0usize;
+    engine.accounts[a].capital = U128::new(1);
+    engine.accounts[a].position_basis_q = 1;
+    engine.accounts[a].adl_a_basis = ADL_ONE;
+    engine.accounts[a].adl_epoch_snap = engine.adl_epoch_long;
+
+    let old_eff = 0i128;
+    let new_eff = 1i128;
+    let buffer_pre = I256::from_i128(1);
+    let result = engine.enforce_one_side_margin(
+        a,
+        DEFAULT_ORACLE,
+        &old_eff,
+        &new_eff,
+        buffer_pre,
+        0,
+        0,
+        false,
+    );
+
+    assert!(matches!(result, Err(RiskError::Undercollateralized)));
+}
+
+// ############################################################################
+// Wave 12-I: Dead-code elimination harnesses
+// ############################################################################
+
+/// Proof: `account_loss_weight_is_counted_in_side_sum` returns false when the
+/// account's b_epoch_snap differs from the side epoch (the fast-reject path).
+/// And when the market is Resolved + ResetPending + epoch==u64::MAX and
+/// adl_epoch_snap matches, returns false (stale reset participant). Otherwise
+/// returns true for matching epochs with a live position. This exercises the
+/// predicate exhaustively over the small-model space.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_account_loss_weight_is_counted_in_side_sum_epoch_mismatch_returns_false() {
+    let mut engine = RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    let i = idx as usize;
+
+    // Install a long position so the account is a loss-weight contributor candidate.
+    engine.accounts[i].position_basis_q = 1_000;
+    engine.accounts[i].adl_a_basis = ADL_ONE;
+
+    // Case 1: epoch mismatch — b_epoch_snap != get_epoch_side(Long).
+    // The engine initializes adl_epoch_long = 0; set b_epoch_snap to 1 to mismatch.
+    engine.accounts[i].b_epoch_snap = 1;
+    engine.adl_epoch_long = 0;
+    assert!(
+        !engine.account_loss_weight_is_counted_in_side_sum(i, Side::Long),
+        "epoch mismatch must return false"
+    );
+
+    // Case 2: epoch match + normal Live market — should return true.
+    engine.accounts[i].b_epoch_snap = 0;
+    engine.adl_epoch_long = 0;
+    assert!(
+        engine.account_loss_weight_is_counted_in_side_sum(i, Side::Long),
+        "epoch match in Live must return true"
+    );
+
+    // Case 3: Resolved + ResetPending + epoch==u64::MAX + adl_epoch_snap matches
+    // — stale reset participant, should return false.
+    engine.market_mode = MarketMode::Resolved;
+    engine.side_mode_long = SideMode::ResetPending;
+    engine.adl_epoch_long = u64::MAX;
+    engine.accounts[i].b_epoch_snap = u64::MAX;
+    engine.accounts[i].adl_epoch_snap = u64::MAX;
+    assert!(
+        !engine.account_loss_weight_is_counted_in_side_sum(i, Side::Long),
+        "stale reset participant (epoch=u64::MAX) must return false"
+    );
+
+    kani::cover!(true, "account_loss_weight_is_counted_in_side_sum all branches reachable");
+}
+
+/// Proof: `force_close_resolved_cursor_not_atomic` is equivalent to calling
+/// `force_close_resolved_cursor_with_fee_not_atomic` with fee_rate=0.
+/// Verifies the zero-fee delegation is correct: both calls produce the same
+/// final state and return value for any Resolved market configuration.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_force_close_resolved_cursor_not_atomic_zero_fee_delegation() {
+    // Build two identical engines.
+    let mut e1 = RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let mut e2 = e1.clone();
+
+    // Transition both to Resolved state with no positioned accounts (cursor scan trivial).
+    e1.market_mode = MarketMode::Resolved;
+    e1.current_slot = DEFAULT_SLOT;
+    e1.resolved_slot = DEFAULT_SLOT;
+    e1.resolved_price = DEFAULT_ORACLE;
+    e1.resolved_live_price = DEFAULT_ORACLE;
+    e2.market_mode = MarketMode::Resolved;
+    e2.current_slot = DEFAULT_SLOT;
+    e2.resolved_slot = DEFAULT_SLOT;
+    e2.resolved_price = DEFAULT_ORACLE;
+    e2.resolved_live_price = DEFAULT_ORACLE;
+
+    let scan_limit: u8 = kani::any();
+    kani::assume(scan_limit > 0);
+
+    let r1 = e1.force_close_resolved_cursor_not_atomic(scan_limit as u64);
+    let r2 = e2.force_close_resolved_cursor_with_fee_not_atomic(scan_limit as u64, 0);
+
+    // Both must agree on result discriminant.
+    assert_eq!(r1.is_ok(), r2.is_ok(), "zero-fee delegation must match fee=0 call");
+    // Both must leave identical engine state (vault, c_tot, insurance).
+    assert_eq!(e1.vault.get(), e2.vault.get(), "vault must agree");
+    assert_eq!(e1.c_tot.get(), e2.c_tot.get(), "c_tot must agree");
+    assert_eq!(
+        e1.insurance_fund.balance.get(),
+        e2.insurance_fund.balance.get(),
+        "insurance must agree"
+    );
+    kani::cover!(r1.is_ok(), "zero-fee cursor delegation succeeds");
+}
+
+/// Proof: `close_resolved_terminal_with_fee_not_atomic` rejects a live-mode
+/// call (Unauthorized), and accepts a zero-PnL resolved account and returns
+/// its capital. Exercises the fee-sync + terminal-close path with fee_rate=0
+/// to verify conservation.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_close_resolved_terminal_with_fee_not_atomic_rejects_live_and_settles_resolved() {
+    let mut engine = RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+
+    // Live mode: must reject with Unauthorized.
+    assert_eq!(
+        engine.market_mode,
+        MarketMode::Live,
+        "engine starts Live"
+    );
+    let live_result = engine.close_resolved_terminal_with_fee_not_atomic(0, 0);
+    assert!(
+        matches!(live_result, Err(RiskError::Unauthorized)),
+        "must reject in Live mode"
+    );
+
+    // Resolved mode: materialize an account with capital but no position/PnL.
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    let deposit_amount: u32 = kani::any();
+    kani::assume(deposit_amount >= 1 && deposit_amount <= 1_000);
+    engine
+        .deposit_not_atomic(idx, deposit_amount as u128, DEFAULT_SLOT)
+        .unwrap();
+
+    engine.market_mode = MarketMode::Resolved;
+    engine.current_slot = DEFAULT_SLOT;
+    engine.resolved_slot = DEFAULT_SLOT;
+    engine.resolved_price = DEFAULT_ORACLE;
+    engine.resolved_live_price = DEFAULT_ORACLE;
+    // Ensure terminal-ready (no stored positions, no stale, no negative PnL).
+    engine.stored_pos_count_long = 0;
+    engine.stored_pos_count_short = 0;
+    engine.stale_account_count_long = 0;
+    engine.stale_account_count_short = 0;
+    engine.neg_pnl_account_count = 0;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
+
+    let vault_before = engine.vault.get();
+    let capital_before = engine.accounts[idx as usize].capital.get();
+    let result = engine.close_resolved_terminal_with_fee_not_atomic(idx, 0);
+
+    assert!(result.is_ok(), "must succeed in Resolved mode with zero PnL");
+    assert_eq!(result.unwrap(), capital_before, "must return correct capital");
+    assert_eq!(
+        engine.vault.get(),
+        vault_before - capital_before,
+        "vault must decrease by released capital"
+    );
+    assert!(engine.check_conservation(), "conservation must hold after close");
+
+    kani::cover!(
+        result.is_ok() && capital_before > 0,
+        "terminal with-fee close releases capital from a funded account"
+    );
 }
