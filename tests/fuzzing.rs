@@ -187,6 +187,8 @@ fn params_regime_a() -> RiskParams {
         min_funding_lifetime_slots: 10_000_000,
         max_active_positions_per_side: 32,
         max_price_move_bps_per_slot: 4,
+        market_kind: 0,
+        _pad_market_kind: [0u8; 7],
     }
 }
 
@@ -210,6 +212,8 @@ fn params_regime_b() -> RiskParams {
         min_funding_lifetime_slots: 10_000_000,
         max_active_positions_per_side: 32,
         max_price_move_bps_per_slot: 4,
+        market_kind: 0,
+        _pad_market_kind: [0u8; 7],
     }
 }
 

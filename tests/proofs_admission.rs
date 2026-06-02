@@ -1408,6 +1408,8 @@ fn same_instruction_bankruptcy_params() -> RiskParams {
         min_funding_lifetime_slots: 1,
         max_active_positions_per_side: 4,
         max_price_move_bps_per_slot: 10_000,
+        market_kind: 0,
+        _pad_market_kind: [0u8; 7],
     }
 }
 

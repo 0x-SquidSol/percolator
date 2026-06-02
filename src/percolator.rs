@@ -744,6 +744,23 @@ pub struct RiskParams {
     /// requirement covers worst-case price movement, funding, and capped
     /// liquidation fee.
     pub max_price_move_bps_per_slot: u64,
+
+    /// Market kind discriminator, mirroring the wrapper's
+    /// `MarketConfig.market_kind`. Default `0` = legacy perp / hyperp /
+    /// native-prediction-spot (engine treats notional as symmetric
+    /// `|eff| * oracle_price / POS_SCALE`). `2` = Polymarket-perp on the
+    /// bounded probability domain — notional is side-aware:
+    ///     notional_long(p)  = |eff| * p             / POS_SCALE
+    ///     notional_short(p) = |eff| * (POS_SCALE-p) / POS_SCALE
+    /// All other engine logic is kind-agnostic; the side-aware branch
+    /// is funnel-localized to `risk_notional_from_eff_q`, so IM, MM,
+    /// IM-trade-open, IM-trade-open-no-pos, and the in-flow notional
+    /// reads inside `execute_trade_not_atomic` all flow through it.
+    ///
+    /// Wrapper writes this field at `InitMarket` (always 0) and on
+    /// `LinkPolymarketMarket` it lifts to 2. No further mutations.
+    pub market_kind: u8,
+    pub _pad_market_kind: [u8; 7],
 }
 
 /// Main risk engine state (spec §2.2)
@@ -5030,11 +5047,43 @@ impl RiskEngine {
         core::cmp::min(x_cap, safe)
     }
 
-    fn risk_notional_from_eff_q(eff: i128, oracle_price: u64) -> u128 {
+    /// Risk notional in collateral units.
+    ///
+    /// For `params.market_kind != 2` (default, legacy perp/hyperp/native-
+    /// prediction-spot): symmetric `notional = |eff| * oracle_price / POS_SCALE`.
+    /// For `params.market_kind == 2` (Polymarket-perp): side-aware —
+    ///   long  → `|eff| * p           / POS_SCALE`
+    ///   short → `|eff| * (POS_SCALE-p) / POS_SCALE`
+    /// where `p = oracle_price` clamped to `(0, POS_SCALE-1]` for
+    /// defence in depth (the wrapper-side ring writer already enforces
+    /// `[POLY_CLAMP_LO, POLY_CLAMP_HI] = [10_000, 990_000]`).
+    ///
+    /// This is the single funnel through which IM, MM, IM-trade-open,
+    /// IM-trade-open-no-pos, and the in-flow notional sites inside
+    /// `execute_trade_not_atomic` all compute notional. One side-aware
+    /// branch here covers every consumer.
+    test_visible! {
+    fn risk_notional_from_eff_q(&self, eff: i128, oracle_price: u64) -> u128 {
         if eff == 0 {
             return 0;
         }
-        mul_div_ceil_u128(eff.unsigned_abs(), oracle_price as u128, POS_SCALE)
+        let abs = eff.unsigned_abs();
+        let factor: u128 = if self.params.market_kind == 2 {
+            // POS_SCALE is u128; cast oracle_price to u128 and clamp.
+            // `min(POS_SCALE - 1)` ensures the subtraction below never
+            // saturates to 0, even if a future caller bypasses the
+            // wrapper's ring-clamp.
+            let p = (oracle_price as u128).min(POS_SCALE - 1);
+            if eff < 0 {
+                POS_SCALE - p
+            } else {
+                p
+            }
+        } else {
+            oracle_price as u128
+        };
+        mul_div_ceil_u128(abs, factor, POS_SCALE)
+    }
     }
 
     fn notional_checked(&self, idx: usize, oracle_price: u64, require_used: bool) -> Result<u128> {
@@ -5042,7 +5091,7 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
         let eff = self.effective_pos_q_checked(idx, require_used)?;
-        Ok(Self::risk_notional_from_eff_q(eff, oracle_price))
+        Ok(self.risk_notional_from_eff_q(eff, oracle_price))
     }
 
     pub fn try_notional(&self, idx: usize, oracle_price: u64) -> Result<u128> {
@@ -8953,11 +9002,11 @@ impl RiskEngine {
 
         // Validate notional bounds
         {
-            let notional_a = Self::risk_notional_from_eff_q(new_eff_a, oracle_price);
+            let notional_a = self.risk_notional_from_eff_q(new_eff_a, oracle_price);
             if notional_a > MAX_ACCOUNT_NOTIONAL {
                 return Err(RiskError::Overflow);
             }
-            let notional_b = Self::risk_notional_from_eff_q(new_eff_b, oracle_price);
+            let notional_b = self.risk_notional_from_eff_q(new_eff_b, oracle_price);
             if notional_b > MAX_ACCOUNT_NOTIONAL {
                 return Err(RiskError::Overflow);
             }
@@ -9342,7 +9391,7 @@ impl RiskEngine {
             // buffer_pre = Eq_maint_raw_pre - MM_req_pre; add MM_req_pre back.
             // Use old_eff (pre-trade) to compute MM_req_pre — NOT current state (post-trade).
             let mm_req_pre_wide = if *old_eff == 0 { I256::ZERO } else {
-                let not_pre = Self::risk_notional_from_eff_q(*old_eff, oracle_price);
+                let not_pre = self.risk_notional_from_eff_q(*old_eff, oracle_price);
                 I256::from_u128(core::cmp::max(
                     mul_div_floor_u128(not_pre, self.params.maintenance_margin_bps as u128, 10_000),
                     self.params.min_nonzero_mm_req))
@@ -9415,7 +9464,7 @@ impl RiskEngine {
             // Recover pre-trade raw equity from buffer_pre + MM_req_pre
             let mm_req_pre = {
                 let not_pre = if *old_eff == 0 { 0u128 } else {
-                    Self::risk_notional_from_eff_q(*old_eff, oracle_price)
+                    self.risk_notional_from_eff_q(*old_eff, oracle_price)
                 };
                 core::cmp::max(
                     mul_div_floor_u128(not_pre, self.params.maintenance_margin_bps as u128, 10_000),

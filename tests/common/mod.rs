@@ -122,6 +122,8 @@ pub fn zero_fee_params() -> RiskParams {
         min_funding_lifetime_slots: 10_000_000,
         max_active_positions_per_side: MAX_ACCOUNTS as u64,
         max_price_move_bps_per_slot: 4,
+        market_kind: 0,
+        _pad_market_kind: [0u8; 7],
     }
 }
 
@@ -332,5 +334,7 @@ pub fn default_params() -> RiskParams {
         min_funding_lifetime_slots: 10_000_000,
         max_active_positions_per_side: MAX_ACCOUNTS as u64,
         max_price_move_bps_per_slot: 3,
+        market_kind: 0,
+        _pad_market_kind: [0u8; 7],
     }
 }
