@@ -628,6 +628,26 @@ fn test_liq_notional_kind2_clamps_at_pos_scale() {
 }
 
 #[test]
+fn test_risk_notional_from_eff_q_kind2_side_aware() {
+    // validate_keeper_hint's predicted MM mirror: the same side-aware
+    // notional the actual MM check uses. Confirms the prediction at
+    // line 10088 (now routed through risk_notional_from_eff_q) sees the
+    // same value the post-partial enforce_partial_liq_post_health sees.
+    let mut p = default_params();
+    p.market_kind = 2;
+    let engine = RiskEngine::new(p);
+    let q_abs: i128 = 1_000;
+    let price = 800_000u64; // p = 0.8
+    let long_signed = q_abs;
+    let short_signed = -q_abs;
+    // ceil for the risk-margin path (matches `risk_notional_from_eff_q`).
+    let long_expected = q_abs as u128 * price as u128 / POS_SCALE; // 800 (ceil = floor here, exact)
+    let short_expected = q_abs as u128 * (POS_SCALE - price as u128) / POS_SCALE; // 200
+    assert_eq!(engine.risk_notional_from_eff_q(long_signed, price), long_expected);
+    assert_eq!(engine.risk_notional_from_eff_q(short_signed, price), short_expected);
+}
+
+#[test]
 fn test_liquidation_eligible_account() {
     // v12.19: use wide_price_move_params (maint=30%, IM=35%) so a 20% adverse
     // price move can fit in one envelope (cap = 25*100*1000 = 2_500_000

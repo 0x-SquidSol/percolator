@@ -10055,8 +10055,14 @@ impl RiskEngine {
                 // Stateless pre-flight: predict post-partial maintenance health.
                 let account = &self.accounts[i];
 
-                // 1. Predict liquidation fee
-                let notional_closed = mul_div_floor_u128(*q_close_q, oracle_price as u128, POS_SCALE);
+                // 1. Predict liquidation fee. Mirror the actual site at
+                //    `liquidate_at_oracle_internal`: side-aware floor notional
+                //    via `liq_notional_from_close`, then ceil at the bps step.
+                //    `eff` is the signed pre-liquidation effective position;
+                //    `eff != 0` is guaranteed by the caller's filter and the
+                //    bounds check at 10051 (`q_close_q < abs_eff` implies abs_eff > 0).
+                let liq_side = side_of_i128(eff).ok_or(RiskError::Overflow)?;
+                let notional_closed = self.liq_notional_from_close(*q_close_q, liq_side, oracle_price);
                 let liq_fee_raw = mul_div_ceil_u128(notional_closed, self.params.liquidation_fee_bps as u128, 10_000);
                 let liq_fee = core::cmp::min(
                     core::cmp::max(liq_fee_raw, self.params.min_liquidation_abs.get()),
@@ -10083,11 +10089,20 @@ impl RiskEngine {
                     None => return Ok(None),
                 };
 
-                // 3. Predict post-partial MM_req
-                let rem_eff = abs_eff - *q_close_q;
-                let rem_notional = mul_div_ceil_u128(rem_eff, oracle_price as u128, POS_SCALE);
+                // 3. Predict post-partial MM_req. Mirror the actual path:
+                //    `enforce_partial_liq_post_health` → `is_above_maintenance_margin`
+                //    → `risk_notional_from_eff_q(signed_eff, oracle_price)` which is
+                //    side-aware ceil. Partial close preserves sign per step 6 of
+                //    `liquidate_at_oracle_internal` (`new_eff = sign(old) * new_eff_abs_q`).
+                let rem_abs = abs_eff - *q_close_q;
+                let rem_eff_signed: i128 = if eff < 0 {
+                    -(rem_abs as i128)
+                } else {
+                    rem_abs as i128
+                };
+                let rem_notional = self.risk_notional_from_eff_q(rem_eff_signed, oracle_price);
                 let proportional_mm = mul_div_floor_u128(rem_notional, self.params.maintenance_margin_bps as u128, 10_000);
-                let predicted_mm_req = if rem_eff == 0 {
+                let predicted_mm_req = if rem_abs == 0 {
                     0u128
                 } else {
                     core::cmp::max(proportional_mm, self.params.min_nonzero_mm_req)
