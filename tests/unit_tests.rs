@@ -582,6 +582,52 @@ fn test_haircut_ratio_with_surplus() {
 // ============================================================================
 
 #[test]
+fn test_liq_notional_kind0_symmetric_long_short() {
+    // Kind=0 markets: the liq-fee notional must be symmetric in side
+    // (q*p/POS_SCALE for both long and short).
+    let mut p = default_params();
+    p.market_kind = 0;
+    let engine = RiskEngine::new(p);
+    let q = 1_000u128;
+    let price = 750_000u64; // 0.75 in POS_SCALE
+    let expected = (q * price as u128) / POS_SCALE;
+    assert_eq!(engine.liq_notional_from_close(q, Side::Long, price), expected);
+    assert_eq!(engine.liq_notional_from_close(q, Side::Short, price), expected);
+}
+
+#[test]
+fn test_liq_notional_kind2_side_aware() {
+    // Regression: kind=2 markets must charge `q*p/POS_SCALE` for a long
+    // close and `q*(POS_SCALE-p)/POS_SCALE` for a short close. Pre-fix
+    // both sides got `q*p` — short close at p=0.8 was over-charged 4×.
+    let mut p = default_params();
+    p.market_kind = 2;
+    let engine = RiskEngine::new(p);
+    let q = 1_000u128;
+    let price = 800_000u64; // p = 0.8
+    let long_expected = (q * price as u128) / POS_SCALE; // 800
+    let short_expected = (q * (POS_SCALE - price as u128)) / POS_SCALE; // 200
+    assert_eq!(engine.liq_notional_from_close(q, Side::Long, price), long_expected);
+    assert_eq!(engine.liq_notional_from_close(q, Side::Short, price), short_expected);
+    assert_ne!(long_expected, short_expected, "test setup must distinguish sides");
+}
+
+#[test]
+fn test_liq_notional_kind2_clamps_at_pos_scale() {
+    // POS_SCALE-1 ceiling on `p` keeps `factor = POS_SCALE - p` at >= 1
+    // even when the caller passes oracle_price == POS_SCALE. Without the
+    // clamp this would saturate to 0 (and pre-fix the caller's wrong
+    // multiplication path would also panic on underflow for p > POS_SCALE).
+    // Use q = POS_SCALE so floor rounding doesn't truncate to zero.
+    let mut p = default_params();
+    p.market_kind = 2;
+    let engine = RiskEngine::new(p);
+    let q = POS_SCALE;
+    let short = engine.liq_notional_from_close(q, Side::Short, POS_SCALE as u64);
+    assert_eq!(short, 1, "factor clamps to 1 at p=POS_SCALE; q=POS_SCALE → notional=1");
+}
+
+#[test]
 fn test_liquidation_eligible_account() {
     // v12.19: use wide_price_move_params (maint=30%, IM=35%) so a 20% adverse
     // price move can fit in one envelope (cap = 25*100*1000 = 2_500_000

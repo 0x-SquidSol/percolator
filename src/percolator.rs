@@ -5086,6 +5086,26 @@ impl RiskEngine {
     }
     }
 
+    /// Side-aware liquidation-fee notional. Kind=0 reduces to the symmetric
+    /// `q*p/POS_SCALE` (byte-identical to the inline expression these call
+    /// sites used). Kind=2 (prediction) pays `p` per unit on a long close
+    /// and `(POS_SCALE - p)` on a short close. Uses floor to preserve the
+    /// pre-fix kind=0 fee exactly; ceil is applied at the bps step below.
+    test_visible! {
+    fn liq_notional_from_close(&self, q_close_q: u128, side: Side, oracle_price: u64) -> u128 {
+        let factor: u128 = if self.params.market_kind == 2 {
+            let p = (oracle_price as u128).min(POS_SCALE - 1);
+            match side {
+                Side::Short => POS_SCALE - p,
+                Side::Long => p,
+            }
+        } else {
+            oracle_price as u128
+        };
+        mul_div_floor_u128(q_close_q, factor, POS_SCALE)
+    }
+    }
+
     fn notional_checked(&self, idx: usize, oracle_price: u64, require_used: bool) -> Result<u128> {
         if oracle_price == 0 || oracle_price > MAX_ORACLE_PRICE {
             return Err(RiskError::Overflow);
@@ -9634,10 +9654,12 @@ impl RiskEngine {
                 // `trigger_bankruptcy_hmax_lock(ctx)` (mirrors toly:8364).
                 self.settle_losses_with_context(idx as usize, Some(ctx))?;
 
-                // Step 10-11: charge liquidation fee on quantity closed
+                // Step 10-11: charge liquidation fee on quantity closed.
+                // Side-aware notional so kind=2 short closes pay (1-p)*q,
+                // long closes pay p*q; kind=0 unchanged.
                 let liq_fee = {
                     let notional_val =
-                        mul_div_floor_u128(q_close_q, oracle_price as u128, POS_SCALE);
+                        self.liq_notional_from_close(q_close_q, liq_side, oracle_price);
                     let liq_fee_raw = mul_div_ceil_u128(
                         notional_val,
                         self.params.liquidation_fee_bps as u128,
@@ -9675,12 +9697,14 @@ impl RiskEngine {
                 // `trigger_bankruptcy_hmax_lock(ctx)` (mirrors toly:8402).
                 self.settle_losses_with_context(idx as usize, Some(ctx))?;
 
-                // Charge liquidation fee (spec §8.3)
+                // Charge liquidation fee (spec §8.3). Side-aware notional so
+                // kind=2 short closes pay (1-p)*q, long closes pay p*q;
+                // kind=0 unchanged.
                 let liq_fee = if q_close_q == 0 {
                     0u128
                 } else {
                     let notional_val =
-                        mul_div_floor_u128(q_close_q, oracle_price as u128, POS_SCALE);
+                        self.liq_notional_from_close(q_close_q, liq_side, oracle_price);
                     let liq_fee_raw = mul_div_ceil_u128(
                         notional_val,
                         self.params.liquidation_fee_bps as u128,
