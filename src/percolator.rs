@@ -9700,6 +9700,19 @@ impl RiskEngine {
                 // Charge liquidation fee (spec §8.3). Side-aware notional so
                 // kind=2 short closes pay (1-p)*q, long closes pay p*q;
                 // kind=0 unchanged.
+                //
+                // Floor / cap policy for kind=2: `min_liquidation_abs` is
+                // an absolute USDC floor that does NOT scale with the
+                // side-aware notional. For a kind=2 short at p=0.99 with
+                // tiny `q*(1-p)` notional, the floor can dominate the
+                // bps fee. This is intentional — the floor backs the
+                // insurance fund's minimum claim per liquidation event.
+                // Admin policy at InitMarket should tune
+                // `min_liquidation_abs` low enough that legitimate
+                // edge-band positions don't pay disproportionate fees,
+                // while still backing insurance for the per-liquidation
+                // gas/state-write cost. The bps and cap remain
+                // side-aware; only the floor is absolute by design.
                 let liq_fee = if q_close_q == 0 {
                     0u128
                 } else {
