@@ -5062,8 +5062,11 @@ impl RiskEngine {
     /// IM-trade-open-no-pos, and the in-flow notional sites inside
     /// `execute_trade_not_atomic` all compute notional. One side-aware
     /// branch here covers every consumer.
-    test_visible! {
-    fn risk_notional_from_eff_q(&self, eff: i128, oracle_price: u64) -> u128 {
+    // `pub` (not test_visible!) so the wrapper crate's keeper-crank
+    // liquidation pre-flight can call this same side-aware funnel in
+    // release builds — keeping the wrapper's prediction in lockstep with
+    // the engine's execution instead of carrying a divergent symmetric copy.
+    pub fn risk_notional_from_eff_q(&self, eff: i128, oracle_price: u64) -> u128 {
         if eff == 0 {
             return 0;
         }
@@ -5084,15 +5087,16 @@ impl RiskEngine {
         };
         mul_div_ceil_u128(abs, factor, POS_SCALE)
     }
-    }
 
     /// Side-aware liquidation-fee notional. Kind=0 reduces to the symmetric
     /// `q*p/POS_SCALE` (byte-identical to the inline expression these call
     /// sites used). Kind=2 (prediction) pays `p` per unit on a long close
     /// and `(POS_SCALE - p)` on a short close. Uses floor to preserve the
     /// pre-fix kind=0 fee exactly; ceil is applied at the bps step below.
-    test_visible! {
-    fn liq_notional_from_close(&self, q_close_q: u128, side: Side, oracle_price: u64) -> u128 {
+    // `pub` (not test_visible!) so the wrapper crate's keeper-crank
+    // liquidation pre-flight calls this same side-aware fee notional in
+    // release builds rather than a divergent symmetric copy.
+    pub fn liq_notional_from_close(&self, q_close_q: u128, side: Side, oracle_price: u64) -> u128 {
         let factor: u128 = if self.params.market_kind == 2 {
             let p = (oracle_price as u128).min(POS_SCALE - 1);
             match side {
@@ -5103,7 +5107,6 @@ impl RiskEngine {
             oracle_price as u128
         };
         mul_div_floor_u128(q_close_q, factor, POS_SCALE)
-    }
     }
 
     fn notional_checked(&self, idx: usize, oracle_price: u64, require_used: bool) -> Result<u128> {
