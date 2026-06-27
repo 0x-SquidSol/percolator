@@ -48,6 +48,11 @@ pub mod wide_math;
 #[cfg(all(not(kani), not(feature = "fork-facade")))]
 mod wide_math;
 
+/// Autonomous per-market buyback: gate parameters, failure types, the
+/// market-exposure helper, and the eligibility predicate. Pure (no engine
+/// or Solana deps); consumed by the buyback handler in `percolator-stake`.
+pub mod buyback;
+
 #[cfg(kani)]
 pub use v16::*;
 #[cfg(not(kani))]
