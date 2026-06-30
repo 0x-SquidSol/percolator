@@ -5557,6 +5557,62 @@ impl<'a, T> MarketGroupV16View<'a, T> {
         }
         Ok(())
     }
+
+    // Senior backing-provider earnings (LP utilization fees) summed across every
+    // domain — the same quantity validate_shape's senior stack includes.
+    fn backing_provider_earnings_total(&self) -> u128 {
+        self.header.backing_provider_earnings_total.get()
+    }
+
+    // Recoverable counterparty backing principal (Fresh-bucket unliened+liened
+    // atoms across every domain): provider-withdrawable whenever the domain is
+    // fully backed, with no mode or payout-snapshot gate, so it is a senior-side
+    // claim on the vault — never junior surplus.
+    fn source_fresh_backing_total_atoms(&self) -> u128 {
+        self.header.source_fresh_backing_total_num.get() / BOUND_SCALE
+    }
+
+    // Junior (positive-PnL) payout pool = vault minus ALL senior claims: capital
+    // (c_tot), insurance, backing-provider earnings, AND recoverable counterparty
+    // backing principal. Omitting a senior claim here over-states the pool and
+    // promises the same vault atoms to two parties: a haircut resolved-close
+    // over-pays winners out of value its owner can still withdraw (or, when the
+    // final validate_shape catches it, deadlocks the close permanently).
+    //
+    // Read-only group math: the canonical definition lives here on the immutable
+    // view, and `MarketGroupV16ViewMut` delegates via `as_view()` (the same
+    // pattern as `validate_shape`), so the matcher and the read-only buyback
+    // haircut gate consume a byte-identical value — no divergence.
+    fn residual(&self) -> u128 {
+        self.header.vault.get().saturating_sub(
+            self.header
+                .c_tot
+                .get()
+                .saturating_add(self.header.insurance.get())
+                .saturating_add(self.backing_provider_earnings_total())
+                .saturating_add(self.source_fresh_backing_total_atoms()),
+        )
+    }
+
+    fn junior_claim_bound(&self) -> u128 {
+        self.header.pnl_pos_bound_tot.get()
+    }
+
+    /// Whether the market group is currently applying a positive-PnL haircut —
+    /// the EXACT condition the matcher applies in `haircut_effective_support`:
+    /// the junior (positive-PnL) payout pool (`residual`) does not fully cover
+    /// the bound positive-PnL claims (`pnl_pos_bound_tot`). When `true`, winners
+    /// are being paid less than 100%, i.e. the deficit is landing on
+    /// insurance/stakers — "market under stress" for the buyback gate
+    /// (PROPOSAL.md §2.4 / §5.2).
+    ///
+    /// Consumes the same private `residual` / `junior_claim_bound` the matcher
+    /// uses (no parallel re-derivation), exposed read-only for the buyback
+    /// program's permissionless trigger gate.
+    pub fn group_haircut_active(&self) -> bool {
+        let junior_bound = self.junior_claim_bound();
+        junior_bound > 0 && self.residual() < junior_bound
+    }
 }
 
 impl<'a, T> MarketGroupV16ViewMut<'a, T> {
@@ -5756,35 +5812,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(())
     }
 
-    // Senior backing-provider earnings (LP utilization fees) summed across every
-    // domain — the same quantity validate_shape's senior stack includes.
-    fn backing_provider_earnings_total(&self) -> u128 {
-        self.header.backing_provider_earnings_total.get()
-    }
-
-    // Recoverable counterparty backing principal (Fresh-bucket unliened+liened
-    // atoms across every domain): provider-withdrawable whenever the domain is
-    // fully backed, with no mode or payout-snapshot gate, so it is a senior-side
-    // claim on the vault — never junior surplus.
-    fn source_fresh_backing_total_atoms(&self) -> u128 {
-        self.header.source_fresh_backing_total_num.get() / BOUND_SCALE
-    }
-
-    // Junior (positive-PnL) payout pool = vault minus ALL senior claims: capital
-    // (c_tot), insurance, backing-provider earnings, AND recoverable counterparty
-    // backing principal. Omitting a senior claim here over-states the pool and
-    // promises the same vault atoms to two parties: a haircut resolved-close
-    // over-pays winners out of value its owner can still withdraw (or, when the
-    // final validate_shape catches it, deadlocks the close permanently).
+    // Read-only junior-payout-pool math. The canonical definitions now live on
+    // the immutable `MarketGroupV16View`; these delegate via `as_view()` (the
+    // same pattern as `validate_shape` above) so the matcher and the read-only
+    // buyback haircut gate consume a byte-identical value — no divergence.
     fn residual(&self) -> u128 {
-        self.header.vault.get().saturating_sub(
-            self.header
-                .c_tot
-                .get()
-                .saturating_add(self.header.insurance.get())
-                .saturating_add(self.backing_provider_earnings_total())
-                .saturating_add(self.source_fresh_backing_total_atoms()),
-        )
+        self.as_view().residual()
     }
 
     #[cfg(kani)]
@@ -5793,7 +5826,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     fn junior_claim_bound(&self) -> u128 {
-        self.header.pnl_pos_bound_tot.get()
+        self.as_view().junior_claim_bound()
     }
 
     fn domain_asset_side(&self, domain: usize) -> V16Result<(usize, SideV16)> {
