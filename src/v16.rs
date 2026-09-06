@@ -701,41 +701,10 @@ pub fn kani_liquidation_partial_search_hi(
     liquidation_partial_search_hi(config, old_abs_q, effective_price)
 }
 
-/// GH#457 — the ATTACH writer, A-scaled to match `clear_leg` and partial-reduce.
-///
-/// This is the third nominal-basis writer engine #134 enumerated, and the one left
-/// unfixed. #132 gave `clear_leg` difference-of-aggregates, #157/#449 did the same
-/// for the partial-reduce writer, #134 removed the value MINT — but attach went on
-/// doing `oi_eff += abs_q` into an A-SCALED accumulator.
-///
-/// On a fresh side (`a == ADL_ONE`) raw `abs_q` happens to equal the aggregate
-/// contribution, so nothing drifts. On a side already scaled by a prior unilateral
-/// close, per-leg rounding does not sum to the rounding of the sum, so `oi_eff`
-/// lags `floor(a · Σloss_weight / SOCIAL_WEIGHT_SCALE)`. `clear_leg` then subtracts
-/// the full aggregate contribution and underflows the under-recorded counter —
-/// `CounterUnderflow` on a LEGITIMATE close. Liquidation routes through the same
-/// `clear_leg`, so the position cannot be forced out either.
-///
-/// The drift is invisible in production: `validate_shape` checks
-/// `oi_eff_long == oi_eff_short`, and both sides drift together.
-///
-/// The contribution is the DIFFERENCE OF AGGREGATES, mirroring `clear_leg` exactly.
-/// That is what makes them telescope — attach adds `eff(w + weight) - eff(w)`,
-/// detach removes `eff(w) - eff(w - weight)` — so the stored counter equals
-/// `floor(a · Σweights / SCALE)` after every operation and the last leg to leave
-/// takes `oi_eff` to exactly zero.
-///
-/// `abs_q` is deliberately gone from the `oi_eff` math. The nominal size still does
-/// its job in the caller, as the input to `loss_weight_for_basis`.
-///
-/// NOT a behaviour change on an unscaled side: `SOCIAL_WEIGHT_SCALE == ADL_ONE`, so
-/// at `a == ADL_ONE` the difference reduces to `loss_weight`, which is itself
-/// `ceil(abs_q · SCALE / ADL_ONE) == abs_q`. A market that has never ADL'd behaves
-/// identically.
 fn add_open_interest_for_new_position(
     asset: &mut AssetStateV16,
     side: SideV16,
-    a_basis: u128,
+    abs_q: u128,
     loss_weight: u128,
 ) -> V16Result<()> {
     match side {
@@ -744,36 +713,28 @@ fn add_open_interest_for_new_position(
                 .stored_pos_count_long
                 .checked_add(1)
                 .ok_or(V16Error::CounterOverflow)?;
-            let w_after = asset
+            asset.oi_eff_long_q = asset
+                .oi_eff_long_q
+                .checked_add(abs_q)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            asset.loss_weight_sum_long = asset
                 .loss_weight_sum_long
                 .checked_add(loss_weight)
                 .ok_or(V16Error::ArithmeticOverflow)?;
-            let eff_before =
-                wide_mul_div_floor_u128(a_basis, asset.loss_weight_sum_long, SOCIAL_WEIGHT_SCALE);
-            let eff_after = wide_mul_div_floor_u128(a_basis, w_after, SOCIAL_WEIGHT_SCALE);
-            asset.oi_eff_long_q = asset
-                .oi_eff_long_q
-                .checked_add(eff_after.saturating_sub(eff_before))
-                .ok_or(V16Error::ArithmeticOverflow)?;
-            asset.loss_weight_sum_long = w_after;
         }
         SideV16::Short => {
             asset.stored_pos_count_short = asset
                 .stored_pos_count_short
                 .checked_add(1)
                 .ok_or(V16Error::CounterOverflow)?;
-            let w_after = asset
+            asset.oi_eff_short_q = asset
+                .oi_eff_short_q
+                .checked_add(abs_q)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            asset.loss_weight_sum_short = asset
                 .loss_weight_sum_short
                 .checked_add(loss_weight)
                 .ok_or(V16Error::ArithmeticOverflow)?;
-            let eff_before =
-                wide_mul_div_floor_u128(a_basis, asset.loss_weight_sum_short, SOCIAL_WEIGHT_SCALE);
-            let eff_after = wide_mul_div_floor_u128(a_basis, w_after, SOCIAL_WEIGHT_SCALE);
-            asset.oi_eff_short_q = asset
-                .oi_eff_short_q
-                .checked_add(eff_after.saturating_sub(eff_before))
-                .ok_or(V16Error::ArithmeticOverflow)?;
-            asset.loss_weight_sum_short = w_after;
         }
     }
     Ok(())
@@ -783,10 +744,10 @@ fn add_open_interest_for_new_position(
 pub fn kani_add_open_interest_for_new_position(
     asset: &mut AssetStateV16,
     side: SideV16,
-    a_basis: u128,
+    abs_q: u128,
     loss_weight: u128,
 ) -> V16Result<()> {
-    add_open_interest_for_new_position(asset, side, a_basis, loss_weight)
+    add_open_interest_for_new_position(asset, side, abs_q, loss_weight)
 }
 
 #[inline]
@@ -11873,10 +11834,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if loss_weight == 0 {
             return Err(V16Error::InvalidLeg);
         }
-        // GH#457: pass the side's A-basis, not the nominal size. The contribution to
-        // the A-scaled oi_eff is a difference of aggregates; `basis_pos_q` has already
-        // done its job above, as the input to loss_weight_for_basis.
-        add_open_interest_for_new_position(&mut asset, side, a_basis, loss_weight)?;
+        add_open_interest_for_new_position(
+            &mut asset,
+            side,
+            basis_pos_q.unsigned_abs(),
+            loss_weight,
+        )?;
         account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
             active: true,
             asset_index: asset_index as u32,
