@@ -845,12 +845,31 @@ Before any OI-increasing operation rejects on `ResetPending`, it MUST call `mayb
 Let:
 
 ```text
-Residual = V - (C_tot + I)   // checked, and invariant guarantees nonnegative
+Residual = V - (C_tot + I + E + F)   // checked, and invariant guarantees nonnegative
+                                     // E = backing_provider_earnings_total
+                                     // F = source_fresh_backing_total (BOUND_SCALE-normalised)
 PosPNL_i = max(PNL_i, 0)
 ReleasedPos_i = PosPNL_i - R_i on Live
 ReleasedPos_i = PosPNL_i on Resolved
 PendingWarmupTot = PNL_pos_tot - PNL_matured_pos_tot = sum R_i on Live
 ```
+
+`E` and `F` are senior and MUST be excluded from `Residual`. `E` is utilization
+fees already owed to backing providers; `F` is backing earmarked to a specific
+source-backed claim, withdrawable by its provider whenever the domain is fully
+backed. Counting either in the junior pool promises the same vault atoms to two
+parties, and whichever moves second is robbed or stranded.
+
+Junior claims are paid by one of two disjoint routes:
+
+- an account **with** source claims is paid from that claim's backing, limited by
+  the backing rather than by `Residual`;
+- an account **without** source claims is paid from `Residual`, pro-rata via `h`.
+
+The exclusion of `F` from `Residual` is what makes those two routes disjoint: an
+atom earmarked to a backed claim is not also offered to unsecured claimants. A
+reader who applies `h` to a source-backed claim, or who computes `Residual`
+without `E` and `F`, will derive a haircut the engine does not apply.
 
 Canonical haircut pairs:
 
@@ -933,7 +952,7 @@ It releases `release` to `PNL_matured_pos_tot`. If the scheduled bucket empties,
 `admit_fresh_reserve_h_lock(i, fresh_positive_pnl_i, ctx, admit_h_min, admit_h_max) -> admitted_h_eff` requires a live materialized account and valid admission pair. Let:
 
 ```text
-Residual_now = V - (C_tot + I)
+Residual_now = V - (C_tot + I + E + F)   // same four senior terms as §3
 matured_plus_fresh = PNL_matured_pos_tot + fresh_positive_pnl_i
 threshold_opt = ctx.admit_h_max_consumption_threshold_bps_opt_shared
 ```

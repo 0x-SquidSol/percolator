@@ -35,12 +35,48 @@ Capital is senior. Profit is junior. A single global ratio determines how much
 released positive PnL is actually backed.
 
 ```
-Residual  = max(0, V - C_tot - I)
+Residual  = max(0, V - C_tot - I - E - F)
 
               min(Residual, PNL_matured_pos_tot)
     h     =  ----------------------------------
                     PNL_matured_pos_tot
 ```
+
+`Residual` is what is left for junior claims after **every** senior claim, and
+there are four of them, not two:
+
+| term | what it is | why it is senior |
+|---|---|---|
+| `C_tot` | deposited capital | principal is never junior to profit |
+| `I` | insurance | reserved against future losses |
+| `E` | `backing_provider_earnings_total` | utilization fees already owed to LPs |
+| `F` | `source_fresh_backing_total` | backing earmarked to a specific claim |
+
+`E` and `F` are easy to overlook and both are load-bearing. Omitting either
+over-states the junior pool and promises winners atoms that someone else can
+already withdraw — see the Kani proofs
+`proof_v16_residual_excludes_senior_backing_provider_earnings` and
+`proof_v16_residual_excludes_recoverable_counterparty_backing_principal`.
+
+### Two ways a junior claim gets paid
+
+`h` above governs **unsecured** junior claims — those with no dedicated
+backing. A claim that *is* source-backed is paid from its own backing instead,
+and does not compete for `Residual`:
+
+```
+account has source claims   ->  paid from that claim's backing (backing-limited)
+otherwise                   ->  paid from Residual, pro-rata via h
+```
+
+That is a seniority *structure*, not an exemption, and `F` is what keeps the two
+consistent: atoms earmarked to a backed claim are removed from `Residual`, so the
+same atom is never promised to both a backed and an unsecured claimant.
+
+When a losing account's principal is consumed it becomes exactly this kind of
+earmarked backing for its counterparty — capital and `c_tot` fall by precisely
+the amount that appears as backing, and the vault does not move. Value is
+reshaped, never created (`proof_v16_capital_backed_loss_reservation_is_value_neutral_and_capital_capped`).
 
 If fully backed, `h = 1`. If stressed, `h < 1`. Every profitable account sees
 the same fraction of its *released* positive PnL:
