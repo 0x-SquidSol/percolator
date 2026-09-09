@@ -13229,6 +13229,25 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(())
     }
 
+    fn begin_zero_oi_residue_resets(&mut self, asset_index: usize) -> V16Result<()> {
+        let asset = self.asset_state(asset_index)?;
+        let reset_long = asset.oi_eff_long_q == 0
+            && asset.stored_pos_count_long != 0
+            && asset.pending_obligation_count_long == 0
+            && asset.mode_long != SideModeV16::ResetPending;
+        let reset_short = asset.oi_eff_short_q == 0
+            && asset.stored_pos_count_short != 0
+            && asset.pending_obligation_count_short == 0
+            && asset.mode_short != SideModeV16::ResetPending;
+        if reset_long {
+            self.begin_full_drain_reset_inner(asset_index, SideV16::Long)?;
+        }
+        if reset_short {
+            self.begin_full_drain_reset_inner(asset_index, SideV16::Short)?;
+        }
+        Ok(())
+    }
+
     fn unilateral_close_capacity(&self, asset_index: usize, stored_abs: u128) -> V16Result<u128> {
         let asset = self.asset_state(asset_index)?;
         Ok(V16Core::kernel_unilateral_close_capacity(
@@ -13496,6 +13515,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         self.reduce_position(account, request.asset_index, close_q)?;
         self.certify_account_after_local_settlement_with_price_override(account, None)?;
+        self.begin_zero_oi_residue_resets(request.asset_index)?;
         self.validate_liquidation_progress_from_score(before_score, &account.as_view())?;
         self.validate_shape_audit_scan()?;
         self.validate_account_audit_scan(&account.as_view())?;
@@ -13550,6 +13570,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.reduce_position(account, request.asset_index, reduce_q)?;
         self.settle_negative_pnl_from_principal_not_atomic(account)?;
         self.certify_account_after_local_settlement_with_price_override(account, None)?;
+        self.begin_zero_oi_residue_resets(request.asset_index)?;
         self.validate_liquidation_progress_from_score(before_score, &account.as_view())?;
         self.validate_shape_audit_scan()?;
         self.validate_account_audit_scan(&account.as_view())?;
@@ -14199,6 +14220,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             long_has_source_claims,
             short_has_source_claims,
         )?;
+        // ADL can leave stored basis larger than effective OI. Start resets only after final margin
+        // checks so the reset's risk-epoch advance leaves each affected account certificate stale;
+        // the public auto-crank then selects Refresh and clears the economically exhausted residue.
+        let mut i = 0usize;
+        while i < requests.len() {
+            self.begin_zero_oi_residue_resets(requests[i].asset_index)?;
+            i += 1;
+        }
         Ok(outcome)
     }
 
@@ -14279,6 +14308,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             long_has_source_claims,
             short_has_source_claims,
         )?;
+        // ADL can leave stored basis larger than effective OI. Start resets only after final margin
+        // checks so the reset's risk-epoch advance leaves each affected account certificate stale;
+        // the public auto-crank then selects Refresh and clears the economically exhausted residue.
+        let mut i = 0usize;
+        while i < requests.len() {
+            self.begin_zero_oi_residue_resets(requests[i].asset_index)?;
+            i += 1;
+        }
         Ok(outcome)
     }
 
