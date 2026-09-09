@@ -1053,6 +1053,205 @@ fn v16_batch_trade_rejects_loss_stale_risk_increase_after_inline_settlement() {
 }
 
 #[test]
+fn v16_fully_accrued_kf_cohort_blocks_fresh_risk_until_every_side_settles() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut winner_header = account_fixture(1, 211);
+    let mut loser_header = account_fixture(1, 212);
+    let mut entrant_header = account_fixture(1, 213);
+    let request = TradeRequestV16 {
+        asset_index: 0,
+        size_q: signed_q(POS_SCALE),
+        exec_price: 101,
+        fee_bps: 0,
+    };
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut winner = PortfolioV16ViewMut::new(&mut winner_header);
+    let mut loser = PortfolioV16ViewMut::new(&mut loser_header);
+    let mut entrant = PortfolioV16ViewMut::new(&mut entrant_header);
+    for account in [&mut winner, &mut loser, &mut entrant] {
+        market.deposit_not_atomic(account, 10_000).unwrap();
+    }
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut winner,
+            &mut loser,
+            TradeRequestV16 {
+                exec_price: 100,
+                ..request
+            },
+            true,
+        )
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(0, 2, 101, 0, true)
+        .unwrap();
+    market.markets[0].engine.asset.raw_oracle_target_price = V16PodU64::new(101);
+    let accrued = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(accrued.slot_last, market.header.current_slot.get());
+    assert_eq!(accrued.stale_account_count_long, 1);
+    assert_eq!(accrued.stale_account_count_short, 1);
+
+    market.full_account_refresh_not_atomic(&mut winner).unwrap();
+    let winner_current = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(winner_current.stale_account_count_long, 0);
+    assert_eq!(winner_current.stale_account_count_short, 1);
+
+    let rejected = market.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+        &mut entrant,
+        &mut winner,
+        request,
+        true,
+    );
+    assert_eq!(rejected, Err(V16Error::LockActive));
+    assert_eq!(entrant.header.active_bitmap[0].get(), 0);
+    assert_ne!(winner.header.active_bitmap[0].get(), 0);
+
+    market.full_account_refresh_not_atomic(&mut loser).unwrap();
+    let current = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(current.stale_account_count_long, 0);
+    assert_eq!(current.stale_account_count_short, 0);
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut entrant,
+            &mut winner,
+            request,
+            true,
+        )
+        .expect("settling the final stale cohort must reopen risk transfer");
+    market.validate_shape().unwrap();
+    winner.validate_with_market(&market.as_view()).unwrap();
+    loser.validate_with_market(&market.as_view()).unwrap();
+    entrant.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_kf_epoch_clears_exact_index_reversal_without_duplicate_discharge() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut long_header = account_fixture(1, 214);
+    let mut short_header = account_fixture(1, 215);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.deposit_not_atomic(&mut long, 10_000).unwrap();
+    market.deposit_not_atomic(&mut short, 10_000).unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(POS_SCALE),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+
+    market
+        .accrue_asset_to_not_atomic(0, 2, 101, 0, true)
+        .unwrap();
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    let first = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(first.kf_epoch_long, 2);
+    assert_eq!(first.kf_epoch_short, 2);
+    assert_eq!(first.stale_account_count_long, 0);
+    assert_eq!(first.stale_account_count_short, 1);
+
+    market
+        .accrue_asset_to_not_atomic(0, 3, 100, 0, true)
+        .unwrap();
+    let reversed = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(reversed.k_long, 0);
+    assert_eq!(reversed.k_short, 0);
+    assert_eq!(reversed.kf_epoch_long, 3);
+    assert_eq!(reversed.kf_epoch_short, 3);
+    assert_eq!(reversed.stale_account_count_long, 1);
+    assert_eq!(reversed.stale_account_count_short, 1);
+
+    // The short's arithmetic snapshots already equal the reversed targets, but
+    // its older epoch still owns one cohort membership and must discharge it.
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    let short_current = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(short_current.stale_account_count_long, 1);
+    assert_eq!(short_current.stale_account_count_short, 0);
+    assert_eq!(short.header.pnl.get(), 0);
+    assert_eq!(
+        short.header.legs[0].try_to_runtime().unwrap().kf_epoch_snap,
+        3
+    );
+
+    // Repeating the same account at the same epoch cannot discharge the long.
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    let repeated = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(repeated.stale_account_count_long, 1);
+    assert_eq!(repeated.stale_account_count_short, 0);
+
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    let current = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(current.stale_account_count_long, 0);
+    assert_eq!(current.stale_account_count_short, 0);
+    assert_eq!(long.header.pnl.get(), 0);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_stale_opposite_cohort_does_not_block_bounded_owner_reduction() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut long_header = account_fixture(1, 216);
+    let mut short_header = account_fixture(1, 217);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.deposit_not_atomic(&mut long, 10_000).unwrap();
+    market.deposit_not_atomic(&mut short, 10_000).unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(POS_SCALE),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(0, 2, 101, 0, true)
+        .unwrap();
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    let stale = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(stale.stale_account_count_long, 0);
+    assert_eq!(stale.stale_account_count_short, 1);
+
+    let reduced = market
+        .rebalance_reduce_position_not_atomic(
+            &mut long,
+            RebalanceRequestV16 {
+                asset_index: 0,
+                reduce_q: POS_SCALE,
+            },
+        )
+        .expect("a stale counterparty cannot block the owner's bounded exit");
+    assert_eq!(reduced.reduced_q, POS_SCALE);
+    assert_eq!(long.header.active_bitmap[0].get(), 0);
+    let after = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(after.stored_pos_count_long, 0);
+    assert_eq!(after.stale_account_count_long, 0);
+    assert_eq!(after.stale_account_count_short, 1);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
 fn v16_public_scoped_trade_preserves_unrelated_loss_stale_summary() {
     let (mut header, mut markets) = market_fixture(2, 100);
     let mut long_header = account_fixture(2, 209);
@@ -1422,6 +1621,7 @@ fn v16_reused_market_slot_rejects_old_market_id_leg() {
         a_basis: ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: POS_SCALE,
         b_snap: 0,
@@ -2045,6 +2245,7 @@ fn v16_public_liquidation_on_unfunded_domain_cannot_drain_shared_insurance() {
         a_basis: ADL_ONE,
         k_snap: asset.k_long,
         f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
         epoch_snap: asset.epoch_long,
         loss_weight: POS_SCALE,
         b_snap: asset.b_long_num,
@@ -2130,6 +2331,7 @@ fn v16_liquidation_engine_selects_healthy_partial_before_margin_floor() {
         a_basis: ADL_ONE,
         k_snap: asset.k_long,
         f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
         epoch_snap: asset.epoch_long,
         loss_weight: POSITION_Q,
         b_snap: asset.b_long_num,
@@ -2204,6 +2406,7 @@ fn v16_permissionless_liquidation_progresses_when_unrelated_asset_is_loss_stale(
         a_basis: ADL_ONE,
         k_snap: asset0.k_long,
         f_snap: asset0.f_long_num,
+        kf_epoch_snap: 0,
         epoch_snap: asset0.epoch_long,
         loss_weight: POS_SCALE,
         b_snap: asset0.b_long_num,
@@ -3502,6 +3705,7 @@ fn v16_crossed_trade_cannot_spend_same_call_addition_as_preexisting_oi() {
         a_basis: ADL_ONE,
         k_snap: asset.k_short,
         f_snap: asset.f_short_num,
+        kf_epoch_snap: 0,
         epoch_snap: asset.epoch_short,
         loss_weight: LIQUIDATED_SHORT_Q,
         b_snap: asset.b_short_num,
@@ -3523,6 +3727,7 @@ fn v16_crossed_trade_cannot_spend_same_call_addition_as_preexisting_oi() {
         a_basis: ADL_ONE,
         k_snap: asset.k_long,
         f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
         epoch_snap: asset.epoch_long,
         loss_weight: SURVIVOR_LONG_Q,
         b_snap: asset.b_long_num,
