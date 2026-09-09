@@ -8763,48 +8763,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         V16Core::prepare_insurance_lien_terminal_release_delta(reservation, source, amount)
     }
 
-    #[cfg(kani)]
-    pub fn kani_apply_insurance_lien_consume_domain_delta(
-        &mut self,
-        domain: usize,
-        amount: u128,
-    ) -> V16Result<()> {
-        self.domain_asset_side(domain)?;
-        if amount == 0 {
-            return Ok(());
-        }
-        let (reservation, source, next_domain_spent, next_insurance) =
-            V16Core::prepare_insurance_lien_consume_delta(
-                self.insurance_reservation_for_domain(domain)?,
-                self.source_credit_for_domain(domain)?,
-                self.domain_insurance_budget_spent(domain)?.1,
-                self.header.insurance.get(),
-                amount,
-            )?;
-        let spend_atoms = self
-            .header
-            .insurance
-            .get()
-            .checked_sub(next_insurance)
-            .ok_or(V16Error::CounterUnderflow)?;
-        let vault_before = self.header.vault.get();
-        let (source, next_risk_epoch) = V16Core::prepare_source_credit_domain_recompute_for_epoch(
-            source,
-            self.header.risk_epoch.get(),
-        )?;
-        TokenValueFlowProofV16::validate_insurance_to_close_insurance_spent(
-            spend_atoms,
-            vault_before,
-            self.header.vault.get(),
-        )?;
-        self.set_insurance_reservation_for_domain(domain, reservation)?;
-        self.set_source_credit_for_domain(domain, source)?;
-        self.header.insurance = V16PodU128::new(next_insurance);
-        self.set_domain_insurance_spent_core(domain, next_domain_spent)?;
-        self.header.risk_epoch = V16PodU64::new(next_risk_epoch);
-        Ok(())
-    }
-
     fn create_account_source_credit_lien_for_effective_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
