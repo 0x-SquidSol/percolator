@@ -764,6 +764,19 @@ pub fn active_bitmap_count_ones(bitmap: V16ActiveBitmap) -> u32 {
 struct V16Core;
 
 impl V16Core {
+    /// A close snapshot becomes stale only when the originating asset has
+    /// advanced past the immutable close anchor while that asset's leg remains
+    /// attached. Unrelated assets may advance the market-wide slot without
+    /// changing this close's economics and therefore cannot trigger recovery.
+    /// (upstream 377de75c)
+    pub(crate) fn kernel_open_close_snapshot_is_stale(
+        originating_leg_active: bool,
+        originating_asset_slot: u64,
+        drift_reference_slot: u64,
+    ) -> bool {
+        originating_leg_active && originating_asset_slot > drift_reference_slot
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -12414,8 +12427,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         let asset_index = ledger.asset_index as usize;
         if asset_index < self.header.config.max_market_slots.get() as usize
-            && Self::active_leg_slot_for_asset(account, asset_index)?.is_some()
-            && self.header.current_slot.get() > ledger.drift_reference_slot
+            && V16Core::kernel_open_close_snapshot_is_stale(
+                Self::active_leg_slot_for_asset(account, asset_index)?.is_some(),
+                self.asset_state(asset_index)?.slot_last,
+                ledger.drift_reference_slot,
+            )
         {
             if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved {
                 return Ok(());
@@ -17561,5 +17577,155 @@ mod bankruptcy_hlock_clear_predicate_tests {
             market.header.bankruptcy_hlock_active, 0,
             "hlock must clear on a market that only has an ordinary open position"
         );
+    }
+}
+
+// ============================================================================
+// Close-drift scope unit tests (upstream 377de75c "Scope close drift to
+// originating asset"). `ensure_open_close_snapshot_current_or_recovery` is
+// crate-private, so its negative control lives here with access to it.
+// ============================================================================
+#[cfg(test)]
+mod close_drift_scope_tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn two_asset_market_fixture() -> (MarketGroupV16HeaderAccount, Vec<Market<u64>>) {
+        let market_group_id = [23u8; 32];
+        let cfg = V16Config::public_user_fund_with_market_slots(2, 2, 0, 10);
+        let mut header =
+            MarketGroupV16HeaderAccount::new_dynamic(market_group_id, cfg, 2, 0).unwrap();
+        let mut markets = vec![
+            Market::new(0u64, EngineAssetSlotV16Account::default()),
+            Market::new(1u64, EngineAssetSlotV16Account::default()),
+        ];
+        header
+            .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, 100, 1)
+            .unwrap();
+        header
+            .activate_empty_asset_slot_not_atomic(1, &mut markets[1].engine, 100, 2)
+            .unwrap();
+        (header, markets)
+    }
+
+    fn account_with_leg_on_asset_zero(
+        market_group_id: [u8; 32],
+        asset: AssetStateV16,
+    ) -> PortfolioAccountV16Account {
+        let provenance = ProvenanceHeaderV16Account::from_runtime(&ProvenanceHeaderV16::new(
+            market_group_id,
+            [32u8; 32],
+            [33u8; 32],
+        ));
+        let mut account = PortfolioAccountV16Account::default();
+        account.init_empty_in_place(provenance).unwrap();
+        account.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+            active: true,
+            asset_index: 0,
+            market_id: asset.market_id,
+            side: SideV16::Long,
+            basis_pos_q: POS_SCALE as i128,
+            a_basis: ADL_ONE,
+            k_snap: asset.k_long,
+            f_snap: asset.f_long_num,
+            epoch_snap: asset.epoch_long,
+            loss_weight: POS_SCALE,
+            b_snap: asset.b_long_num,
+            b_rem: 0,
+            b_epoch_snap: asset.epoch_long,
+            b_stale: false,
+            stale: false,
+        });
+        account.active_bitmap[0] = V16PodU64::new(1);
+        account
+    }
+
+    fn open_ledger_on_asset_zero(market_id: u64, drift_reference_slot: u64) -> CloseProgressLedgerV16 {
+        CloseProgressLedgerV16 {
+            active: true,
+            finalized: false,
+            canceled: false,
+            close_id: 7,
+            asset_index: 0,
+            market_id,
+            domain_side: SideV16::Short,
+            gross_loss_at_close_start: 5,
+            drift_reference_slot,
+            max_close_slot: 0,
+            residual_remaining: 5,
+            ..CloseProgressLedgerV16::EMPTY
+        }
+    }
+
+    /// Only the ORIGINATING asset advancing past the close anchor (with the leg
+    /// still attached) makes the snapshot stale. An unrelated asset moving the
+    /// market-wide clock must not trigger recovery.
+    #[test]
+    fn unrelated_asset_accrual_does_not_stale_an_open_close() {
+        let (mut header, mut markets) = two_asset_market_fixture();
+        let asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+        assert_eq!(asset0.slot_last, 1, "asset 0 anchored at its activation slot");
+        // Asset 1 advanced the market-wide clock well past the close anchor.
+        header.current_slot = V16PodU64::new(9);
+        header.slot_last = V16PodU64::new(9);
+        let market_group_id = header.market_group_id;
+        let mut account_header = account_with_leg_on_asset_zero(market_group_id, asset0);
+        let ledger = open_ledger_on_asset_zero(asset0.market_id, 1);
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let account = PortfolioV16ViewMut::new(&mut account_header);
+        let result = market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
+        assert_eq!(
+            result,
+            Ok(()),
+            "an unrelated asset advancing the global clock must not declare recovery"
+        );
+        assert_eq!(market.header.mode, 0, "market stays Live");
+    }
+
+    /// The originating asset advancing past the anchor while the leg is attached
+    /// is stale on both sides of the port.
+    #[test]
+    fn originating_asset_accrual_stales_an_open_close() {
+        let (mut header, mut markets) = two_asset_market_fixture();
+        let mut asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+        asset0.slot_last = 9;
+        markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+        header.current_slot = V16PodU64::new(9);
+        header.slot_last = V16PodU64::new(9);
+        let market_group_id = header.market_group_id;
+        let mut account_header = account_with_leg_on_asset_zero(market_group_id, asset0);
+        let ledger = open_ledger_on_asset_zero(asset0.market_id, 1);
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let account = PortfolioV16ViewMut::new(&mut account_header);
+        let result = market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
+        assert_eq!(result, Err(V16Error::RecoveryRequired));
+        assert_eq!(market.header.mode, 2, "recovery declared");
+    }
+
+    /// A detached originating leg never stales the close, whatever the clocks say.
+    #[test]
+    fn detached_originating_leg_never_stales_an_open_close() {
+        let (mut header, mut markets) = two_asset_market_fixture();
+        let mut asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+        asset0.slot_last = 9;
+        markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+        header.current_slot = V16PodU64::new(9);
+        header.slot_last = V16PodU64::new(9);
+        let market_group_id = header.market_group_id;
+        let mut account_header = account_with_leg_on_asset_zero(market_group_id, asset0);
+        account_header.legs[0] = PortfolioLegV16Account::default();
+        account_header.active_bitmap[0] = V16PodU64::new(0);
+        let ledger = open_ledger_on_asset_zero(asset0.market_id, 1);
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let account = PortfolioV16ViewMut::new(&mut account_header);
+        assert_eq!(
+            market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger),
+            Ok(())
+        );
+        assert_eq!(market.header.mode, 0);
     }
 }
