@@ -254,6 +254,8 @@ For long-profit claims, use long-side best-case price/basis; for short-profit cl
 
 A full account refresh computes, for every domain where the account currently owes loss, a deterministic `BackingReservationPlan`.
 
+The plan MUST be built from every active leg before any newly observed K/F delta is applied. Its canonical order is `(negative phase first, source_domain ascending, canonical leg_slot ascending)`. A plan entry MAY cache the arithmetic delta computed while building that plan because the canonical account representation has at most one leg per asset and applying an earlier entry cannot mutate another asset's K/F target. Immediately before application, the implementation MUST reload the leg and asset, recompute the inexpensive live K/F target, and reject unless it matches the cached target; it MUST also recompute and match the phase and source domain encoded in the key. This is ordering, not netting: each negative delta reserves available capital in its own source domain, and a same-refresh positive delta cannot erase that loss before reservation. Positive face that existed before the refresh remains subject to the ordinary source-support and face-burn rules when a new loss is applied.
+
 A backing reservation may be funded only by:
 - senior capital `C_i`;
 - already realized nonjunior quote gains;

@@ -4252,6 +4252,96 @@ struct SupportLossApplicationV16 {
     junior_face_burned: u128,
 }
 
+const ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX: u64 = u32::MAX as u64 * 2 + 1;
+const ACCOUNT_KF_SETTLEMENT_PHASE_SHIFT: u32 = 37;
+const ACCOUNT_KF_SETTLEMENT_KEY_MAX: u64 = (1u64 << 38) - 1;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AccountKfSettlementPreparedV16 {
+    k_now: i128,
+    f_now: i128,
+    f_delta: i128,
+    net: i128,
+}
+
+fn account_kf_settlement_plan_key(
+    phase: u8,
+    source_domain: usize,
+    leg_slot: usize,
+) -> V16Result<u64> {
+    let domain = u64::try_from(source_domain).map_err(|_| V16Error::InvalidLeg)?;
+    if phase > 1
+        || domain > ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX
+        || leg_slot >= V16_MAX_PORTFOLIO_ASSETS_N
+    {
+        return Err(V16Error::InvalidLeg);
+    }
+    Ok((u64::from(phase) << ACCOUNT_KF_SETTLEMENT_PHASE_SHIFT) | (domain << 4) | leg_slot as u64)
+}
+
+fn decode_account_kf_settlement_plan_key(key: u64) -> V16Result<(u8, usize, usize)> {
+    if key > ACCOUNT_KF_SETTLEMENT_KEY_MAX {
+        return Err(V16Error::InvalidLeg);
+    }
+    let phase = (key >> ACCOUNT_KF_SETTLEMENT_PHASE_SHIFT) as u8;
+    let source_domain = usize::try_from((key >> 4) & ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX)
+        .map_err(|_| V16Error::InvalidLeg)?;
+    let leg_slot = (key & 0xf) as usize;
+    if account_kf_settlement_plan_key(phase, source_domain, leg_slot)? != key {
+        return Err(V16Error::InvalidLeg);
+    }
+    Ok((phase, source_domain, leg_slot))
+}
+
+fn insert_account_kf_settlement_plan_entry(
+    plan: &mut [Option<u64>; V16_MAX_PORTFOLIO_ASSETS_N],
+    plan_len: usize,
+    entry: u64,
+) -> V16Result<usize> {
+    if plan_len >= V16_MAX_PORTFOLIO_ASSETS_N || plan[plan_len].is_some() {
+        return Err(V16Error::InvalidLeg);
+    }
+    let mut insert_at = plan_len;
+    while insert_at > 0 {
+        let incumbent = plan[insert_at - 1].ok_or(V16Error::InvalidLeg)?;
+        if entry >= incumbent {
+            break;
+        }
+        plan[insert_at] = Some(incumbent);
+        insert_at -= 1;
+    }
+    plan[insert_at] = Some(entry);
+    plan_len.checked_add(1).ok_or(V16Error::CounterOverflow)
+}
+
+#[cfg(kani)]
+pub const KANI_ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX: u64 = ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX;
+#[cfg(kani)]
+pub const KANI_ACCOUNT_KF_SETTLEMENT_KEY_MAX: u64 = ACCOUNT_KF_SETTLEMENT_KEY_MAX;
+
+#[cfg(kani)]
+pub fn kani_account_kf_settlement_plan_key(
+    phase: u8,
+    source_domain: usize,
+    leg_slot: usize,
+) -> V16Result<u64> {
+    account_kf_settlement_plan_key(phase, source_domain, leg_slot)
+}
+
+#[cfg(kani)]
+pub fn kani_decode_account_kf_settlement_plan_key(key: u64) -> V16Result<(u8, usize, usize)> {
+    decode_account_kf_settlement_plan_key(key)
+}
+
+#[cfg(kani)]
+pub fn kani_insert_account_kf_settlement_plan_entry(
+    plan: &mut [Option<u64>; V16_MAX_PORTFOLIO_ASSETS_N],
+    plan_len: usize,
+    entry: u64,
+) -> V16Result<usize> {
+    insert_account_kf_settlement_plan_entry(plan, plan_len, entry)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceCreditConsumptionV16 {
     face_burn: u128,
@@ -9923,37 +10013,20 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.leg_kf_delta_for_settlement(leg)
     }
 
-    fn settle_leg_kf_effects_at_slot(
+    fn prepare_account_kf_settlement_entry(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
         leg_slot: usize,
-    ) -> V16Result<()> {
+    ) -> V16Result<(u64, AccountKfSettlementPreparedV16)> {
         if leg_slot >= V16_MAX_PORTFOLIO_ASSETS_N {
             return Err(V16Error::InvalidLeg);
         }
         let leg = account.header.legs[leg_slot].try_to_runtime()?;
         if !leg.active {
-            return Ok(());
+            return Err(V16Error::InvalidLeg);
         }
         let asset_index = leg.asset_index as usize;
         let asset = self.asset_state(asset_index)?;
-        self.settle_leg_kf_effects_at_slot_with_asset(account, leg_slot, asset)
-    }
-
-    fn settle_leg_kf_effects_at_slot_with_asset(
-        &mut self,
-        account: &mut PortfolioV16ViewMut<'_>,
-        leg_slot: usize,
-        mut asset: AssetStateV16,
-    ) -> V16Result<()> {
-        if leg_slot >= V16_MAX_PORTFOLIO_ASSETS_N {
-            return Err(V16Error::InvalidLeg);
-        }
-        let mut leg = account.header.legs[leg_slot].try_to_runtime()?;
-        if !leg.active {
-            return Ok(());
-        }
-        let asset_index = leg.asset_index as usize;
         if asset_index >= self.header.config.max_market_slots.get() as usize
             || asset_index >= self.markets.len()
             || asset.market_id == 0
@@ -9962,30 +10035,71 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         let (k_now, f_now, _k_delta, f_delta, net) =
             Self::leg_kf_delta_components_for_settlement_from_asset(asset, leg)?;
-        if net != 0 {
-            if net > 0 {
-                let source_domain =
-                    Some(self.insurance_domain_index(asset_index, opposite_side(leg.side))?);
-                self.apply_signed_kf_delta_to_pnl(account, net, source_domain)?;
+        let source_side = if net > 0 {
+            opposite_side(leg.side)
+        } else {
+            leg.side
+        };
+        let source_domain = self.insurance_domain_index(asset_index, source_side)?;
+        let entry = account_kf_settlement_plan_key(u8::from(net >= 0), source_domain, leg_slot)?;
+        Ok((
+            entry,
+            AccountKfSettlementPreparedV16 {
+                k_now,
+                f_now,
+                f_delta,
+                net,
+            },
+        ))
+    }
+
+    fn apply_account_kf_settlement_entry(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        entry: u64,
+        prepared: AccountKfSettlementPreparedV16,
+    ) -> V16Result<()> {
+        let (phase, source_domain, leg_slot) = decode_account_kf_settlement_plan_key(entry)?;
+        let mut leg = account.header.legs[leg_slot].try_to_runtime()?;
+        if !leg.active {
+            return Err(V16Error::InvalidLeg);
+        }
+        let asset_index = leg.asset_index as usize;
+        let mut asset = self.asset_state(asset_index)?;
+        let (live_k_now, live_f_now) = Self::kf_target_for_leg_from_asset(asset, leg)?;
+        let actual_source_side = if prepared.net > 0 {
+            opposite_side(leg.side)
+        } else {
+            leg.side
+        };
+        if live_k_now != prepared.k_now
+            || live_f_now != prepared.f_now
+            || phase != u8::from(prepared.net >= 0)
+            || source_domain != self.insurance_domain_index(asset_index, actual_source_side)?
+        {
+            return Err(V16Error::InvalidLeg);
+        }
+        if prepared.net != 0 {
+            if prepared.net > 0 {
+                self.apply_signed_kf_delta_to_pnl(account, prepared.net, Some(source_domain))?;
             } else {
                 let negative_before = account.header.pnl.get().min(0).unsigned_abs();
-                self.apply_signed_kf_delta_to_pnl(account, net, None)?;
+                self.apply_signed_kf_delta_to_pnl(account, prepared.net, None)?;
                 let negative_after = account.header.pnl.get().min(0).unsigned_abs();
-                let loss_source_domain = self.insurance_domain_index(asset_index, leg.side)?;
                 self.reserve_new_capital_backed_loss_for_source_domain_not_atomic(
                     account,
-                    loss_source_domain,
+                    source_domain,
                     negative_before,
                     negative_after,
                 )?;
             }
         }
-        Self::record_account_funding_flow(account, leg.side, f_delta)?;
+        Self::record_account_funding_flow(account, leg.side, prepared.f_delta)?;
         let (settled_asset, kf_epoch_snap) =
             V16Core::kernel_settle_kf_stale_cohort(asset, leg.side, leg.kf_epoch_snap)?;
         asset = settled_asset;
-        leg.k_snap = k_now;
-        leg.f_snap = f_now;
+        leg.k_snap = prepared.k_now;
+        leg.f_snap = prepared.f_now;
         leg.kf_epoch_snap = kf_epoch_snap;
         account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&leg);
         account.header.health_cert.valid = 0;
@@ -9994,6 +10108,59 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             asset,
             self.header.current_slot.get(),
         ));
+        Ok(())
+    }
+
+    fn settle_account_kf_effects_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+    ) -> V16Result<()> {
+        // The composing refresh/crank paths validate bitmap-to-leg consistency. Flat
+        // accounts have no K/F work, and skipping a second full leg scan preserves
+        // headroom for their bounded source-domain admission checks.
+        let active_bitmap = account.header.active_bitmap.map(V16PodU64::get);
+        let active_leg_count = active_bitmap_count_ones(active_bitmap);
+        if active_leg_count == 0 {
+            return Ok(());
+        }
+        if active_leg_count == 1 {
+            let mut slot = 0usize;
+            while slot < V16_MAX_PORTFOLIO_ASSETS_N && !active_bitmap_get(active_bitmap, slot) {
+                slot += 1;
+            }
+            if slot == V16_MAX_PORTFOLIO_ASSETS_N {
+                return Err(V16Error::InvalidLeg);
+            }
+            let (entry, prepared) = self.prepare_account_kf_settlement_entry(account, slot)?;
+            return self.apply_account_kf_settlement_entry(account, entry, prepared);
+        }
+        let mut plan = [None; V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut prepared_by_slot =
+            [AccountKfSettlementPreparedV16::default(); V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut plan_len = 0usize;
+        let mut slot = 0usize;
+        while slot < V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = account.header.legs[slot].try_to_runtime()?;
+            if !leg.active {
+                slot += 1;
+                continue;
+            }
+            let (entry, prepared) = self.prepare_account_kf_settlement_entry(account, slot)?;
+            prepared_by_slot[slot] = prepared;
+            plan_len = insert_account_kf_settlement_plan_entry(&mut plan, plan_len, entry)?;
+            slot += 1;
+        }
+
+        let mut index = 0usize;
+        while index < plan_len {
+            let entry = plan[index].ok_or(V16Error::InvalidLeg)?;
+            let leg_slot = (entry & 0xf) as usize;
+            if leg_slot >= V16_MAX_PORTFOLIO_ASSETS_N {
+                return Err(V16Error::InvalidLeg);
+            }
+            self.apply_account_kf_settlement_entry(account, entry, prepared_by_slot[leg_slot])?;
+            index += 1;
+        }
         Ok(())
     }
 
@@ -10124,6 +10291,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if decode_bool(account.header.b_stale_state)? && !allow_b_chunk {
             return Err(V16Error::BStale);
         }
+        self.settle_account_kf_effects_not_atomic(account)?;
         let config = self.header.config.try_to_runtime_shape()?;
         let mut initial_req = 0u128;
         let mut maintenance_req = 0u128;
@@ -10180,7 +10348,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             seen_assets[seen_asset_count] = leg.asset_index;
             seen_asset_count += 1;
-            self.settle_leg_kf_effects_at_slot_with_asset(account, slot, asset)?;
             let mut refreshed = account.header.legs[slot].try_to_runtime()?;
             let target = Self::b_target_for_leg_from_asset(asset, refreshed)?;
             if target > refreshed.b_snap {
@@ -10557,12 +10724,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         b_delta_budget: u128,
     ) -> V16Result<PermissionlessProgressOutcomeV16> {
         account.validate_with_market(&self.as_view())?;
+        self.settle_account_kf_effects_not_atomic(account)?;
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
             if leg.active {
                 let asset_index = leg.asset_index as usize;
-                self.settle_leg_kf_effects_at_slot(account, slot)?;
                 let refreshed = account.header.legs[slot].try_to_runtime()?;
                 let target = self.b_target_for_leg(asset_index, refreshed)?;
                 if target > refreshed.b_snap {
@@ -12283,7 +12450,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         delta_q: i128,
         lookup: PositionDeltaLookupV16,
     ) -> V16Result<()> {
-        self.apply_position_delta_with_lookup_inner(account, asset_index, delta_q, lookup, true)
+        self.apply_position_delta_with_lookup_inner(account, asset_index, delta_q, lookup, false)
     }
 
     fn apply_current_position_delta_with_lookup(
@@ -12293,7 +12460,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         delta_q: i128,
         lookup: PositionDeltaLookupV16,
     ) -> V16Result<()> {
-        self.apply_position_delta_with_lookup_inner(account, asset_index, delta_q, lookup, false)
+        self.apply_position_delta_with_lookup_inner(account, asset_index, delta_q, lookup, true)
     }
 
     fn apply_position_delta_with_lookup_inner(
@@ -12302,7 +12469,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         asset_index: usize,
         delta_q: i128,
         lookup: PositionDeltaLookupV16,
-        settle_existing: bool,
+        // Upstream feeds this to clear_leg_at_slot_inner (d91c2dc4, worklist row 339);
+        // that consumer is not in this fork yet, so the flag is carried but unread.
+        _allow_attributed_terminal_trade: bool,
     ) -> V16Result<()> {
         if delta_q == 0 {
             return Ok(());
@@ -12316,15 +12485,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         validate_basis_or_zero(lookup.next_q)?;
         let existing_slot = lookup.existing_slot;
-        if settle_existing {
-            if let Some(existing_slot) = existing_slot {
-                self.settle_leg_kf_effects_at_slot(account, existing_slot)?;
-            }
-        }
         let current_leg = if let Some(existing_slot) = existing_slot {
             let leg = account.header.legs[existing_slot].try_to_runtime()?;
             if !leg.active || leg.asset_index as usize != asset_index {
                 return Err(V16Error::HiddenLeg);
+            }
+            let asset = self.asset_state(asset_index)?;
+            let (k_target, f_target) = Self::kf_target_for_leg_from_asset(asset, leg)?;
+            if !Self::leg_kf_epoch_is_current(asset, leg)
+                || k_target != leg.k_snap
+                || f_target != leg.f_snap
+            {
+                return Err(V16Error::Stale);
             }
             leg
         } else {

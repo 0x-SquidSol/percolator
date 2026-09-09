@@ -2,14 +2,15 @@
 
 use percolator::v16::{
     active_bitmap_count_ones, active_bitmap_get, active_bitmap_is_empty,
-    backing_domain_fee_split_for_lien_delta_num, kani_active_bitmap_set as active_bitmap_set,
-    kani_add_open_interest_for_new_position, kani_apply_backing_provider_earnings_withdraw,
-    kani_apply_backing_utilization_fee_charge, kani_apply_resolved_payout_receipt_payment,
-    kani_available_backing_num_for_source_credit_state,
+    backing_domain_fee_split_for_lien_delta_num, kani_account_kf_settlement_plan_key,
+    kani_active_bitmap_set as active_bitmap_set, kani_add_open_interest_for_new_position,
+    kani_apply_backing_provider_earnings_withdraw, kani_apply_backing_utilization_fee_charge,
+    kani_apply_resolved_payout_receipt_payment, kani_available_backing_num_for_source_credit_state,
     kani_backing_utilization_fee_quote_atoms_for_lien,
-    kani_backing_utilization_rate_e9_for_source_state,
+    kani_backing_utilization_rate_e9_for_source_state, kani_decode_account_kf_settlement_plan_key,
     kani_expected_source_credit_rate_num_for_state, kani_health_cert_after_capital_debit,
     kani_health_requirements_from_base_and_target_lag,
+    kani_insert_account_kf_settlement_plan_entry,
     kani_liquidation_close_would_leave_uncovered_loss_with_open_risk,
     kani_liquidation_engine_close_request_q, kani_liquidation_fee_from_raw_fee,
     kani_liquidation_partial_search_hi, kani_liquidation_projected_healthy_after_close,
@@ -33,7 +34,8 @@ use percolator::v16::{
     SourceCreditStateV16Account, StockReconciliationProofV16, TokenValueClassV16,
     TokenValueFlowProofV16, V16Config, V16ConfigAccount, V16Error,
     V16OptionalRecoveryReasonAccount, V16PodI128, V16PodU128, V16PodU32, V16PodU64,
-    BACKING_FEE_RATE_DEN_E9, MAX_BACKING_FEE_RATE_E9_PER_SLOT, MAX_BACKING_FEE_UTIL_BPS,
+    BACKING_FEE_RATE_DEN_E9, KANI_ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX,
+    KANI_ACCOUNT_KF_SETTLEMENT_KEY_MAX, MAX_BACKING_FEE_RATE_E9_PER_SLOT, MAX_BACKING_FEE_UTIL_BPS,
     PORTFOLIO_SOURCE_DOMAIN_CAP, V16_EMPTY_ACTIVE_BITMAP, V16_MAX_PORTFOLIO_ASSETS_N,
 };
 use percolator::{
@@ -13239,4 +13241,122 @@ fn proof_v16_kf_settlement_disposes_one_cohort_member_without_underflow() {
     );
     assert!(settled.stale_account_count_long <= settled.stored_pos_count_long);
     assert!(settled.stale_account_count_short <= settled.stored_pos_count_short);
+}
+
+#[kani::proof]
+#[kani::solver(cadical)]
+fn proof_account_kf_settlement_key_roundtrip_and_priority() {
+    let phase: u8 = kani::any();
+    let source_domain: usize = kani::any();
+    let leg_slot: usize = kani::any();
+    kani::assume(phase <= 1);
+    kani::assume(source_domain <= KANI_ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX as usize);
+    kani::assume(leg_slot < V16_MAX_PORTFOLIO_ASSETS_N);
+
+    let key = kani_account_kf_settlement_plan_key(phase, source_domain, leg_slot).unwrap();
+    assert!(key <= KANI_ACCOUNT_KF_SETTLEMENT_KEY_MAX);
+    assert_eq!(
+        kani_decode_account_kf_settlement_plan_key(key),
+        Ok((phase, source_domain, leg_slot)),
+    );
+
+    let other_domain: usize = kani::any();
+    let other_slot: usize = kani::any();
+    kani::assume(other_domain <= KANI_ACCOUNT_KF_SETTLEMENT_DOMAIN_MAX as usize);
+    kani::assume(other_slot < V16_MAX_PORTFOLIO_ASSETS_N);
+    let loss_key = kani_account_kf_settlement_plan_key(0, source_domain, leg_slot).unwrap();
+    let gain_key = kani_account_kf_settlement_plan_key(1, other_domain, other_slot).unwrap();
+    assert!(loss_key < gain_key);
+
+    if source_domain < other_domain {
+        let earlier_domain =
+            kani_account_kf_settlement_plan_key(phase, source_domain, leg_slot).unwrap();
+        let later_domain =
+            kani_account_kf_settlement_plan_key(phase, other_domain, other_slot).unwrap();
+        assert!(earlier_domain < later_domain);
+    }
+    if leg_slot < other_slot {
+        let earlier_slot =
+            kani_account_kf_settlement_plan_key(phase, source_domain, leg_slot).unwrap();
+        let later_slot =
+            kani_account_kf_settlement_plan_key(phase, source_domain, other_slot).unwrap();
+        assert!(earlier_slot < later_slot);
+    }
+}
+
+// The whole-account K/F settlement plan is built one entry at a time by this
+// production insertion kernel. Prove the induction step over the full 16-leg
+// bound: any sorted valid prefix remains sorted, gains exactly the incoming
+// entry, loses no existing entry, and leaves the unused tail untouched.
+#[kani::proof]
+#[kani::unwind(18)]
+#[kani::solver(cadical)]
+fn proof_account_kf_settlement_plan_insert_preserves_order_and_multiset() {
+    let entries: [u64; V16_MAX_PORTFOLIO_ASSETS_N] = kani::any();
+    let incoming: u64 = kani::any();
+    let prefix_len: usize = kani::any();
+    kani::assume(prefix_len < V16_MAX_PORTFOLIO_ASSETS_N);
+    kani::assume(incoming <= KANI_ACCOUNT_KF_SETTLEMENT_KEY_MAX);
+
+    let mut plan = [None; V16_MAX_PORTFOLIO_ASSETS_N];
+    let mut index = 0usize;
+    while index < prefix_len {
+        kani::assume(entries[index] <= KANI_ACCOUNT_KF_SETTLEMENT_KEY_MAX);
+        plan[index] = Some(entries[index]);
+        index += 1;
+    }
+    index = 1;
+    while index < prefix_len {
+        kani::assume(entries[index - 1] <= entries[index]);
+        index += 1;
+    }
+
+    let before = plan;
+    let mut expected_insert_at = prefix_len;
+    index = 0;
+    while index < prefix_len {
+        if incoming < entries[index] {
+            expected_insert_at = index;
+            break;
+        }
+        index += 1;
+    }
+    let next_len =
+        match kani_insert_account_kf_settlement_plan_entry(&mut plan, prefix_len, incoming) {
+            Ok(next_len) => next_len,
+            Err(_) => {
+                assert!(false, "a valid entry must fit in a non-full canonical plan");
+                return;
+            }
+        };
+    let mut proof_holds = next_len == prefix_len + 1;
+
+    index = 0;
+    while index < next_len {
+        proof_holds &= plan[index].is_some();
+        if index > 0 {
+            proof_holds &= plan[index - 1] <= plan[index];
+        }
+        index += 1;
+    }
+    while index < V16_MAX_PORTFOLIO_ASSETS_N {
+        proof_holds &= plan[index].is_none();
+        index += 1;
+    }
+
+    // The forward reference scan chooses the first strictly greater key. The
+    // production backward scan must produce that exact stable insertion:
+    // unchanged prefix, incoming entry, then the old suffix shifted by one.
+    index = 0;
+    while index < expected_insert_at {
+        proof_holds &= plan[index] == before[index];
+        index += 1;
+    }
+    proof_holds &= plan[expected_insert_at] == Some(incoming);
+    index = expected_insert_at + 1;
+    while index < next_len {
+        proof_holds &= plan[index] == before[index - 1];
+        index += 1;
+    }
+    assert!(proof_holds);
 }
