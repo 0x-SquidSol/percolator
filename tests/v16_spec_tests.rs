@@ -14,6 +14,10 @@ use percolator::{
 };
 use percolator::{ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, POS_SCALE};
 
+const FUNDING_COUNTER_PRICE: u64 = 1_000_000;
+const FUNDING_COUNTER_RATE_E9: i128 = 10_000;
+const FUNDING_COUNTER_ATOMS_PER_SLOT: u128 = 10;
+
 fn ids() -> ([u8; 32], [u8; 32], [u8; 32]) {
     ([1; 32], [2; 32], [3; 32])
 }
@@ -40,6 +44,23 @@ fn market_fixture(
             )
             .unwrap();
     }
+    {
+        let view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        view.validate_shape().unwrap();
+    }
+    (header, markets)
+}
+
+fn funding_market_fixture(init_price: u64) -> (MarketGroupV16HeaderAccount, Vec<Market<u64>>) {
+    let (market_id, _, _) = ids();
+    let mut cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    cfg.max_abs_funding_e9_per_slot = FUNDING_COUNTER_RATE_E9 as u64;
+    cfg.max_price_move_bps_per_slot = 9_000;
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id, cfg, 1, 0).unwrap();
+    let mut markets = vec![Market::new(0, EngineAssetSlotV16Account::default())];
+    header
+        .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, init_price, 1)
+        .unwrap();
     {
         let view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
         view.validate_shape().unwrap();
@@ -91,6 +112,37 @@ fn finalized_inert_close_progress(
 
 fn signed_q(q: u128) -> i128 {
     i128::try_from(q).unwrap()
+}
+
+fn funding_counter_tuple(account: &PortfolioAccountV16Account) -> (u128, u128, u128, u128) {
+    (
+        account.funding_long_paid_atoms_total.get(),
+        account.funding_long_received_atoms_total.get(),
+        account.funding_short_paid_atoms_total.get(),
+        account.funding_short_received_atoms_total.get(),
+    )
+}
+
+fn open_one_lot_pair(
+    market: &mut MarketGroupV16ViewMut<'_, u64>,
+    long: &mut PortfolioV16ViewMut<'_>,
+    short: &mut PortfolioV16ViewMut<'_>,
+) {
+    market.deposit_not_atomic(long, 10_000_000).unwrap();
+    market.deposit_not_atomic(short, 10_000_000).unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            long,
+            short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(POS_SCALE),
+                exec_price: FUNDING_COUNTER_PRICE,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
 }
 
 /// Like `market_fixture`, but with a nonzero `max_trading_fee_bps` cap so
@@ -167,6 +219,297 @@ fn v16_view_deposit_and_withdraw_are_the_tested_paths() {
     account_view
         .validate_with_market(&market_view.as_view())
         .unwrap();
+}
+
+#[test]
+fn v16_funding_counter_layout_canary_places_fields_before_fee_state() {
+    let width = core::mem::size_of::<V16PodU128>();
+
+    assert_eq!(
+        core::mem::offset_of!(PortfolioAccountV16Account, funding_long_paid_atoms_total),
+        core::mem::offset_of!(PortfolioAccountV16Account, residual_received_atoms_total) + width
+    );
+    assert_eq!(
+        core::mem::offset_of!(
+            PortfolioAccountV16Account,
+            funding_long_received_atoms_total
+        ),
+        core::mem::offset_of!(PortfolioAccountV16Account, funding_long_paid_atoms_total) + width
+    );
+    assert_eq!(
+        core::mem::offset_of!(PortfolioAccountV16Account, funding_short_paid_atoms_total),
+        core::mem::offset_of!(
+            PortfolioAccountV16Account,
+            funding_long_received_atoms_total
+        ) + width
+    );
+    assert_eq!(
+        core::mem::offset_of!(
+            PortfolioAccountV16Account,
+            funding_short_received_atoms_total
+        ),
+        core::mem::offset_of!(PortfolioAccountV16Account, funding_short_paid_atoms_total) + width
+    );
+    assert_eq!(
+        core::mem::offset_of!(PortfolioAccountV16Account, fee_credits),
+        core::mem::offset_of!(
+            PortfolioAccountV16Account,
+            funding_short_received_atoms_total
+        ) + width
+    );
+}
+
+#[test]
+fn v16_funding_counters_record_long_pays_short_once_on_refresh() {
+    let (mut header, mut markets) = funding_market_fixture(FUNDING_COUNTER_PRICE);
+    let mut long_header = account_fixture(1, 120);
+    let mut short_header = account_fixture(1, 121);
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        market
+            .accrue_asset_to_not_atomic(0, 2, FUNDING_COUNTER_PRICE, FUNDING_COUNTER_RATE_E9, true)
+            .unwrap();
+    }
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+
+    assert_eq!(
+        funding_counter_tuple(long.header),
+        (FUNDING_COUNTER_ATOMS_PER_SLOT, 0, 0, 0)
+    );
+    assert_eq!(
+        funding_counter_tuple(short.header),
+        (0, 0, 0, FUNDING_COUNTER_ATOMS_PER_SLOT)
+    );
+    assert_eq!(
+        long.header.capital.get(),
+        10_000_000 - FUNDING_COUNTER_ATOMS_PER_SLOT
+    );
+    assert_eq!(
+        long.header.funding_long_paid_atoms_total.get(),
+        short.header.funding_short_received_atoms_total.get(),
+        "payer/receiver funding counters must conserve across both refreshed accounts"
+    );
+
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    assert_eq!(
+        funding_counter_tuple(long.header),
+        (FUNDING_COUNTER_ATOMS_PER_SLOT, 0, 0, 0),
+        "advancing f_snap must prevent double counting on a later refresh"
+    );
+    assert_eq!(
+        funding_counter_tuple(short.header),
+        (0, 0, 0, FUNDING_COUNTER_ATOMS_PER_SLOT)
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_funding_counters_record_short_pays_long_on_negative_funding() {
+    let (mut header, mut markets) = funding_market_fixture(FUNDING_COUNTER_PRICE);
+    let mut long_header = account_fixture(1, 122);
+    let mut short_header = account_fixture(1, 123);
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        market
+            .accrue_asset_to_not_atomic(0, 2, FUNDING_COUNTER_PRICE, -FUNDING_COUNTER_RATE_E9, true)
+            .unwrap();
+    }
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+
+    assert_eq!(
+        funding_counter_tuple(long.header),
+        (0, FUNDING_COUNTER_ATOMS_PER_SLOT, 0, 0)
+    );
+    assert_eq!(
+        funding_counter_tuple(short.header),
+        (0, 0, FUNDING_COUNTER_ATOMS_PER_SLOT, 0)
+    );
+    assert_eq!(
+        long.header.funding_long_received_atoms_total.get(),
+        short.header.funding_short_paid_atoms_total.get(),
+        "receiver/payer funding counters must conserve when shorts pay longs"
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_funding_counters_settle_before_same_side_resize() {
+    let (mut header, mut markets) = funding_market_fixture(FUNDING_COUNTER_PRICE);
+    let mut long_header = account_fixture(1, 124);
+    let mut short_header = account_fixture(1, 125);
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        market
+            .accrue_asset_to_not_atomic(0, 2, FUNDING_COUNTER_PRICE, FUNDING_COUNTER_RATE_E9, true)
+            .unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(POS_SCALE),
+                    exec_price: FUNDING_COUNTER_PRICE,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+    }
+
+    let long_leg = long_header.legs[0].try_to_runtime().unwrap();
+    let short_leg = short_header.legs[0].try_to_runtime().unwrap();
+    assert_eq!(long_leg.basis_pos_q, signed_q(2 * POS_SCALE));
+    assert_eq!(short_leg.basis_pos_q, -signed_q(2 * POS_SCALE));
+    assert_eq!(
+        funding_counter_tuple(&long_header),
+        (FUNDING_COUNTER_ATOMS_PER_SLOT, 0, 0, 0)
+    );
+    assert_eq!(
+        funding_counter_tuple(&short_header),
+        (0, 0, 0, FUNDING_COUNTER_ATOMS_PER_SLOT)
+    );
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    assert_eq!(
+        funding_counter_tuple(long.header),
+        (FUNDING_COUNTER_ATOMS_PER_SLOT, 0, 0, 0)
+    );
+    assert_eq!(
+        funding_counter_tuple(short.header),
+        (0, 0, 0, FUNDING_COUNTER_ATOMS_PER_SLOT)
+    );
+}
+
+#[test]
+fn v16_funding_counters_settle_before_trade_close_clears_leg() {
+    let (mut header, mut markets) = funding_market_fixture(FUNDING_COUNTER_PRICE);
+    let mut long_header = account_fixture(1, 126);
+    let mut short_header = account_fixture(1, 127);
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        market
+            .accrue_asset_to_not_atomic(0, 2, FUNDING_COUNTER_PRICE, FUNDING_COUNTER_RATE_E9, true)
+            .unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: -signed_q(POS_SCALE),
+                    exec_price: FUNDING_COUNTER_PRICE,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(long_header.active_bitmap[0].get(), 0);
+    assert_eq!(short_header.active_bitmap[0].get(), 0);
+    assert_eq!(
+        funding_counter_tuple(&long_header),
+        (FUNDING_COUNTER_ATOMS_PER_SLOT, 0, 0, 0)
+    );
+    assert_eq!(
+        funding_counter_tuple(&short_header),
+        (0, 0, 0, FUNDING_COUNTER_ATOMS_PER_SLOT)
+    );
+}
+
+#[test]
+fn v16_funding_counters_record_forfeited_dead_leg_settlement() {
+    let (mut header, mut markets) = funding_market_fixture(FUNDING_COUNTER_PRICE);
+    let mut long_header = account_fixture(1, 128);
+    let mut short_header = account_fixture(1, 129);
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        market
+            .accrue_asset_to_not_atomic(0, 2, FUNDING_COUNTER_PRICE, FUNDING_COUNTER_RATE_E9, true)
+            .unwrap();
+        market.force_asset_recovery_not_atomic(0, 2).unwrap();
+        market
+            .forfeit_recovery_leg_not_atomic(&mut long, 0, 1)
+            .unwrap();
+        market
+            .forfeit_recovery_leg_not_atomic(&mut short, 0, 1)
+            .unwrap();
+    }
+
+    assert_eq!(
+        funding_counter_tuple(&long_header),
+        (FUNDING_COUNTER_ATOMS_PER_SLOT, 0, 0, 0)
+    );
+    assert_eq!(
+        funding_counter_tuple(&short_header),
+        (0, 0, 0, FUNDING_COUNTER_ATOMS_PER_SLOT)
+    );
+}
+
+#[test]
+fn v16_funding_counters_ignore_inactive_accounts_when_market_funding_moves() {
+    let (mut header, mut markets) = funding_market_fixture(FUNDING_COUNTER_PRICE);
+    let mut long_header = account_fixture(1, 130);
+    let mut short_header = account_fixture(1, 131);
+    let mut idle_header = account_fixture(1, 132);
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        market
+            .accrue_asset_to_not_atomic(0, 2, FUNDING_COUNTER_PRICE, FUNDING_COUNTER_RATE_E9, true)
+            .unwrap();
+    }
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut idle = PortfolioV16ViewMut::new(&mut idle_header);
+    market.full_account_refresh_not_atomic(&mut idle).unwrap();
+
+    assert_eq!(funding_counter_tuple(idle.header), (0, 0, 0, 0));
+    market.validate_shape().unwrap();
+    idle.validate_with_market(&market.as_view()).unwrap();
 }
 
 #[test]
