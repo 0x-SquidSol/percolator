@@ -941,6 +941,95 @@ impl V16Core {
         Ok((asset, leg))
     }
 
+    /// PRODUCTION KERNEL: the clear-leg asset transform — decrement the
+    /// side's stored-position count (and pending-obligation count for a
+    /// zero-basis obligation leg), and unless the leg predates a side reset,
+    /// fold its social-loss dust and remove its OI and loss weight. Pure on
+    /// (PortfolioLegV16, AssetStateV16); the clear-leg glue calls exactly this.
+    pub(crate) fn kernel_clear_leg(
+        leg: PortfolioLegV16,
+        mut asset: AssetStateV16,
+    ) -> V16Result<AssetStateV16> {
+        let prior_reset_epoch = match leg.side {
+            SideV16::Long => {
+                asset.mode_long == SideModeV16::ResetPending
+                    && leg.epoch_snap.checked_add(1) == Some(asset.epoch_long)
+            }
+            SideV16::Short => {
+                asset.mode_short == SideModeV16::ResetPending
+                    && leg.epoch_snap.checked_add(1) == Some(asset.epoch_short)
+            }
+        };
+        let dust_after_clear = if !prior_reset_epoch && leg.b_rem != 0 {
+            let current_dust = match leg.side {
+                SideV16::Long => asset.social_loss_dust_long_num,
+                SideV16::Short => asset.social_loss_dust_short_num,
+            };
+            let new_dust = current_dust
+                .checked_add(leg.b_rem)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            if new_dust >= SOCIAL_LOSS_DEN {
+                return Err(V16Error::RecoveryRequired);
+            }
+            Some(new_dust)
+        } else {
+            None
+        };
+        match leg.side {
+            SideV16::Long => {
+                asset.stored_pos_count_long = asset
+                    .stored_pos_count_long
+                    .checked_sub(1)
+                    .ok_or(V16Error::CounterUnderflow)?;
+                if leg.basis_pos_q == 0 && leg.loss_weight != 0 {
+                    asset.pending_obligation_count_long = asset
+                        .pending_obligation_count_long
+                        .checked_sub(1)
+                        .ok_or(V16Error::CounterUnderflow)?;
+                }
+                if !prior_reset_epoch {
+                    if let Some(new_dust) = dust_after_clear {
+                        asset.social_loss_dust_long_num = new_dust;
+                    }
+                    asset.oi_eff_long_q = asset
+                        .oi_eff_long_q
+                        .checked_sub(leg.basis_pos_q.unsigned_abs())
+                        .ok_or(V16Error::CounterUnderflow)?;
+                    asset.loss_weight_sum_long = asset
+                        .loss_weight_sum_long
+                        .checked_sub(leg.loss_weight)
+                        .ok_or(V16Error::CounterUnderflow)?;
+                }
+            }
+            SideV16::Short => {
+                asset.stored_pos_count_short = asset
+                    .stored_pos_count_short
+                    .checked_sub(1)
+                    .ok_or(V16Error::CounterUnderflow)?;
+                if leg.basis_pos_q == 0 && leg.loss_weight != 0 {
+                    asset.pending_obligation_count_short = asset
+                        .pending_obligation_count_short
+                        .checked_sub(1)
+                        .ok_or(V16Error::CounterUnderflow)?;
+                }
+                if !prior_reset_epoch {
+                    if let Some(new_dust) = dust_after_clear {
+                        asset.social_loss_dust_short_num = new_dust;
+                    }
+                    asset.oi_eff_short_q = asset
+                        .oi_eff_short_q
+                        .checked_sub(leg.basis_pos_q.unsigned_abs())
+                        .ok_or(V16Error::CounterUnderflow)?;
+                    asset.loss_weight_sum_short = asset
+                        .loss_weight_sum_short
+                        .checked_sub(leg.loss_weight)
+                        .ok_or(V16Error::CounterUnderflow)?;
+                }
+            }
+        }
+        Ok(asset)
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -12295,7 +12384,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if self.has_pending_domain_loss_barrier(asset_index, leg.side)? {
             return Err(V16Error::LockActive);
         }
-        let mut asset = self.asset_state(asset_index)?;
+        let asset = self.asset_state(asset_index)?;
         let (k_target, f_target) = Self::kf_target_for_leg_from_asset(asset, leg)?;
         if !Self::leg_kf_epoch_is_current(asset, leg)
             || k_target != leg.k_snap
@@ -12306,83 +12395,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if self.b_target_for_leg(asset_index, leg)? != leg.b_snap {
             return Err(V16Error::Stale);
         }
-        let prior_reset_epoch = match leg.side {
-            SideV16::Long => {
-                asset.mode_long == SideModeV16::ResetPending
-                    && leg.epoch_snap.checked_add(1) == Some(asset.epoch_long)
-            }
-            SideV16::Short => {
-                asset.mode_short == SideModeV16::ResetPending
-                    && leg.epoch_snap.checked_add(1) == Some(asset.epoch_short)
-            }
-        };
-        let dust_after_clear = if !prior_reset_epoch && leg.b_rem != 0 {
-            let current_dust = match leg.side {
-                SideV16::Long => asset.social_loss_dust_long_num,
-                SideV16::Short => asset.social_loss_dust_short_num,
-            };
-            let new_dust = current_dust
-                .checked_add(leg.b_rem)
-                .ok_or(V16Error::ArithmeticOverflow)?;
-            if new_dust >= SOCIAL_LOSS_DEN {
-                return Err(V16Error::RecoveryRequired);
-            }
-            Some(new_dust)
-        } else {
-            None
-        };
-        match leg.side {
-            SideV16::Long => {
-                asset.stored_pos_count_long = asset
-                    .stored_pos_count_long
-                    .checked_sub(1)
-                    .ok_or(V16Error::CounterUnderflow)?;
-                if leg.basis_pos_q == 0 && leg.loss_weight != 0 {
-                    asset.pending_obligation_count_long = asset
-                        .pending_obligation_count_long
-                        .checked_sub(1)
-                        .ok_or(V16Error::CounterUnderflow)?;
-                }
-                if !prior_reset_epoch {
-                    if let Some(new_dust) = dust_after_clear {
-                        asset.social_loss_dust_long_num = new_dust;
-                    }
-                    asset.oi_eff_long_q = asset
-                        .oi_eff_long_q
-                        .checked_sub(leg.basis_pos_q.unsigned_abs())
-                        .ok_or(V16Error::CounterUnderflow)?;
-                    asset.loss_weight_sum_long = asset
-                        .loss_weight_sum_long
-                        .checked_sub(leg.loss_weight)
-                        .ok_or(V16Error::CounterUnderflow)?;
-                }
-            }
-            SideV16::Short => {
-                asset.stored_pos_count_short = asset
-                    .stored_pos_count_short
-                    .checked_sub(1)
-                    .ok_or(V16Error::CounterUnderflow)?;
-                if leg.basis_pos_q == 0 && leg.loss_weight != 0 {
-                    asset.pending_obligation_count_short = asset
-                        .pending_obligation_count_short
-                        .checked_sub(1)
-                        .ok_or(V16Error::CounterUnderflow)?;
-                }
-                if !prior_reset_epoch {
-                    if let Some(new_dust) = dust_after_clear {
-                        asset.social_loss_dust_short_num = new_dust;
-                    }
-                    asset.oi_eff_short_q = asset
-                        .oi_eff_short_q
-                        .checked_sub(leg.basis_pos_q.unsigned_abs())
-                        .ok_or(V16Error::CounterUnderflow)?;
-                    asset.loss_weight_sum_short = asset
-                        .loss_weight_sum_short
-                        .checked_sub(leg.loss_weight)
-                        .ok_or(V16Error::CounterUnderflow)?;
-                }
-            }
-        }
+        let asset = V16Core::kernel_clear_leg(leg, asset)?;
         account.header.legs[leg_slot] =
             PortfolioLegV16Account::from_runtime(&PortfolioLegV16::EMPTY);
         let mut bitmap = account.header.active_bitmap.map(V16PodU64::get);
