@@ -1,3 +1,4 @@
+use percolator::active_bitmap_is_empty;
 use percolator::{
     v16_domain_count_for_market_slots, AssetLifecycleV16, AssetStateV16Account,
     BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, CloseProgressLedgerV16,
@@ -1925,6 +1926,99 @@ fn v16_exact_oi_cross_starts_reset_for_adl_basis_residue() {
     market.validate_shape().unwrap();
     survivor.validate_with_market(&market.as_view()).unwrap();
     liquidated.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_recovery_forfeit_retains_loss_weight_until_opposite_positions_settle() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut first_header = account_fixture(1, 29);
+    let mut second_header = account_fixture(1, 30);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut first = PortfolioV16ViewMut::new(&mut first_header);
+        let mut second = PortfolioV16ViewMut::new(&mut second_header);
+        market.deposit_not_atomic(&mut first, 1_000).unwrap();
+        market.deposit_not_atomic(&mut second, 1_000).unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut first,
+                &mut second,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: POS_SCALE as i128,
+                    exec_price: 100,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+        market.force_asset_recovery_not_atomic(0, 2).unwrap();
+    }
+
+    let first_side = first_header.legs[0].try_to_runtime().unwrap().side;
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut first = PortfolioV16ViewMut::new(&mut first_header);
+        let outcome = market
+            .forfeit_recovery_leg_not_atomic(&mut first, 0, u128::MAX)
+            .expect("first Recovery exit must retain future loss absorption");
+        assert!(!outcome.detached);
+        let obligation = first.header.legs[0].try_to_runtime().unwrap();
+        assert!(obligation.active);
+        assert_eq!(obligation.basis_pos_q, 0);
+        assert_ne!(obligation.loss_weight, 0);
+        let asset = market.markets[0].engine.asset.try_to_runtime().unwrap();
+        match first_side {
+            SideV16::Long => {
+                assert_eq!(asset.oi_eff_long_q, 0);
+                assert_eq!(asset.pending_obligation_count_long, 1);
+                assert_ne!(asset.oi_eff_short_q, 0);
+            }
+            SideV16::Short => {
+                assert_eq!(asset.oi_eff_short_q, 0);
+                assert_eq!(asset.pending_obligation_count_short, 1);
+                assert_ne!(asset.oi_eff_long_q, 0);
+            }
+        }
+        market.validate_shape().unwrap();
+        first.validate_with_market(&market.as_view()).unwrap();
+    }
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut second = PortfolioV16ViewMut::new(&mut second_header);
+        let outcome = market
+            .forfeit_recovery_leg_not_atomic(&mut second, 0, u128::MAX)
+            .expect("last non-pending opposite position can detach");
+        assert!(outcome.detached);
+        assert!(active_bitmap_is_empty(
+            second.header.active_bitmap.map(V16PodU64::get)
+        ));
+        market.validate_shape().unwrap();
+        second.validate_with_market(&market.as_view()).unwrap();
+    }
+
+    {
+        // Upstream clears the released zero-basis obligation through the
+        // self-classifying auto-crank (Stage D). This fork has no such plan yet;
+        // a second Recovery forfeit reaches the same release path.
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut first = PortfolioV16ViewMut::new(&mut first_header);
+        let outcome = market
+            .forfeit_recovery_leg_not_atomic(&mut first, 0, u128::MAX)
+            .expect("released zero-basis obligation must clear once the opposite side is empty");
+        assert!(outcome.detached);
+        assert!(active_bitmap_is_empty(
+            first.header.active_bitmap.map(V16PodU64::get)
+        ));
+        let asset = market.markets[0].engine.asset.try_to_runtime().unwrap();
+        assert_eq!(asset.pending_obligation_count_long, 0);
+        assert_eq!(asset.pending_obligation_count_short, 0);
+        assert_eq!(asset.loss_weight_sum_long, 0);
+        assert_eq!(asset.loss_weight_sum_short, 0);
+        market.validate_shape().unwrap();
+        first.validate_with_market(&market.as_view()).unwrap();
+    }
 }
 
 #[test]
