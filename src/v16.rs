@@ -10595,7 +10595,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             || effective_price == 0
             || effective_price > MAX_ORACLE_PRICE
             || funding_rate_e9.unsigned_abs() > config.max_abs_funding_e9_per_slot as u128
-            || now_slot < self.header.current_slot.get()
         {
             return Err(V16Error::InvalidConfig);
         }
@@ -10676,7 +10675,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             .checked_add(segment_dt)
             .ok_or(V16Error::ArithmeticOverflow)?;
         self.set_asset_state(asset_index, asset)?;
-        self.header.current_slot = V16PodU64::new(now_slot);
+        // `now_slot` is the endpoint of this asset-local committed segment. Another asset can
+        // already have advanced the market's authenticated clock beyond that endpoint, so keep
+        // the global clock monotonic while allowing this lagging asset to catch up.
+        // (upstream b4b975f3)
+        self.header.current_slot = V16PodU64::new(self.header.current_slot.get().max(now_slot));
         // Hot paths are asset-local: scanning all markets here makes every
         // crank/trade depend on total dynamic asset count. `slot_last` and
         // `loss_stale_active` summarize only the touched asset; safety gates
