@@ -764,6 +764,59 @@ pub fn active_bitmap_count_ones(bitmap: V16ActiveBitmap) -> u32 {
 struct V16Core;
 
 impl V16Core {
+    /// Claim-free terminal overlap recredit: the paired-domain insurance spend
+    /// that is also backed by an outstanding provider receivable and by
+    /// claim-free residual. (upstream 76a86f48)
+    fn terminal_claim_free_overlap_recredit(
+        provider_receivable_atoms: u128,
+        paired_domain_insurance_spent: u128,
+        claim_free_residual_remaining: u128,
+    ) -> u128 {
+        provider_receivable_atoms
+            .min(paired_domain_insurance_spent)
+            .min(claim_free_residual_remaining)
+    }
+
+    /// One asset step of the bounded terminal slab scan, priority ordered:
+    /// expire a lapsed long, then short, bucket; recredit; wait on live
+    /// backing; else continue. (upstream 6f3c5c12 / 545e0224)
+    fn kernel_terminal_slab_asset_step(
+        long_status: BackingBucketStatusV16,
+        long_expiry_slot: u64,
+        short_status: BackingBucketStatusV16,
+        short_expiry_slot: u64,
+        authenticated_slot: u64,
+        recreditable: bool,
+    ) -> TerminalSlabAssetStepV16 {
+        let long_fresh = long_status == BackingBucketStatusV16::Fresh;
+        let short_fresh = short_status == BackingBucketStatusV16::Fresh;
+        if long_fresh && long_expiry_slot <= authenticated_slot {
+            TerminalSlabAssetStepV16::Expire(0)
+        } else if short_fresh && short_expiry_slot <= authenticated_slot {
+            TerminalSlabAssetStepV16::Expire(1)
+        } else if recreditable {
+            TerminalSlabAssetStepV16::Recredit
+        } else if (long_fresh && long_expiry_slot > authenticated_slot)
+            || (short_fresh && short_expiry_slot > authenticated_slot)
+        {
+            TerminalSlabAssetStepV16::Wait
+        } else {
+            TerminalSlabAssetStepV16::Continue
+        }
+    }
+
+    /// A parked cursor may only report strict progress. (upstream 6f3c5c12)
+    fn kernel_terminal_slab_wait_continuation(
+        scan_start_asset_index: usize,
+        asset_index: usize,
+    ) -> V16Result<usize> {
+        if asset_index <= scan_start_asset_index {
+            Err(V16Error::LockActive)
+        } else {
+            Ok(asset_index)
+        }
+    }
+
     /// Recompute the resolved payout rate from the ledger's current residual
     /// and outstanding claim bound. This deliberately contains no wide
     /// division: receipts apply the resulting fraction when they are paid.
@@ -4014,6 +4067,17 @@ impl TokenValueFlowProofV16 {
         Ok(proof)
     }
 
+    fn unallocated_protocol_surplus_to_insurance(
+        amount: u128,
+        vault_before: u128,
+        vault_after: u128,
+    ) -> V16Result<Self> {
+        let mut proof = Self::empty(vault_before, vault_after);
+        proof.debit(TokenValueClassV16::UnallocatedProtocolSurplus, amount)?;
+        proof.credit(TokenValueClassV16::InsuranceCapital, amount)?;
+        Ok(proof)
+    }
+
     pub fn account_capital_to_realized_loss(
         amount: u128,
         vault_before: u128,
@@ -6744,6 +6808,332 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.vault = V16PodU128::new(next_vault);
         self.validate_source_domain_ledger(domain)?;
         self.validate_shape()
+    }
+
+    // Contract layer: terminal retirement removes only value that has no
+    // remaining domain or source-credit claimant. Any vault value above
+    // insurance is claim-free protocol surplus at this boundary; the wrapper
+    // pairs the complete accounting transition with an SPL-token burn.
+    // (upstream a87c9a5b / 545e0224)
+    fn retire_terminal_unbudgeted_insurance_delta(
+        vault: u128,
+        insurance: u128,
+        budget_remaining: u128,
+        source_reserved_atoms: u128,
+    ) -> V16Result<(u128, u128, u128)> {
+        if insurance > vault || budget_remaining != 0 || source_reserved_atoms != 0 {
+            return Err(V16Error::LockActive);
+        }
+        Ok((vault, 0, 0))
+    }
+
+    fn retire_terminal_unbudgeted_insurance_core_not_atomic(&mut self) -> V16Result<u128> {
+        let vault_before = self.header.vault.get();
+        let insurance_before = self.header.insurance.get();
+        let (retired, next_vault, next_insurance) =
+            Self::retire_terminal_unbudgeted_insurance_delta(
+                vault_before,
+                insurance_before,
+                self.header.insurance_domain_budget_remaining_total.get(),
+                self.header
+                    .source_insurance_credit_reserved_total_atoms
+                    .get(),
+            )?;
+        self.header.vault = V16PodU128::new(next_vault);
+        self.header.insurance = V16PodU128::new(next_insurance);
+        let protocol_surplus = vault_before
+            .checked_sub(insurance_before)
+            .ok_or(V16Error::CounterUnderflow)?;
+        TokenValueFlowProofV16::unallocated_protocol_surplus_to_insurance(
+            protocol_surplus,
+            vault_before,
+            vault_before,
+        )?
+        .validate()?;
+        TokenValueFlowProofV16::insurance_capital_to_external_out(
+            retired,
+            vault_before,
+            next_vault,
+        )?
+        .validate()?;
+        Ok(retired)
+    }
+
+    /// Retires the final unbudgeted insurance and claim-free protocol surplus
+    /// from an otherwise empty resolved market. No recoverable insurance
+    /// overlap, domain budget, source reservation, portfolio, PnL, backing
+    /// claim, or payout receipt may remain. (upstream a87c9a5b / 545e0224)
+    pub fn retire_terminal_unbudgeted_insurance_not_atomic(&mut self) -> V16Result<u128> {
+        self.validate_shape()?;
+        self.require_terminal_claim_free_state()?;
+        if self.header.backing_provider_earnings_total.get() != 0
+            || self.header.source_fresh_backing_total_num.get() != 0
+        {
+            return Err(V16Error::LockActive);
+        }
+        if self.first_terminal_claim_free_recredit_asset()?.is_some() {
+            return Err(V16Error::LockActive);
+        }
+        let retired = self.retire_terminal_unbudgeted_insurance_core_not_atomic()?;
+        self.validate_shape()?;
+        Ok(retired)
+    }
+
+    fn recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+        &mut self,
+        source_domain: usize,
+        claim_free_residual_remaining: &mut u128,
+    ) -> V16Result<u128> {
+        let (asset_index, source_side) = self.domain_asset_side(source_domain)?;
+        let insurance_domain =
+            self.insurance_domain_index(asset_index, opposite_side(source_side))?;
+        let (_, insurance_spent) = self.domain_insurance_budget_spent(insurance_domain)?;
+        let provider_receivable_atoms = self
+            .source_credit_for_domain(source_domain)?
+            .provider_receivable_num
+            / BOUND_SCALE;
+        let recredit = V16Core::terminal_claim_free_overlap_recredit(
+            provider_receivable_atoms,
+            insurance_spent,
+            *claim_free_residual_remaining,
+        );
+        if recredit == 0 {
+            return Ok(0);
+        }
+
+        let vault_before = self.header.vault.get();
+        self.header.insurance = V16PodU128::new(
+            self.header
+                .insurance
+                .get()
+                .checked_add(recredit)
+                .ok_or(V16Error::ArithmeticOverflow)?,
+        );
+        self.set_domain_insurance_spent_core(
+            insurance_domain,
+            insurance_spent
+                .checked_sub(recredit)
+                .ok_or(V16Error::CounterUnderflow)?,
+        )?;
+        *claim_free_residual_remaining = claim_free_residual_remaining
+            .checked_sub(recredit)
+            .ok_or(V16Error::CounterUnderflow)?;
+        TokenValueFlowProofV16::unallocated_protocol_surplus_to_insurance(
+            recredit,
+            vault_before,
+            self.header.vault.get(),
+        )?
+        .validate()?;
+        Ok(recredit)
+    }
+
+    /// Shared gate of the three terminal public entries: Resolved and no
+    /// trader claim of any kind remains. (upstream 76a86f48 / 545e0224)
+    fn require_terminal_claim_free_state(&self) -> V16Result<()> {
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Resolved
+            || self.header.materialized_portfolio_count.get() != 0
+            || self.header.c_tot.get() != 0
+            || self.header.pnl_pos_tot.get() != 0
+            || self.header.pnl_matured_pos_tot.get() != 0
+            || self.header.pnl_pos_bound_tot.get() != 0
+            || self.header.pnl_pos_bound_tot_num.get() != 0
+            || self.header.source_claim_bound_total_num.get() != 0
+            || self.header.resolved_payout_blocker_count.get() != 0
+            || self.header.stale_certificate_count.get() != 0
+            || self.header.b_stale_account_count.get() != 0
+            || self.header.negative_pnl_account_count.get() != 0
+        {
+            return Err(V16Error::LockActive);
+        }
+        Ok(())
+    }
+
+    /// Read-only recredit amount for one persisted asset slot, so the bounded
+    /// scan does no view resolution. (upstream af7b4d2a)
+    fn terminal_claim_free_recredit_for_slot(
+        slot: &EngineAssetSlotV16Account,
+        claim_free_residual: u128,
+    ) -> V16Result<u128> {
+        let long_source_recredit = V16Core::terminal_claim_free_overlap_recredit(
+            slot.source_credit_long.provider_receivable_num.get() / BOUND_SCALE,
+            slot.insurance_domain_spent_short.get(),
+            claim_free_residual,
+        );
+        let residual_after_long = claim_free_residual
+            .checked_sub(long_source_recredit)
+            .ok_or(V16Error::CounterUnderflow)?;
+        let short_source_recredit = V16Core::terminal_claim_free_overlap_recredit(
+            slot.source_credit_short.provider_receivable_num.get() / BOUND_SCALE,
+            slot.insurance_domain_spent_long.get(),
+            residual_after_long,
+        );
+        long_source_recredit
+            .checked_add(short_source_recredit)
+            .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    fn first_terminal_claim_free_recredit_asset(&self) -> V16Result<Option<usize>> {
+        let residual = self.residual();
+        if residual == 0 {
+            return Ok(None);
+        }
+        let configured_assets = self.header.config.max_market_slots.get() as usize;
+        for asset_index in 0..configured_assets {
+            if Self::terminal_claim_free_recredit_for_slot(
+                self.markets[asset_index].engine_slot(),
+                residual,
+            )? != 0
+            {
+                return Ok(Some(asset_index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Restores one asset's claim-free terminal residual that is also backed by
+    /// both an outstanding counterparty-provider receivable and historical
+    /// insurance spend on the paired side. The final materialized-portfolio gate
+    /// makes the residual unowned by traders before any reclassification occurs.
+    ///
+    /// This operation is intentionally asset-local: wrapper callers can make
+    /// bounded progress even when the market account contains thousands of
+    /// configured slots. (upstream 76a86f48 [BLOCKER LoF])
+    fn recredit_terminal_claim_free_residual_for_asset_core_not_atomic(
+        &mut self,
+        asset_index: usize,
+    ) -> V16Result<u128> {
+        let mut claim_free_residual_remaining = self.residual();
+        let mut recredited_total = 0u128;
+        for side in [SideV16::Long, SideV16::Short] {
+            if claim_free_residual_remaining == 0 {
+                break;
+            }
+            let source_domain = self.insurance_domain_index(asset_index, side)?;
+            let recredited = self
+                .recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+                    source_domain,
+                    &mut claim_free_residual_remaining,
+                )?;
+            recredited_total = recredited_total
+                .checked_add(recredited)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+        }
+        Ok(recredited_total)
+    }
+
+    pub fn recredit_terminal_claim_free_residual_for_asset_not_atomic(
+        &mut self,
+        asset_index: usize,
+    ) -> V16Result<u128> {
+        self.validate_shape()?;
+        self.require_terminal_claim_free_state()?;
+        let recredited =
+            self.recredit_terminal_claim_free_residual_for_asset_core_not_atomic(asset_index)?;
+        self.validate_shape()?;
+        Ok(recredited)
+    }
+
+    /// Advances one bounded terminal cleanup step. A nonzero scan start must be the exact
+    /// `ScanProgress` continuation persisted by the wrapper. The scan never advances past a Fresh
+    /// backing bucket: it expires an elapsed bucket, advances up to a still-live bucket, or returns
+    /// `LockActive` when already parked on one. This makes the prefix stable across authenticated
+    /// slot changes without requiring every continuation to land in one slot. The wrapper owns the
+    /// continuation state and closes external custody only for `ReadyToClose`.
+    /// (upstream 545e0224 / af7b4d2a / 6f3c5c12)
+    pub fn advance_terminal_slab_not_atomic(
+        &mut self,
+        authenticated_slot: u64,
+        scan_start_asset_index: usize,
+    ) -> V16Result<TerminalSlabOutcomeV16> {
+        self.validate_shape()?;
+        self.require_terminal_claim_free_state()?;
+        self.advance_resolved_slot_not_atomic(authenticated_slot)?;
+
+        let configured_assets = self.header.config.max_market_slots.get() as usize;
+        if scan_start_asset_index != 0 && scan_start_asset_index >= configured_assets {
+            return Err(V16Error::InvalidConfig);
+        }
+        let inspect_backing = self.header.source_fresh_backing_total_num.get() != 0;
+        let residual = self.residual();
+        let inspect_recredit = residual != 0;
+        if inspect_backing || inspect_recredit {
+            let scan_end = scan_start_asset_index
+                .checked_add(TERMINAL_SLAB_SCAN_ASSETS_PER_CALL)
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .min(configured_assets);
+            for asset_index in scan_start_asset_index..scan_end {
+                let step = {
+                    let slot = self.markets[asset_index].engine_slot();
+                    let long_status = decode_backing_bucket_status(slot.backing_long.status)?;
+                    let short_status = decode_backing_bucket_status(slot.backing_short.status)?;
+                    let recreditable = inspect_recredit
+                        && Self::terminal_claim_free_recredit_for_slot(slot, residual)? != 0;
+                    V16Core::kernel_terminal_slab_asset_step(
+                        if inspect_backing {
+                            long_status
+                        } else {
+                            BackingBucketStatusV16::Empty
+                        },
+                        slot.backing_long.expiry_slot.get(),
+                        if inspect_backing {
+                            short_status
+                        } else {
+                            BackingBucketStatusV16::Empty
+                        },
+                        slot.backing_short.expiry_slot.get(),
+                        authenticated_slot,
+                        recreditable,
+                    )
+                };
+                match step {
+                    TerminalSlabAssetStepV16::Expire(side_offset) => {
+                        let domain = asset_index
+                            .checked_mul(2)
+                            .and_then(|value| value.checked_add(side_offset))
+                            .ok_or(V16Error::ArithmeticOverflow)?;
+                        self.expire_source_backing_bucket_not_atomic(domain, authenticated_slot)?;
+                        self.validate_shape()?;
+                        return Ok(TerminalSlabOutcomeV16::BackingExpired { domain });
+                    }
+                    TerminalSlabAssetStepV16::Recredit => {
+                        let amount = self
+                            .recredit_terminal_claim_free_residual_for_asset_core_not_atomic(
+                                asset_index,
+                            )?;
+                        if amount == 0 {
+                            return Err(V16Error::InvalidConfig);
+                        }
+                        self.validate_shape()?;
+                        return Ok(TerminalSlabOutcomeV16::InsuranceRecredited {
+                            asset_index,
+                            amount,
+                        });
+                    }
+                    TerminalSlabAssetStepV16::Wait => {
+                        let next_asset_index = V16Core::kernel_terminal_slab_wait_continuation(
+                            scan_start_asset_index,
+                            asset_index,
+                        )?;
+                        return Ok(TerminalSlabOutcomeV16::ScanProgress { next_asset_index });
+                    }
+                    TerminalSlabAssetStepV16::Continue => {}
+                }
+            }
+            if scan_end != configured_assets {
+                return Ok(TerminalSlabOutcomeV16::ScanProgress {
+                    next_asset_index: scan_end,
+                });
+            }
+        }
+
+        if self.header.backing_provider_earnings_total.get() != 0
+            || self.header.source_fresh_backing_total_num.get() != 0
+        {
+            return Err(V16Error::LockActive);
+        }
+        let retired = self.retire_terminal_unbudgeted_insurance_core_not_atomic()?;
+        self.validate_shape()?;
+        Ok(TerminalSlabOutcomeV16::ReadyToClose { retired })
     }
 
     pub fn expire_source_backing_bucket_not_atomic(
@@ -13522,6 +13912,33 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     #[cfg(kani)]
+    pub fn kani_recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+        &mut self,
+        source_domain: usize,
+        claim_free_residual_remaining: &mut u128,
+    ) -> V16Result<u128> {
+        self.recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+            source_domain,
+            claim_free_residual_remaining,
+        )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_retire_terminal_unbudgeted_insurance_delta(
+        vault: u128,
+        insurance: u128,
+        budget_remaining: u128,
+        source_reserved_atoms: u128,
+    ) -> V16Result<(u128, u128, u128)> {
+        Self::retire_terminal_unbudgeted_insurance_delta(
+            vault,
+            insurance,
+            budget_remaining,
+            source_reserved_atoms,
+        )
+    }
+
+    #[cfg(kani)]
     pub fn kani_prepare_counterparty_backing_expiry_delta(
         bucket: BackingBucketV16,
         source: SourceCreditStateV16,
@@ -16730,6 +17147,28 @@ impl RiskScoreV16 {
     }
 }
 
+/// Outcome of one bounded terminal cleanup step (upstream 545e0224). The wrapper
+/// owns the `ScanProgress` continuation and closes external custody only for
+/// `ReadyToClose`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSlabOutcomeV16 {
+    ScanProgress { next_asset_index: usize },
+    BackingExpired { domain: usize },
+    InsuranceRecredited { asset_index: usize, amount: u128 },
+    ReadyToClose { retired: u128 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalSlabAssetStepV16 {
+    Expire(usize),
+    Recredit,
+    Wait,
+    Continue,
+}
+
+/// Assets inspected by one `advance_terminal_slab_not_atomic` call.
+pub const TERMINAL_SLAB_SCAN_ASSETS_PER_CALL: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionlessProgressOutcomeV16 {
     AccountCurrent,
@@ -16878,6 +17317,52 @@ pub fn kani_trade_preflight_risk_gate(
         target_effective_lag,
         touches_pending_domain_barrier,
     )
+}
+
+#[cfg(kani)]
+pub fn kani_terminal_claim_free_overlap_recredit(
+    provider_receivable_atoms: u128,
+    paired_domain_insurance_spent: u128,
+    claim_free_residual_remaining: u128,
+) -> u128 {
+    V16Core::terminal_claim_free_overlap_recredit(
+        provider_receivable_atoms,
+        paired_domain_insurance_spent,
+        claim_free_residual_remaining,
+    )
+}
+
+#[cfg(kani)]
+pub fn kani_terminal_slab_asset_step(
+    long_status: BackingBucketStatusV16,
+    long_expiry_slot: u64,
+    short_status: BackingBucketStatusV16,
+    short_expiry_slot: u64,
+    authenticated_slot: u64,
+    recreditable: bool,
+) -> u8 {
+    match V16Core::kernel_terminal_slab_asset_step(
+        long_status,
+        long_expiry_slot,
+        short_status,
+        short_expiry_slot,
+        authenticated_slot,
+        recreditable,
+    ) {
+        TerminalSlabAssetStepV16::Expire(0) => 0,
+        TerminalSlabAssetStepV16::Expire(_) => 1,
+        TerminalSlabAssetStepV16::Recredit => 2,
+        TerminalSlabAssetStepV16::Wait => 3,
+        TerminalSlabAssetStepV16::Continue => 4,
+    }
+}
+
+#[cfg(kani)]
+pub fn kani_terminal_slab_wait_continuation(
+    scan_start_asset_index: usize,
+    asset_index: usize,
+) -> V16Result<usize> {
+    V16Core::kernel_terminal_slab_wait_continuation(scan_start_asset_index, asset_index)
 }
 
 #[cfg(kani)]

@@ -16,13 +16,14 @@ use percolator::v16::{
     kani_loss_stale_trade_scope_allowed, kani_pending_domain_loss_barrier_blocks_position_change,
     kani_position_delta_increases_risk, kani_prepare_asset_recovery_transition,
     kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
-    kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
-    kani_validate_positive_pnl_source_attribution, AssetLifecycleV16, AssetStateV16,
-    AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
-    BatchTradeOutcomeV16, CloseProgressLedgerV16, CloseProgressLedgerV16Account,
-    EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16, HealthCertV16Account,
-    InsuranceCreditReservationV16, InsuranceCreditReservationV16Account, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
+    kani_terminal_claim_free_overlap_recredit, kani_terminal_slab_asset_step,
+    kani_terminal_slab_wait_continuation, kani_trade_preexisting_oi_reduction_gate,
+    kani_trade_preflight_risk_gate, kani_validate_positive_pnl_source_attribution,
+    AssetLifecycleV16, AssetStateV16, AssetStateV16Account, BackingBucketStatusV16,
+    BackingBucketV16, BackingBucketV16Account, BatchTradeOutcomeV16, CloseProgressLedgerV16,
+    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16,
+    HealthCertV16Account, InsuranceCreditReservationV16, InsuranceCreditReservationV16Account,
+    Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
     PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
@@ -13553,4 +13554,249 @@ fn proof_v16_resolved_clock_advance_is_exact_and_monotonic() {
     } else {
         assert_eq!(result, Err(V16Error::LockActive));
     }
+}
+
+// upstream a87c9a5b / 76a86f48 / 6f3c5c12: terminal retirement and claim-free recredit proofs.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_unbudgeted_insurance_retirement_is_exact_and_claim_safe() {
+    let vault: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let budget_remaining: u128 = kani::any();
+    let source_reserved: u128 = kani::any();
+
+    let result = MarketGroupV16ViewMut::<u64>::kani_retire_terminal_unbudgeted_insurance_delta(
+        vault,
+        insurance,
+        budget_remaining,
+        source_reserved,
+    );
+    let expected_ok = insurance <= vault && budget_remaining == 0 && source_reserved == 0;
+    kani::cover!(
+        expected_ok && insurance > 0,
+        "terminal retirement covers a nonzero unbudgeted insurance burn"
+    );
+    kani::cover!(
+        expected_ok && vault > insurance,
+        "terminal retirement covers claim-free protocol surplus"
+    );
+    kani::cover!(
+        vault == insurance && budget_remaining > 0,
+        "terminal retirement covers a protected domain budget"
+    );
+    kani::cover!(
+        vault == insurance && source_reserved > 0,
+        "terminal retirement covers a protected source reservation"
+    );
+    assert_eq!(result.is_ok(), expected_ok);
+    if let Ok((retired, next_vault, next_insurance)) = result {
+        assert_eq!(retired, vault);
+        assert_eq!(next_vault, 0);
+        assert_eq!(next_insurance, 0);
+        assert_eq!(vault - next_vault, retired);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_claim_free_overlap_recredit_is_exactly_bounded() {
+    let receivable_raw: u16 = kani::any();
+    let spent_raw: u16 = kani::any();
+    let residual_raw: u16 = kani::any();
+    let receivable = receivable_raw as u128;
+    let spent = spent_raw as u128;
+    let residual = residual_raw as u128;
+
+    let recredit = kani_terminal_claim_free_overlap_recredit(receivable, spent, residual);
+
+    kani::cover!(
+        receivable > 8 && spent > receivable && residual > receivable,
+        "terminal overlap recredit covers provider-receivable cap"
+    );
+    kani::cover!(
+        spent > 8 && receivable > spent && residual > spent,
+        "resolved overlap recredit covers paired-insurance-spend cap"
+    );
+    kani::cover!(
+        residual > 8 && receivable > residual && spent > residual,
+        "resolved overlap recredit covers claim-free-residual cap"
+    );
+
+    assert_eq!(recredit, receivable.min(spent).min(residual));
+    assert!(recredit <= receivable);
+    assert!(recredit <= spent);
+    assert!(recredit <= residual);
+
+    let insurance_before: u128 = kani::any();
+    kani::assume(insurance_before <= u128::MAX - residual);
+    let insurance_after = insurance_before + recredit;
+    let spent_after = spent - recredit;
+    let residual_after = residual - recredit;
+    assert_eq!(
+        insurance_after + residual_after,
+        insurance_before + residual
+    );
+    assert_eq!(spent_after + recredit, spent);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_slab_asset_step_is_total_and_priority_ordered() {
+    let long_selector: u8 = kani::any();
+    let short_selector: u8 = kani::any();
+    let long_status = match long_selector & 3 {
+        0 => BackingBucketStatusV16::Empty,
+        1 => BackingBucketStatusV16::Fresh,
+        2 => BackingBucketStatusV16::Expired,
+        _ => BackingBucketStatusV16::Impaired,
+    };
+    let short_status = match short_selector & 3 {
+        0 => BackingBucketStatusV16::Empty,
+        1 => BackingBucketStatusV16::Fresh,
+        2 => BackingBucketStatusV16::Expired,
+        _ => BackingBucketStatusV16::Impaired,
+    };
+    let long_expiry_slot: u64 = kani::any();
+    let short_expiry_slot: u64 = kani::any();
+    let authenticated_slot: u64 = kani::any();
+    let recreditable: bool = kani::any();
+
+    let actual = kani_terminal_slab_asset_step(
+        long_status,
+        long_expiry_slot,
+        short_status,
+        short_expiry_slot,
+        authenticated_slot,
+        recreditable,
+    );
+    let long_lapsed =
+        long_status == BackingBucketStatusV16::Fresh && long_expiry_slot <= authenticated_slot;
+    let short_lapsed =
+        short_status == BackingBucketStatusV16::Fresh && short_expiry_slot <= authenticated_slot;
+    let has_live_backing = (long_status == BackingBucketStatusV16::Fresh
+        && long_expiry_slot > authenticated_slot)
+        || (short_status == BackingBucketStatusV16::Fresh
+            && short_expiry_slot > authenticated_slot);
+    let expected = if long_lapsed {
+        0
+    } else if short_lapsed {
+        1
+    } else if recreditable {
+        2
+    } else if has_live_backing {
+        3
+    } else {
+        4
+    };
+
+    kani::cover!(actual == 0, "terminal scan selects lapsed long backing");
+    kani::cover!(actual == 1, "terminal scan selects lapsed short backing");
+    kani::cover!(actual == 2, "terminal scan selects insurance recredit");
+    kani::cover!(actual == 3, "terminal scan stops at live backing");
+    kani::cover!(actual == 4, "terminal scan advances over an inert asset");
+    assert_eq!(actual, expected);
+    if actual == 3 {
+        assert!(has_live_backing);
+        assert!(!long_lapsed && !short_lapsed && !recreditable);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_slab_wait_is_error_or_strict_cursor_progress() {
+    let scan_start_raw: u16 = kani::any();
+    let asset_raw: u16 = kani::any();
+    let scan_start = scan_start_raw as usize;
+    let asset = asset_raw as usize;
+    let result = kani_terminal_slab_wait_continuation(scan_start, asset);
+
+    kani::cover!(
+        asset == scan_start,
+        "a parked cursor rejects a successful no-op"
+    );
+    kani::cover!(
+        asset > scan_start,
+        "a discovered blocker advances the cursor to itself"
+    );
+    assert_eq!(result.is_ok(), asset > scan_start);
+    if let Ok(next_asset) = result {
+        assert_eq!(next_asset, asset);
+        assert!(next_asset > scan_start);
+    } else {
+        assert!(asset <= scan_start);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(32)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_claim_free_overlap_recredit_updates_only_paired_insurance_domain() {
+    let budget_raw: u8 = kani::any();
+    let spent_raw: u8 = kani::any();
+    let receivable_raw: u8 = kani::any();
+    let residual_raw: u8 = kani::any();
+    kani::assume(spent_raw <= budget_raw);
+
+    let budget = budget_raw as u128;
+    let spent = spent_raw as u128;
+    let receivable = receivable_raw as u128;
+    let residual_before = residual_raw as u128;
+    let insurance_before = budget - spent;
+    let expected = receivable.min(spent).min(residual_before);
+
+    let (mut header, mut markets, _) = one_market_view_fixture();
+    header.insurance = V16PodU128::new(insurance_before);
+    header.vault = V16PodU128::new(insurance_before + residual_before);
+    header.insurance_domain_budget_remaining_total = V16PodU128::new(insurance_before);
+    markets[0].engine.insurance_domain_budget_short = V16PodU128::new(budget);
+    markets[0].engine.insurance_domain_spent_short = V16PodU128::new(spent);
+    let receivable_num = receivable * BOUND_SCALE;
+    let mut source = markets[0]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+    source.spent_backing_num = receivable_num;
+    source.provider_receivable_num = receivable_num;
+    markets[0].engine.source_credit_long = SourceCreditStateV16Account::from_runtime(&source);
+    let mut bucket = markets[0].engine.backing_long.try_to_runtime().unwrap();
+    bucket.consumed_liened_backing_num = receivable_num;
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&bucket);
+    let long_spent_before = markets[0].engine.insurance_domain_spent_long;
+    let vault_before = header.vault;
+    let mut residual_remaining = residual_before;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let result = market
+        .kani_recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+            0,
+            &mut residual_remaining,
+        )
+        .unwrap();
+
+    kani::cover!(
+        expected > 2 && expected < receivable,
+        "transition covers a nontrivial paired-domain partial recredit"
+    );
+    assert_eq!(result, expected);
+    assert_eq!(market.header.vault, vault_before);
+    assert_eq!(market.header.insurance.get(), insurance_before + expected);
+    assert_eq!(
+        market.header.insurance_domain_budget_remaining_total.get(),
+        insurance_before + expected
+    );
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_spent_short.get(),
+        spent - expected
+    );
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_spent_long,
+        long_spent_before
+    );
+    assert_eq!(residual_remaining, residual_before - expected);
+    assert_eq!(market.kani_residual(), residual_before - expected);
 }
