@@ -11514,6 +11514,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Ok(());
         }
         let asset = self.asset_state(asset_index)?;
+        if asset.a_long != ADL_ONE || asset.a_short != ADL_ONE {
+            return Err(V16Error::LockActive);
+        }
         asset_risk_increase_gate(asset.lifecycle, asset.mode_long, asset.mode_short)
     }
 
