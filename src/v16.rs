@@ -879,6 +879,68 @@ impl V16Core {
         Ok((leg, asset))
     }
 
+    /// PRODUCTION KERNEL: the attach-leg core — snapshot the side's basis
+    /// anchors, gate the a-basis range, add open interest, and construct the
+    /// new leg. Pure on (AssetStateV16, scalars); the attach glue calls
+    /// exactly this. loss_weight is caller-supplied (division-bearing).
+    pub(crate) fn kernel_attach_leg(
+        mut asset: AssetStateV16,
+        side: SideV16,
+        basis_pos_q: i128,
+        loss_weight: u128,
+        asset_index_u32: u32,
+    ) -> V16Result<(AssetStateV16, PortfolioLegV16)> {
+        let (a_basis, k_snap, f_snap, kf_epoch_snap, b_snap, epoch_snap) = match side {
+            SideV16::Long => (
+                asset.a_long,
+                asset.k_long,
+                asset.f_long_num,
+                asset.kf_epoch_long,
+                asset.b_long_num,
+                asset.epoch_long,
+            ),
+            SideV16::Short => (
+                asset.a_short,
+                asset.k_short,
+                asset.f_short_num,
+                asset.kf_epoch_short,
+                asset.b_short_num,
+                asset.epoch_short,
+            ),
+        };
+        if !(MIN_A_SIDE..=ADL_ONE).contains(&a_basis) {
+            return Err(V16Error::InvalidLeg);
+        }
+        if loss_weight == 0 {
+            return Err(V16Error::InvalidLeg);
+        }
+        add_open_interest_for_new_position(
+            &mut asset,
+            side,
+            basis_pos_q.unsigned_abs(),
+            loss_weight,
+        )?;
+        let leg = PortfolioLegV16 {
+            active: true,
+            asset_index: asset_index_u32,
+            market_id: asset.market_id,
+            side,
+            basis_pos_q,
+            a_basis,
+            k_snap,
+            f_snap,
+            kf_epoch_snap,
+            epoch_snap,
+            loss_weight,
+            b_snap,
+            b_rem: 0,
+            b_epoch_snap: epoch_snap,
+            b_stale: false,
+            stale: false,
+        };
+        Ok((asset, leg))
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -12194,57 +12256,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Err(V16Error::LockActive);
         }
         validate_basis(basis_pos_q)?;
-        let mut asset = self.asset_state(asset_index)?;
+        let asset = self.asset_state(asset_index)?;
         self.require_asset_risk_change_allowed(asset_index, true)?;
-        let (a_basis, k_snap, f_snap, kf_epoch_snap, b_snap, epoch_snap) = match side {
-            SideV16::Long => (
-                asset.a_long,
-                asset.k_long,
-                asset.f_long_num,
-                asset.kf_epoch_long,
-                asset.b_long_num,
-                asset.epoch_long,
-            ),
-            SideV16::Short => (
-                asset.a_short,
-                asset.k_short,
-                asset.f_short_num,
-                asset.kf_epoch_short,
-                asset.b_short_num,
-                asset.epoch_short,
-            ),
+        let a_basis = match side {
+            SideV16::Long => asset.a_long,
+            SideV16::Short => asset.a_short,
         };
-        if !(MIN_A_SIDE..=ADL_ONE).contains(&a_basis) {
-            return Err(V16Error::InvalidLeg);
-        }
         let loss_weight = loss_weight_for_basis(basis_pos_q.unsigned_abs(), a_basis)?;
-        if loss_weight == 0 {
-            return Err(V16Error::InvalidLeg);
-        }
-        add_open_interest_for_new_position(
-            &mut asset,
-            side,
-            basis_pos_q.unsigned_abs(),
-            loss_weight,
-        )?;
-        account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
-            active: true,
-            asset_index: asset_index as u32,
-            market_id: asset.market_id,
-            side,
-            basis_pos_q,
-            a_basis,
-            k_snap,
-            f_snap,
-            kf_epoch_snap,
-            epoch_snap,
-            loss_weight,
-            b_snap,
-            b_rem: 0,
-            b_epoch_snap: epoch_snap,
-            b_stale: false,
-            stale: false,
-        });
+        let (asset, new_leg) =
+            V16Core::kernel_attach_leg(asset, side, basis_pos_q, loss_weight, asset_index as u32)?;
+        account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&new_leg);
         let mut bitmap = account.header.active_bitmap.map(V16PodU64::get);
         active_bitmap_set(&mut bitmap, leg_slot)?;
         account.header.active_bitmap = bitmap.map(V16PodU64::new);
