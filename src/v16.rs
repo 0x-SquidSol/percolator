@@ -843,6 +843,42 @@ impl V16Core {
         Ok((reduce_q, delta))
     }
 
+    /// PRODUCTION KERNEL (kernel-proofs restructure): the same-side leg
+    /// resize state transform. Pure on small Copy structs so the contract
+    /// layer can verify it over its full input domain; the position-delta
+    /// glue in MarketGroupV16ViewMut calls exactly this.
+    pub(crate) fn kernel_resize_leg_same_side(
+        mut leg: PortfolioLegV16,
+        mut asset: AssetStateV16,
+        new_signed: i128,
+        new_weight: u128,
+        preserve_pending_obligation_weight: bool,
+    ) -> V16Result<(PortfolioLegV16, AssetStateV16)> {
+        let old_abs = leg.basis_pos_q.unsigned_abs();
+        let new_abs = new_signed.unsigned_abs();
+        match leg.side {
+            SideV16::Long => {
+                asset.oi_eff_long_q = adjust_u128(asset.oi_eff_long_q, old_abs, new_abs)?;
+                if !preserve_pending_obligation_weight {
+                    asset.loss_weight_sum_long =
+                        adjust_u128(asset.loss_weight_sum_long, leg.loss_weight, new_weight)?;
+                }
+            }
+            SideV16::Short => {
+                asset.oi_eff_short_q = adjust_u128(asset.oi_eff_short_q, old_abs, new_abs)?;
+                if !preserve_pending_obligation_weight {
+                    asset.loss_weight_sum_short =
+                        adjust_u128(asset.loss_weight_sum_short, leg.loss_weight, new_weight)?;
+                }
+            }
+        }
+        leg.basis_pos_q = new_signed;
+        if !preserve_pending_obligation_weight {
+            leg.loss_weight = new_weight;
+        }
+        Ok((leg, asset))
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -12481,37 +12517,22 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if new.unsigned_abs() > current.unsigned_abs() {
             self.require_asset_risk_change_allowed(asset_index, true)?;
         }
-        let mut old_leg = account.header.legs[leg_slot].try_to_runtime()?;
-        let old_abs = old_leg.basis_pos_q.unsigned_abs();
-        let new_abs = new.unsigned_abs();
-        let new_weight = loss_weight_for_basis(new_abs, old_leg.a_basis)?;
+        let old_leg = account.header.legs[leg_slot].try_to_runtime()?;
+        let new_weight = loss_weight_for_basis(new.unsigned_abs(), old_leg.a_basis)?;
         let preserve_pending_obligation_weight =
             same_side_risk_reduction_or_flat_obligation(current, new)
                 && self.has_pending_domain_loss_barrier(asset_index, old_leg.side)?;
-        let mut asset = self.asset_state(asset_index)?;
-        match old_leg.side {
-            SideV16::Long => {
-                asset.oi_eff_long_q = adjust_u128(asset.oi_eff_long_q, old_abs, new_abs)?;
-                if !preserve_pending_obligation_weight {
-                    asset.loss_weight_sum_long =
-                        adjust_u128(asset.loss_weight_sum_long, old_leg.loss_weight, new_weight)?;
-                }
-            }
-            SideV16::Short => {
-                asset.oi_eff_short_q = adjust_u128(asset.oi_eff_short_q, old_abs, new_abs)?;
-                if !preserve_pending_obligation_weight {
-                    asset.loss_weight_sum_short =
-                        adjust_u128(asset.loss_weight_sum_short, old_leg.loss_weight, new_weight)?;
-                }
-            }
-        }
-        old_leg.basis_pos_q = new;
-        if !preserve_pending_obligation_weight {
-            old_leg.loss_weight = new_weight;
-        }
-        account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&old_leg);
+        let asset = self.asset_state(asset_index)?;
+        let (new_leg, new_asset) = V16Core::kernel_resize_leg_same_side(
+            old_leg,
+            asset,
+            new,
+            new_weight,
+            preserve_pending_obligation_weight,
+        )?;
+        account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&new_leg);
         account.header.health_cert.valid = 0;
-        self.set_asset_state(asset_index, asset)?;
+        self.set_asset_state(asset_index, new_asset)?;
         Ok(())
     }
 
