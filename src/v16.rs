@@ -388,8 +388,11 @@ fn liquidation_leg_maintenance_requirement(
     let adverse_delta =
         V16Core::target_effective_lag_adverse_delta(side, effective_price, raw_target_price);
     let target_lag_penalty = liquidation_risk_notional_ceil(abs_q, adverse_delta)?;
-    let base = ((risk_notional * config.maintenance_margin_bps as u128) / MAX_MARGIN_BPS as u128)
-        .max(config.min_nonzero_mm_req);
+    let base = margin_requirement(
+        risk_notional,
+        config.maintenance_margin_bps,
+        config.min_nonzero_mm_req,
+    )?;
     base.checked_add(target_lag_penalty)
         .ok_or(V16Error::ArithmeticOverflow)
 }
@@ -764,6 +767,28 @@ pub fn active_bitmap_count_ones(bitmap: V16ActiveBitmap) -> u32 {
 struct V16Core;
 
 impl V16Core {
+    /// ceil(a * b / denominator) with a u128 fast path and a U256 fallback
+    /// (upstream 4c4dfb20 / ba7a84b7; zero denominator is InvalidConfig).
+    #[inline(always)]
+    fn mul_div_ceil_u128_or_wide(a: u128, b: u128, denominator: u128) -> V16Result<u128> {
+        if denominator == 0 {
+            return Err(V16Error::InvalidConfig);
+        }
+        if let Some(product) = a.checked_mul(b) {
+            let quotient = product / denominator;
+            return quotient
+                .checked_add(u128::from(product % denominator != 0))
+                .ok_or(V16Error::ArithmeticOverflow);
+        }
+        checked_mul_div_ceil_u256(
+            U256::from_u128(a),
+            U256::from_u128(b),
+            U256::from_u128(denominator),
+        )
+        .and_then(|value| value.try_into_u128())
+        .ok_or(V16Error::ArithmeticOverflow)
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -2013,15 +2038,8 @@ impl V16Config {
     }
 
     fn maintenance_requirement_for_notional(&self, n: u128) -> V16Result<u128> {
-        let mm_prop = if let Some(product) = n.checked_mul(self.maintenance_margin_bps as u128) {
-            product / 10_000
-        } else {
-            U256::from_u128(n)
-                .checked_mul(U256::from_u128(self.maintenance_margin_bps as u128))
-                .and_then(|v| v.checked_div(U256::from_u128(10_000)))
-                .and_then(|v| v.try_into_u128())
-                .ok_or(V16Error::InvalidConfig)?
-        };
+        let mm_prop =
+            Self::checked_mul_div_ceil_to_u128(n, self.maintenance_margin_bps as u128, 10_000)?;
         Ok(core::cmp::max(mm_prop, self.min_nonzero_mm_req))
     }
 
@@ -2229,16 +2247,11 @@ impl V16Config {
             return Err(V16Error::InvalidConfig);
         }
 
-        let floor_region_max = U256::from_u128(
-            self.min_nonzero_mm_req
-                .checked_add(1)
-                .ok_or(V16Error::InvalidConfig)?,
-        )
-        .checked_mul(ten_thousand)
-        .and_then(|v| v.checked_sub(U256::ONE))
-        .and_then(|v| v.checked_div(U256::from_u128(self.maintenance_margin_bps as u128)))
-        .and_then(|v| v.try_into_u128())
-        .ok_or(V16Error::InvalidConfig)?;
+        let floor_region_max = U256::from_u128(self.min_nonzero_mm_req)
+            .checked_mul(ten_thousand)
+            .and_then(|v| v.checked_div(U256::from_u128(self.maintenance_margin_bps as u128)))
+            .and_then(|v| v.try_into_u128())
+            .ok_or(V16Error::InvalidConfig)?;
         let floor_region_end = core::cmp::min(floor_region_max, domain_max);
         if floor_region_end != 0
             && !self.solvency_envelope_holds_for_notional(
@@ -16489,10 +16502,7 @@ fn margin_requirement(notional: u128, bps: u64, floor: u128) -> V16Result<u128> 
     if notional == 0 {
         return Ok(0);
     }
-    if let Some(product) = notional.checked_mul(bps as u128) {
-        return Ok((product / MAX_MARGIN_BPS as u128).max(floor));
-    }
-    let raw = wide_mul_div_floor_u128(notional, bps as u128, MAX_MARGIN_BPS as u128);
+    let raw = V16Core::mul_div_ceil_u128_or_wide(notional, bps as u128, MAX_MARGIN_BPS as u128)?;
     Ok(raw.max(floor))
 }
 
@@ -17561,5 +17571,64 @@ mod bankruptcy_hlock_clear_predicate_tests {
             market.header.bankruptcy_hlock_active, 0,
             "hlock must clear on a market that only has an ordinary open position"
         );
+    }
+}
+
+#[cfg(test)]
+mod margin_rounding_tests {
+    // upstream ba7a84b7 "Round margin requirements conservatively" (2026-08-23):
+    // mm_req = max(ceil(X * bps / 10_000), min). Under the former floor, splitting
+    // one notional across two portfolios lowered the aggregate requirement
+    // (2 x 1_311 = 2_622 < 2_623), i.e. fractional-atom collateral credit.
+    use super::margin_requirement;
+    use proptest::prelude::*;
+
+    #[test]
+    fn margin_requirement_partition_regression() {
+        let aggregate = margin_requirement(52_470, 500, 1).unwrap();
+        let partitioned = margin_requirement(26_235, 500, 1)
+            .unwrap()
+            .checked_mul(2)
+            .unwrap();
+        assert_eq!(aggregate, 2_624);
+        assert_eq!(partitioned, aggregate);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn margin_requirement_is_exact_ceiled_with_min(
+            notional in 0u128..=u128::MAX / 20_000,
+            bps in 0u64..=10_000u64,
+            min_req in 0u128..=1_000_000u128,
+        ) {
+            let req = margin_requirement(notional, bps, min_req).unwrap();
+            if notional == 0 {
+                prop_assert_eq!(req, 0);
+            } else {
+                let product = notional * bps as u128;
+                let expected = (product / 10_000 + u128::from(product % 10_000 != 0)).max(min_req);
+                prop_assert_eq!(req, expected);
+            }
+        }
+
+        #[test]
+        fn margin_requirement_is_conservative_under_partition(
+            first in 0u128..=u128::MAX / 40_000,
+            second in 0u128..=u128::MAX / 40_000,
+            bps in 0u64..=10_000u64,
+            min_req in 0u128..=1_000_000u128,
+        ) {
+            let aggregate = margin_requirement(first + second, bps, min_req).unwrap();
+            let partitioned = margin_requirement(first, bps, min_req)
+                .unwrap()
+                .checked_add(margin_requirement(second, bps, min_req).unwrap())
+                .unwrap();
+            prop_assert!(
+                partitioned >= aggregate,
+                "partitioned requirement {} fell below aggregate {}", partitioned, aggregate
+            );
+        }
     }
 }

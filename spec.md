@@ -157,7 +157,7 @@ price_funding_loss_N = ceil(N * loss_budget_num / (10_000 * FUNDING_DEN))
 worst_liq_notional_N = ceil(N * (10_000 + price_budget_bps) / 10_000)
 liq_fee_raw_N        = ceil(worst_liq_notional_N * cfg_liquidation_fee_bps / 10_000)
 liq_fee_N            = min(max(liq_fee_raw_N, cfg_min_liquidation_abs), cfg_liquidation_fee_cap)
-mm_req_N             = max(floor(N * cfg_maintenance_bps / 10_000), cfg_min_nonzero_mm_req)
+mm_req_N             = max(ceil(N * cfg_maintenance_bps / 10_000), cfg_min_nonzero_mm_req)
 require price_funding_loss_N + liq_fee_N <= mm_req_N
 ```
 
