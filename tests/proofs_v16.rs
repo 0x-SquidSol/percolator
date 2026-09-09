@@ -22,7 +22,8 @@ use percolator::v16::{
     BatchTradeOutcomeV16, CloseProgressLedgerV16, CloseProgressLedgerV16Account,
     EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16, HealthCertV16Account,
     InsuranceCreditReservationV16, InsuranceCreditReservationV16Account, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
+    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
+    PermissionlessCrankActionV16,
     PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
@@ -13077,6 +13078,52 @@ fn proof_v16_persisted_risk_gate_is_complete_for_all_lifecycles_and_side_modes()
 
     assert_eq!(result.is_ok(), expected_ok);
     if !expected_ok {
+        assert_eq!(result, Err(V16Error::LockActive));
+    }
+}
+
+// upstream 44847fd5: the resolved-settlement clock admits an authenticated slot
+// only in Resolved mode and only forward.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_clock_advance_is_exact_and_monotonic() {
+    let current_slot: u64 = kani::any();
+    let authenticated_slot: u64 = kani::any();
+    let resolved: bool = kani::any();
+    let mode = if resolved {
+        MarketModeV16::Resolved
+    } else {
+        MarketModeV16::Live
+    };
+    let result = MarketGroupV16ViewMut::<u64>::kani_advance_resolved_slot(
+        mode,
+        current_slot,
+        authenticated_slot,
+    );
+
+    kani::cover!(
+        resolved && authenticated_slot == current_slot,
+        "resolved clock accepts the exact current slot"
+    );
+    kani::cover!(
+        resolved && authenticated_slot > current_slot,
+        "resolved clock accepts a later authenticated slot"
+    );
+    kani::cover!(
+        resolved && authenticated_slot < current_slot,
+        "resolved clock rejects rewind"
+    );
+    kani::cover!(
+        !resolved,
+        "non-resolved mode rejects terminal clock admission"
+    );
+
+    if resolved && authenticated_slot >= current_slot {
+        assert_eq!(result, Ok(authenticated_slot));
+        assert!(result.unwrap() >= current_slot);
+    } else if resolved {
+        assert_eq!(result, Err(V16Error::Stale));
+    } else {
         assert_eq!(result, Err(V16Error::LockActive));
     }
 }
