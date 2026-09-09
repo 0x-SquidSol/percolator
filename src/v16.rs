@@ -812,6 +812,37 @@ impl V16Core {
         Ok((asset, epoch))
     }
 
+    /// PRODUCTION KERNEL: cap unilateral close work by the account's stored
+    /// basis and by matched effective OI. Liquidation and owner rebalance share
+    /// this bound so neither can subtract more OI than either side contains.
+    fn kernel_unilateral_close_capacity(
+        stored_abs: u128,
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+    ) -> u128 {
+        stored_abs.min(oi_eff_long_q).min(oi_eff_short_q)
+    }
+
+    /// PRODUCTION KERNEL (roadmap 3A.2 risk-reduction / S-L3, A5.dec rank): the
+    /// position-reduction core of liquidation/rebalance. Clamps the requested
+    /// close to the leg and produces the toward-zero signed delta.
+    pub(crate) fn kernel_reduce_position_delta(
+        pre_basis_signed: i128,
+        side: SideV16,
+        requested: u128,
+    ) -> V16Result<(u128, i128)> {
+        let pre_abs = pre_basis_signed.unsigned_abs();
+        let reduce_q = requested.min(pre_abs);
+        let reduce_i128 = i128::try_from(reduce_q).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let delta = match side {
+            SideV16::Long => reduce_i128
+                .checked_neg()
+                .ok_or(V16Error::ArithmeticOverflow)?,
+            SideV16::Short => reduce_i128,
+        };
+        Ok((reduce_q, delta))
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -10017,6 +10048,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
         leg_slot: usize,
+        normalize_exhausted_sides: bool,
     ) -> V16Result<(u64, AccountKfSettlementPreparedV16)> {
         if leg_slot >= V16_MAX_PORTFOLIO_ASSETS_N {
             return Err(V16Error::InvalidLeg);
@@ -10026,12 +10058,24 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Err(V16Error::InvalidLeg);
         }
         let asset_index = leg.asset_index as usize;
-        let asset = self.asset_state(asset_index)?;
+        let mut asset = self.asset_state(asset_index)?;
         if asset_index >= self.header.config.max_market_slots.get() as usize
             || asset_index >= self.markets.len()
             || asset.market_id == 0
         {
             return Err(V16Error::InvalidLeg);
+        }
+        if normalize_exhausted_sides
+            && Self::leg_has_exhausted_effective_oi(asset, leg)
+            && !account
+                .header
+                .close_progress
+                .try_to_runtime()?
+                .has_pending_residual()
+            && !self.has_pending_domain_loss_barrier(asset_index, leg.side)?
+        {
+            self.begin_full_drain_reset_inner(asset_index, leg.side)?;
+            asset = self.asset_state(asset_index)?;
         }
         let (k_now, f_now, _k_delta, f_delta, net) =
             Self::leg_kf_delta_components_for_settlement_from_asset(asset, leg)?;
@@ -10114,6 +10158,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     fn settle_account_kf_effects_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
+        normalize_exhausted_sides: bool,
     ) -> V16Result<()> {
         // The composing refresh/crank paths validate bitmap-to-leg consistency. Flat
         // accounts have no K/F work, and skipping a second full leg scan preserves
@@ -10131,7 +10176,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             if slot == V16_MAX_PORTFOLIO_ASSETS_N {
                 return Err(V16Error::InvalidLeg);
             }
-            let (entry, prepared) = self.prepare_account_kf_settlement_entry(account, slot)?;
+            let (entry, prepared) =
+                self.prepare_account_kf_settlement_entry(account, slot, normalize_exhausted_sides)?;
             return self.apply_account_kf_settlement_entry(account, entry, prepared);
         }
         let mut plan = [None; V16_MAX_PORTFOLIO_ASSETS_N];
@@ -10145,7 +10191,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 slot += 1;
                 continue;
             }
-            let (entry, prepared) = self.prepare_account_kf_settlement_entry(account, slot)?;
+            let (entry, prepared) =
+                self.prepare_account_kf_settlement_entry(account, slot, normalize_exhausted_sides)?;
             prepared_by_slot[slot] = prepared;
             plan_len = insert_account_kf_settlement_plan_entry(&mut plan, plan_len, entry)?;
             slot += 1;
@@ -10291,7 +10338,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if decode_bool(account.header.b_stale_state)? && !allow_b_chunk {
             return Err(V16Error::BStale);
         }
-        self.settle_account_kf_effects_not_atomic(account)?;
+        self.settle_account_kf_effects_not_atomic(account, true)?;
         let config = self.header.config.try_to_runtime_shape()?;
         let mut initial_req = 0u128;
         let mut maintenance_req = 0u128;
@@ -10724,7 +10771,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         b_delta_budget: u128,
     ) -> V16Result<PermissionlessProgressOutcomeV16> {
         account.validate_with_market(&self.as_view())?;
-        self.settle_account_kf_effects_not_atomic(account)?;
+        self.settle_account_kf_effects_not_atomic(account, false)?;
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
@@ -13252,6 +13299,41 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(())
     }
 
+    fn unilateral_close_capacity(&self, asset_index: usize, stored_abs: u128) -> V16Result<u128> {
+        let asset = self.asset_state(asset_index)?;
+        Ok(V16Core::kernel_unilateral_close_capacity(
+            stored_abs,
+            asset.oi_eff_long_q,
+            asset.oi_eff_short_q,
+        ))
+    }
+
+    fn begin_side_reset_if_effective_oi_exhausted(
+        &mut self,
+        asset_index: usize,
+        side: SideV16,
+    ) -> V16Result<()> {
+        let asset = self.asset_state(asset_index)?;
+        let exhausted = match side {
+            SideV16::Long => {
+                asset.oi_eff_long_q == 0
+                    && asset.stored_pos_count_long != 0
+                    && asset.pending_obligation_count_long == 0
+                    && asset.mode_long != SideModeV16::ResetPending
+            }
+            SideV16::Short => {
+                asset.oi_eff_short_q == 0
+                    && asset.stored_pos_count_short != 0
+                    && asset.pending_obligation_count_short == 0
+                    && asset.mode_short != SideModeV16::ResetPending
+            }
+        };
+        if exhausted && !self.has_pending_domain_loss_barrier(asset_index, side)? {
+            self.begin_full_drain_reset_inner(asset_index, side)?;
+        }
+        Ok(())
+    }
+
     fn reduce_matching_open_interest_for_unilateral_close(
         &mut self,
         asset_index: usize,
@@ -13343,6 +13425,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         };
         let oi_eff_before = oi_eff_on_side(self)?;
         self.apply_position_delta(account, asset_index, delta)?;
+        self.begin_side_reset_if_effective_oi_exhausted(asset_index, leg.side)?;
         let oi_eff_after = oi_eff_on_side(self)?;
         let effective_close_q = oi_eff_before.saturating_sub(oi_eff_after);
         // A leg that removed NO effective OI while closing a non-zero raw amount is
@@ -13415,14 +13498,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             asset.raw_oracle_target_price,
             fee_bps,
         )?;
-        let close_q = close_request_q.min(leg.basis_pos_q.unsigned_abs());
-        let close_i128 = i128::try_from(close_q).map_err(|_| V16Error::ArithmeticOverflow)?;
-        let close_delta = match leg.side {
-            SideV16::Long => close_i128
-                .checked_neg()
-                .ok_or(V16Error::ArithmeticOverflow)?,
-            SideV16::Short => close_i128,
-        };
+        let close_budget = close_request_q.min(
+            self.unilateral_close_capacity(request.asset_index, leg.basis_pos_q.unsigned_abs())?,
+        );
+        if close_budget == 0 {
+            return Err(V16Error::NonProgress);
+        }
+        let (close_q, close_delta) =
+            V16Core::kernel_reduce_position_delta(leg.basis_pos_q, leg.side, close_budget)?;
         if self.position_delta_touches_pending_domain_loss_barrier(
             &account.as_view(),
             request.asset_index,
@@ -13551,17 +13634,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if !leg.active {
             return Err(V16Error::InvalidLeg);
         }
-        let reduce_q = request.reduce_q.min(leg.basis_pos_q.unsigned_abs());
+        let reduce_budget = request.reduce_q.min(
+            self.unilateral_close_capacity(request.asset_index, leg.basis_pos_q.unsigned_abs())?,
+        );
+        let (reduce_q, reduce_delta) =
+            V16Core::kernel_reduce_position_delta(leg.basis_pos_q, leg.side, reduce_budget)?;
         if reduce_q == 0 {
             return Err(V16Error::NonProgress);
         }
-        let reduce_i128 = i128::try_from(reduce_q).map_err(|_| V16Error::ArithmeticOverflow)?;
-        let reduce_delta = match leg.side {
-            SideV16::Long => reduce_i128
-                .checked_neg()
-                .ok_or(V16Error::ArithmeticOverflow)?,
-            SideV16::Short => reduce_i128,
-        };
         if self.position_delta_blocked_by_pending_domain_loss_barrier(
             &account.as_view(),
             request.asset_index,
@@ -15793,6 +15873,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     return Ok(());
                 }
                 let asset = self.asset_state(asset_index)?;
+                if Self::leg_has_exhausted_effective_oi(asset, leg) {
+                    self.begin_full_drain_reset_inner(asset_index, leg.side)?;
+                }
+                let asset = self.asset_state(asset_index)?;
                 let (k_target, f_target) = Self::kf_target_for_leg_from_asset(asset, leg)?;
                 if !Self::leg_kf_epoch_is_current(asset, leg)
                     || k_target != leg.k_snap
@@ -16112,6 +16196,52 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         ))
     }
 
+    fn leg_has_exhausted_effective_oi(asset: AssetStateV16, leg: PortfolioLegV16) -> bool {
+        let (effective_oi, stored_count, pending_count, mode) = match leg.side {
+            SideV16::Long => (
+                asset.oi_eff_long_q,
+                asset.stored_pos_count_long,
+                asset.pending_obligation_count_long,
+                asset.mode_long,
+            ),
+            SideV16::Short => (
+                asset.oi_eff_short_q,
+                asset.stored_pos_count_short,
+                asset.pending_obligation_count_short,
+                asset.mode_short,
+            ),
+        };
+        leg.active
+            && leg.basis_pos_q != 0
+            && effective_oi == 0
+            && stored_count != 0
+            && pending_count == 0
+            && mode != SideModeV16::ResetPending
+    }
+
+    #[cfg(kani)]
+    pub fn kani_kernel_unilateral_close_capacity(
+        stored_abs: u128,
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+    ) -> u128 {
+        V16Core::kernel_unilateral_close_capacity(stored_abs, oi_eff_long_q, oi_eff_short_q)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_kernel_reduce_position_delta(
+        pre_basis_signed: i128,
+        side: SideV16,
+        requested: u128,
+    ) -> V16Result<(u128, i128)> {
+        V16Core::kernel_reduce_position_delta(pre_basis_signed, side, requested)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_leg_has_exhausted_effective_oi(asset: AssetStateV16, leg: PortfolioLegV16) -> bool {
+        Self::leg_has_exhausted_effective_oi(asset, leg)
+    }
+
     pub fn forfeit_recovery_leg_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -16125,12 +16255,26 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         {
             return Err(V16Error::InvalidLeg);
         }
-        let leg = Self::active_leg_for_asset(&account.as_view(), asset_index)?;
+        let mut leg = Self::active_leg_for_asset(&account.as_view(), asset_index)?;
         if !leg.active {
             return Err(V16Error::InvalidLeg);
         }
         if !self.leg_is_dead_for_forfeit(asset_index, leg.side)? {
             return Err(V16Error::LockActive);
+        }
+        if Self::leg_has_exhausted_effective_oi(self.asset_state(asset_index)?, leg)
+            && !account
+                .header
+                .close_progress
+                .try_to_runtime()?
+                .has_pending_residual()
+            && !self.has_pending_domain_loss_barrier(asset_index, leg.side)?
+        {
+            // A matched Recovery close can consume the final effective OI while
+            // leaving an ADL-reduced account's larger stored basis behind. Move
+            // that terminal residue into the reset epoch before forfeit clears it.
+            self.begin_full_drain_reset_inner(asset_index, leg.side)?;
+            leg = Self::active_leg_for_asset(&account.as_view(), asset_index)?;
         }
 
         let asset = self.asset_state(asset_index)?;
