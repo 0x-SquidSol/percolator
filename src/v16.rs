@@ -10203,6 +10203,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             last_slot,
             self.header.current_slot.get(),
         )?;
+        // Carry the floored-away fractional accrual forward: when the rent quote
+        // floors to zero this interval, do NOT advance the fee cursor, so a later
+        // collection over a longer interval crosses >= 1 atom (no free lien). The
+        // lien_backing_num == 0 and last_slot == 0 cases were handled above, so a
+        // stuck cursor here only ever means real, still-accruing rent.
+        // (upstream f7ad3ee9)
+        if fee == 0 {
+            return Ok(0);
+        }
         account.header.source_domains[slot].source_lien_fee_last_slot =
             V16PodU64::new(self.header.current_slot.get());
         let mut bucket = self.backing_bucket_for_domain(domain)?;
