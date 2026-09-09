@@ -13080,3 +13080,34 @@ fn proof_v16_persisted_risk_gate_is_complete_for_all_lifecycles_and_side_modes()
         assert_eq!(result, Err(V16Error::LockActive));
     }
 }
+
+// upstream 63891280 "Prove the no-free-OI fee lower bound": a risk-increasing fill
+// with nonzero size, nonzero price, and nonzero fee_bps must charge a STRICTLY
+// POSITIVE fee per side. The pre-fix code derived the fee from trade_notional_floor,
+// which rounds sub-atom notional (size_q * exec_price < POS_SCALE) to 0, so a
+// nonzero fill paid zero fee while still TAKING open interest. Charging on CEIL
+// notional guarantees >= 1 atom per side. This is exactly the LOWER BOUND the
+// conservation/application fee proofs are blind to. Mutation-checked: swapping the
+// shim to trade_notional_floor makes this FAIL on the sub-atom counterexample.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_nonzero_trade_charges_positive_fee_per_side() {
+    let size_q: u128 = kani::any();
+    let exec_price: u64 = kani::any();
+    let fee_bps: u64 = kani::any();
+    kani::assume(size_q > 0 && size_q <= percolator::MAX_TRADE_SIZE_Q);
+    kani::assume(exec_price > 0 && exec_price <= percolator::MAX_ORACLE_PRICE);
+    kani::assume(fee_bps > 0 && fee_bps <= percolator::MAX_TRADING_FEE_BPS);
+    // Exercise the bug's regime: sub-atom notional that floored to zero.
+    kani::cover!(
+        (size_q.saturating_mul(exec_price as u128)) < percolator::POS_SCALE,
+        "sub-atom notional (the floored-to-zero regime) is reachable"
+    );
+    let fee =
+        percolator::v16::kani_trade_fee_atoms_per_side(size_q, exec_price, fee_bps).unwrap();
+    assert!(
+        fee >= 1,
+        "nonzero fill at nonzero price with nonzero fee must charge >= 1 atom per side (no free OI)"
+    );
+}
