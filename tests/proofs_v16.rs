@@ -13868,3 +13868,204 @@ fn proof_v16_full_drain_reset_then_prior_epoch_clear_is_total_and_exact() {
     );
     assert_eq!(cleared, expected_clear);
 }
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_foreign_expiry_lien_impairment_is_exact_relabel() {
+    let counter_face_atoms: u8 = kani::any();
+    let counter_effective: u8 = kani::any();
+    let insurance_face_atoms: u8 = kani::any();
+    let insurance_effective: u8 = kani::any();
+    let prior_impaired_face_atoms: u8 = kani::any();
+    let prior_impaired_effective: u8 = kani::any();
+    let live_fee: u8 = kani::any();
+    let impaired_fee: u8 = kani::any();
+    kani::assume(counter_face_atoms > 0 && counter_face_atoms <= 8);
+    kani::assume(counter_effective > 0 && counter_effective <= counter_face_atoms);
+    kani::assume(insurance_face_atoms <= 8);
+    kani::assume(insurance_effective <= insurance_face_atoms);
+    kani::assume(prior_impaired_face_atoms <= 8);
+    kani::assume(prior_impaired_effective <= prior_impaired_face_atoms);
+
+    let counter_face = (counter_face_atoms as u128) * BOUND_SCALE;
+    let insurance_face = (insurance_face_atoms as u128) * BOUND_SCALE;
+    let prior_impaired_face = (prior_impaired_face_atoms as u128) * BOUND_SCALE;
+    let counter_backing = (counter_effective as u128) * BOUND_SCALE;
+    let insurance_backing = (insurance_effective as u128) * BOUND_SCALE;
+    let live_effective = counter_effective as u128 + insurance_effective as u128;
+    let source = PortfolioSourceDomainV16Account {
+        domain: V16PodU32::new(3),
+        source_claim_market_id: V16PodU64::new(9),
+        source_claim_bound_num: V16PodU128::new(
+            counter_face + insurance_face + prior_impaired_face + BOUND_SCALE,
+        ),
+        source_claim_liened_num: V16PodU128::new(counter_face + insurance_face),
+        source_claim_counterparty_liened_num: V16PodU128::new(counter_face),
+        source_claim_insurance_liened_num: V16PodU128::new(insurance_face),
+        source_lien_effective_reserved: V16PodU128::new(live_effective),
+        source_lien_counterparty_backing_num: V16PodU128::new(counter_backing),
+        source_lien_insurance_backing_num: V16PodU128::new(insurance_backing),
+        source_lien_fee_last_slot: V16PodU64::new(7),
+        source_claim_impaired_num: V16PodU128::new(prior_impaired_face),
+        source_lien_impaired_effective_reserved: V16PodU128::new(prior_impaired_effective as u128),
+        source_lien_capital_at_risk_fee_revenue: V16PodU128::new(live_fee as u128),
+        source_lien_impaired_capital_at_risk_fee_revenue: V16PodU128::new(impaired_fee as u128),
+    };
+
+    let (after, impaired_effective) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_account_counterparty_lien_impairment(source)
+            .unwrap();
+
+    kani::cover!(
+        insurance_face_atoms > 0,
+        "foreign expiry preserves a mixed insurance-backed lien"
+    );
+    kani::cover!(
+        prior_impaired_face_atoms > 0,
+        "foreign expiry composes with prior impaired face"
+    );
+    kani::cover!(
+        live_fee > 0 && insurance_effective > 0,
+        "foreign expiry splits mixed-lien fee revenue"
+    );
+    assert_eq!(impaired_effective, counter_effective as u128);
+    assert_eq!(after.domain.get(), source.domain.get());
+    assert_eq!(
+        after.source_claim_market_id.get(),
+        source.source_claim_market_id.get()
+    );
+    assert_eq!(
+        after.source_claim_bound_num.get(),
+        source.source_claim_bound_num.get()
+    );
+    assert_eq!(after.source_claim_liened_num.get(), insurance_face);
+    assert_eq!(after.source_claim_counterparty_liened_num.get(), 0);
+    assert_eq!(
+        after.source_claim_insurance_liened_num.get(),
+        source.source_claim_insurance_liened_num.get()
+    );
+    assert_eq!(
+        after.source_claim_impaired_num.get(),
+        prior_impaired_face + counter_face
+    );
+    assert_eq!(
+        after.source_claim_liened_num.get() + after.source_claim_impaired_num.get(),
+        source.source_claim_liened_num.get() + source.source_claim_impaired_num.get()
+    );
+    assert_eq!(
+        after.source_lien_effective_reserved.get(),
+        insurance_effective as u128
+    );
+    assert_eq!(after.source_lien_counterparty_backing_num.get(), 0);
+    assert_eq!(
+        after.source_lien_insurance_backing_num.get(),
+        source.source_lien_insurance_backing_num.get()
+    );
+    assert_eq!(
+        after.source_lien_impaired_effective_reserved.get(),
+        prior_impaired_effective as u128 + counter_effective as u128
+    );
+    assert_eq!(
+        after.source_lien_effective_reserved.get()
+            + after.source_lien_impaired_effective_reserved.get(),
+        source.source_lien_effective_reserved.get()
+            + source.source_lien_impaired_effective_reserved.get()
+    );
+    assert_eq!(after.source_lien_fee_last_slot.get(), 0);
+    let expected_impaired_fee = (live_fee as u128) * (counter_effective as u128) / live_effective;
+    assert_eq!(
+        after.source_lien_capital_at_risk_fee_revenue.get(),
+        live_fee as u128 - expected_impaired_fee
+    );
+    assert_eq!(
+        after.source_lien_impaired_capital_at_risk_fee_revenue.get(),
+        impaired_fee as u128 + expected_impaired_fee
+    );
+    assert_eq!(
+        after.source_lien_capital_at_risk_fee_revenue.get()
+            + after.source_lien_impaired_capital_at_risk_fee_revenue.get(),
+        live_fee as u128 + impaired_fee as u128
+    );
+}
+
+// 1e0d952e: utilization rent stops at the backing bucket's own expiry slot. The
+// window here is last_slot..current_slot = 3 slots, but the bucket lapsed after
+// one, so exactly one slot of rent may be charged and the fee cursor may only
+// advance to the expiry slot. Before that fix the whole 3-slot window was
+// charged and the cursor jumped to the current slot.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_backing_utilization_rent_stops_at_bucket_expiry() {
+    let slack_raw: u8 = kani::any();
+    let earnings_raw: u8 = kani::any();
+    kani::assume(slack_raw <= 4);
+    kani::assume(earnings_raw <= 4);
+    let lien_atoms = 1u128;
+    let lien_num = lien_atoms * BOUND_SCALE;
+    let last_slot = 3u64;
+    let expiry_slot = 4u64;
+    let current_slot = 6u64;
+    let earnings_before = earnings_raw as u128;
+    // Only last_slot..expiry_slot may be billed, not last_slot..current_slot.
+    let expected_charged = lien_atoms * (expiry_slot - last_slot) as u128;
+    let capital = expected_charged + slack_raw as u128;
+    let (mut header, mut markets, mut account_header) = one_market_direct_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    header.config.backing_fee_base_rate_e9_per_slot =
+        V16PodU64::new(MAX_BACKING_FEE_RATE_E9_PER_SLOT);
+    header.config.backing_fee_slope_at_kink_e9_per_slot = V16PodU64::new(0);
+    header.config.backing_fee_slope_above_kink_e9_per_slot = V16PodU64::new(0);
+    header.current_slot = V16PodU64::new(current_slot);
+    header.slot_last = V16PodU64::new(current_slot);
+    header.vault = V16PodU128::new(capital + earnings_before + lien_atoms);
+    header.c_tot = V16PodU128::new(capital);
+    header.backing_provider_earnings_total = V16PodU128::new(earnings_before);
+    header.source_fresh_backing_total_num = V16PodU128::new(lien_num);
+    account_header.capital = V16PodU128::new(capital);
+    account_header.pnl = V16PodI128::new(0);
+    account_header.health_cert.valid = 1;
+    account_header.source_domains[0] = PortfolioSourceDomainV16Account {
+        domain: V16PodU32::new(0),
+        source_claim_market_id: V16PodU64::new(market_id),
+        source_lien_counterparty_backing_num: V16PodU128::new(lien_num),
+        source_lien_fee_last_slot: V16PodU64::new(last_slot),
+        ..PortfolioSourceDomainV16Account::default()
+    };
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            fresh_reserved_backing_num: lien_num,
+            valid_liened_backing_num: lien_num,
+            credit_rate_num: CREDIT_RATE_SCALE,
+            ..SourceCreditStateV16::EMPTY
+        });
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id,
+        valid_liened_backing_num: lien_num,
+        utilization_fee_earnings: earnings_before,
+        expiry_slot,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut {
+        header: &mut account_header,
+    };
+    let charged = market
+        .kani_collect_account_backing_utilization_fee_for_domain_not_atomic(&mut account, 0)
+        .unwrap();
+
+    kani::cover!(
+        slack_raw > 0 && earnings_raw > 0,
+        "expired-bucket rent cap covers a solvent account with prior provider earnings"
+    );
+    assert_eq!(charged, expected_charged);
+    assert_eq!(
+        account.header.source_domains[0]
+            .source_lien_fee_last_slot
+            .get(),
+        expiry_slot
+    );
+}
