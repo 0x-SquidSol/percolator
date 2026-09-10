@@ -811,6 +811,14 @@ or mode_s == ResetPending and epoch_snap_i + 1 == epoch_s
 
 `begin_full_drain_reset(side)` requires `OI_eff_side == 0` and then snapshots `K_side`/`F_side_num` to epoch-start fields, zeros live `K_side`/`F_side_num`, increments `epoch_side`, sets `A_side = ADL_ONE`, sets `stale_account_count_side = stored_pos_count_side`, clears phantom dust for that side, and enters `ResetPending`.
 
+When a side reset or leg clear combines two valid sub-atom social-loss carries,
+the sum is normalized modulo `SOCIAL_LOSS_DEN`. Crossing the denominator adds
+one to the side-local `explicit_unallocated_loss` audit counter; that counter
+saturates and never creates payout capacity. Remainder, dust, and explicit-loss
+audit fields remain durable while the asset has any live economic obligation.
+An otherwise empty asset may clear only those inert fields atomically with
+retirement so historical rounding cannot permanently block terminal progress.
+
 `finalize_side_reset(side)` requires `ResetPending`, zero OI, zero stale count, and zero stored position count, then sets mode to `Normal`.
 
 Before any OI-increasing operation rejects on `ResetPending`, it MUST call `maybe_finalize_ready_reset_sides_before_oi_increase`.
