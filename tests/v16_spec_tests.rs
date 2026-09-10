@@ -4601,3 +4601,146 @@ fn v16_under_margin_owner_can_transfer_risk_to_margin_healthy_counterparty() {
         .unwrap();
     new_holder.validate_with_market(&market.as_view()).unwrap();
 }
+
+// upstream 379fbfea "Normalize lapsed backing during asset retirement" (2026-08-20):
+// retirement is the terminal consumer for one asset, so it normalizes both of the
+// asset's source domains (expire a lapsed Fresh bucket, canonicalize an
+// economically empty Expired one) before testing whether the slot is empty. This
+// also covers a lapsed bucket that no portfolio references.
+#[test]
+fn v16_retire_normalizes_unreferenced_lapsed_backing() {
+    const BACKING: u128 = 7;
+    const EXPIRY_SLOT: u64 = 5;
+    const DOMAIN: usize = 2;
+
+    let (mut header, mut markets) = market_fixture(2, 100);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(DOMAIN, BACKING, EXPIRY_SLOT)
+            .unwrap();
+    }
+    let vault_before = header.vault.get();
+    let bucket_before = markets[1].engine.backing_long.try_to_runtime().unwrap();
+    assert_eq!(bucket_before.status, BackingBucketStatusV16::Fresh);
+    assert_eq!(
+        bucket_before.fresh_unliened_backing_num,
+        BACKING * BOUND_SCALE
+    );
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        assert_eq!(
+            market.retire_empty_asset_not_atomic(1, EXPIRY_SLOT - 1),
+            Err(V16Error::LockActive),
+            "fresh principal remains a retirement blocker"
+        );
+    }
+    assert_eq!(header.vault.get(), vault_before);
+    assert_eq!(
+        markets[1].engine.asset.try_to_runtime().unwrap().lifecycle,
+        AssetLifecycleV16::Active
+    );
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market
+        .retire_empty_asset_not_atomic(1, EXPIRY_SLOT)
+        .unwrap();
+    let bucket = market.markets[1]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+    let source = market.markets[1]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+    assert_eq!(bucket.status, BackingBucketStatusV16::Empty);
+    assert_eq!(bucket.expiry_slot, 0);
+    assert_eq!(bucket.fresh_unliened_backing_num, 0);
+    assert_eq!(source.fresh_reserved_backing_num, 0);
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(
+        market.markets[1]
+            .engine
+            .asset
+            .try_to_runtime()
+            .unwrap()
+            .lifecycle,
+        AssetLifecycleV16::Retired
+    );
+    market.validate_shape().unwrap();
+}
+
+// upstream a7577b0b "Credit backing released after payout snapshot" (2026-07-20):
+// once the terminal payout snapshot is captured, principal released by a backing
+// expiry must reach the resolved payout ledger (snapshot_residual and the legacy
+// payout_snapshot) and raise the common payout rate, otherwise the released
+// residual is stranded forever behind a frozen snapshot. Fork test (upstream ships
+// the kernel proof only).
+#[test]
+fn v16_post_snapshot_backing_expiry_credits_resolved_payout_ledger() {
+    const BACKING: u128 = 7;
+    const EXPIRY_SLOT: u64 = 5;
+    const CLAIM_ATOMS: u128 = 20;
+
+    let (mut header, mut markets) = market_fixture(1, 100);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(0, BACKING, EXPIRY_SLOT)
+            .unwrap();
+        market.resolve_market_not_atomic(EXPIRY_SLOT + 1).unwrap();
+    }
+    // Terminal snapshot captured before the lapsed bucket expired: the junior
+    // pool the snapshot saw excludes the still-reserved backing principal.
+    let residual_before = header.vault.get()
+        - header.c_tot.get()
+        - header.insurance.get()
+        - header.backing_provider_earnings_total.get()
+        - BACKING;
+    header.payout_snapshot_captured = 1;
+    header.payout_snapshot = V16PodU128::new(residual_before);
+    header.payout_snapshot_pnl_pos_tot = V16PodU128::new(CLAIM_ATOMS);
+    let claim_num = CLAIM_ATOMS * BOUND_SCALE;
+    header.resolved_payout_ledger =
+        ResolvedPayoutLedgerV16Account::from_runtime(&ResolvedPayoutLedgerV16 {
+            snapshot_residual: residual_before,
+            terminal_claim_exact_receipts_num: 0,
+            terminal_claim_bound_unreceipted_num: claim_num,
+            current_payout_rate_num: (residual_before * BOUND_SCALE).min(claim_num),
+            current_payout_rate_den: claim_num,
+            snapshot_slot: EXPIRY_SLOT + 1,
+            payout_halted: false,
+            finalized: false,
+        });
+    let vault_before = header.vault.get();
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market
+        .expire_source_backing_bucket_not_atomic(0, EXPIRY_SLOT + 1)
+        .unwrap();
+
+    let ledger = market
+        .header
+        .resolved_payout_ledger
+        .try_to_runtime()
+        .unwrap();
+    assert_eq!(
+        ledger.snapshot_residual,
+        residual_before + BACKING,
+        "released principal must be credited to the snapshot residual"
+    );
+    assert_eq!(
+        market.header.payout_snapshot.get(),
+        residual_before + BACKING
+    );
+    assert_eq!(
+        ledger.current_payout_rate_num,
+        ((residual_before + BACKING) * BOUND_SCALE).min(claim_num)
+    );
+    assert_eq!(ledger.current_payout_rate_den, claim_num);
+    assert_eq!(ledger.terminal_claim_bound_unreceipted_num, claim_num);
+    assert_eq!(market.header.vault.get(), vault_before);
+}

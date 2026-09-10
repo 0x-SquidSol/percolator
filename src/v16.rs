@@ -764,6 +764,68 @@ pub fn active_bitmap_count_ones(bitmap: V16ActiveBitmap) -> u32 {
 struct V16Core;
 
 impl V16Core {
+    /// Recompute the resolved payout rate from the ledger's current residual
+    /// and outstanding claim bound. This deliberately contains no wide
+    /// division: receipts apply the resulting fraction when they are paid.
+    /// (upstream a7577b0b)
+    pub(crate) fn kernel_recompute_resolved_payout_rate(
+        mut ledger: ResolvedPayoutLedgerV16,
+    ) -> V16Result<ResolvedPayoutLedgerV16> {
+        let total_bound_num = ledger
+            .terminal_claim_exact_receipts_num
+            .checked_add(ledger.terminal_claim_bound_unreceipted_num)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if total_bound_num == 0 {
+            ledger.current_payout_rate_num = 1;
+            ledger.current_payout_rate_den = 1;
+        } else {
+            ledger.current_payout_rate_num = ledger
+                .snapshot_residual
+                .checked_mul(BOUND_SCALE)
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .min(total_bound_num);
+            ledger.current_payout_rate_den = total_bound_num;
+        }
+        Ok(ledger)
+    }
+
+    /// Credit residual released after terminal snapshot capture into both
+    /// persisted snapshots and immediately raise the common payout rate.
+    /// (upstream a7577b0b)
+    pub(crate) fn kernel_credit_post_snapshot_residual(
+        mut ledger: ResolvedPayoutLedgerV16,
+        legacy_snapshot: u128,
+        released: u128,
+    ) -> V16Result<(ResolvedPayoutLedgerV16, u128)> {
+        ledger.snapshot_residual = ledger
+            .snapshot_residual
+            .checked_add(released)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let legacy_snapshot = legacy_snapshot
+            .checked_add(released)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        ledger = Self::kernel_recompute_resolved_payout_rate(ledger)?;
+        Ok((ledger, legacy_snapshot))
+    }
+
+    /// PRODUCTION KERNEL: canonicalize only an economically empty expired
+    /// bucket. Retirement must not erase consumed principal, impaired backing,
+    /// or provider earnings merely because the freshness period ended.
+    /// (upstream 379fbfea)
+    fn kernel_retirement_backing_normalization(bucket: BackingBucketV16) -> BackingBucketV16 {
+        if bucket.status == BackingBucketStatusV16::Expired
+            && bucket.fresh_unliened_backing_num == 0
+            && bucket.valid_liened_backing_num == 0
+            && bucket.consumed_liened_backing_num == 0
+            && bucket.impaired_liened_backing_num == 0
+            && bucket.utilization_fee_earnings == 0
+        {
+            BackingBucketV16::empty_for_market(bucket.market_id)
+        } else {
+            bucket
+        }
+    }
+
     /// PRODUCTION KERNEL: expire one lapsed Fresh counterparty-backing bucket.
     /// Unliened and valid-liened principal leave the source fresh reserve; the
     /// liened part becomes impaired on both the source and the bucket.
@@ -6672,6 +6734,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         domain: usize,
         now_slot: u64,
     ) -> V16Result<()> {
+        let snapshot_captured = decode_bool(self.header.payout_snapshot_captured)?;
+        let residual_before = if snapshot_captured {
+            self.residual()
+        } else {
+            0
+        };
         let (bucket, source) = V16Core::prepare_counterparty_backing_expiry_delta(
             self.backing_bucket_for_domain(domain)?,
             self.source_credit_for_domain(domain)?,
@@ -6679,7 +6747,31 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )?;
         self.set_backing_bucket_for_domain(domain, bucket)?;
         self.set_source_credit_for_domain(domain, source)?;
-        self.refresh_source_credit_domain_after_mutation(domain)
+        self.refresh_source_credit_domain_after_mutation(domain)?;
+        if snapshot_captured {
+            // upstream a7577b0b: principal released after the terminal snapshot
+            // was captured must reach the payout ledger, not strand behind it.
+            let released = self
+                .residual()
+                .checked_sub(residual_before)
+                .ok_or(V16Error::CounterUnderflow)?;
+            self.credit_post_snapshot_residual_not_atomic(released)?;
+        }
+        Ok(())
+    }
+
+    fn credit_post_snapshot_residual_not_atomic(&mut self, released: u128) -> V16Result<()> {
+        if released == 0 || !decode_bool(self.header.payout_snapshot_captured)? {
+            return Ok(());
+        }
+        let (ledger, legacy_snapshot) = V16Core::kernel_credit_post_snapshot_residual(
+            self.header.resolved_payout_ledger.try_to_runtime()?,
+            self.header.payout_snapshot.get(),
+            released,
+        )?;
+        self.header.payout_snapshot = V16PodU128::new(legacy_snapshot);
+        self.header.resolved_payout_ledger = ResolvedPayoutLedgerV16Account::from_runtime(&ledger);
+        Ok(())
     }
 
     /// First occupied source domain of the account whose backing bucket is
@@ -13399,6 +13491,20 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     #[cfg(kani)]
+    pub fn kani_kernel_credit_post_snapshot_residual(
+        ledger: ResolvedPayoutLedgerV16,
+        legacy_snapshot: u128,
+        released: u128,
+    ) -> V16Result<(ResolvedPayoutLedgerV16, u128)> {
+        V16Core::kernel_credit_post_snapshot_residual(ledger, legacy_snapshot, released)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_retirement_backing_normalization(bucket: BackingBucketV16) -> BackingBucketV16 {
+        V16Core::kernel_retirement_backing_normalization(bucket)
+    }
+
+    #[cfg(kani)]
     pub fn kani_prepare_counterparty_backing_expiry_delta(
         bucket: BackingBucketV16,
         source: SourceCreditStateV16,
@@ -14588,22 +14694,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     fn recompute_resolved_payout_rate(&mut self) -> V16Result<()> {
-        let mut ledger = self.header.resolved_payout_ledger.try_to_runtime()?;
-        let total_bound_num = ledger
-            .terminal_claim_exact_receipts_num
-            .checked_add(ledger.terminal_claim_bound_unreceipted_num)
-            .ok_or(V16Error::ArithmeticOverflow)?;
-        if total_bound_num == 0 {
-            ledger.current_payout_rate_num = 1;
-            ledger.current_payout_rate_den = 1;
-        } else {
-            ledger.current_payout_rate_num = ledger
-                .snapshot_residual
-                .checked_mul(BOUND_SCALE)
-                .ok_or(V16Error::ArithmeticOverflow)?
-                .min(total_bound_num);
-            ledger.current_payout_rate_den = total_bound_num;
-        }
+        let ledger = V16Core::kernel_recompute_resolved_payout_rate(
+            self.header.resolved_payout_ledger.try_to_runtime()?,
+        )?;
         self.header.resolved_payout_ledger = ResolvedPayoutLedgerV16Account::from_runtime(&ledger);
         Ok(())
     }
@@ -15728,6 +15821,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             AssetLifecycleV16::Active
             | AssetLifecycleV16::DrainOnly
             | AssetLifecycleV16::Recovery => {
+                self.expire_lapsed_source_backing_for_asset_not_atomic(asset_index, now_slot)?;
                 self.require_empty_asset_lifecycle_state(asset_index)?;
                 let (next_asset_set_epoch, next_risk_epoch) =
                     self.checked_asset_set_epoch_bump()?;
@@ -15739,11 +15833,37 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 self.validate_shape()
             }
             AssetLifecycleV16::Retired => {
+                self.expire_lapsed_source_backing_for_asset_not_atomic(asset_index, now_slot)?;
                 self.require_empty_asset_lifecycle_state(asset_index)?;
                 self.validate_shape()
             }
             _ => Err(V16Error::LockActive),
         }
+    }
+
+    /// Retirement is the terminal consumer for one asset, so it must normalize
+    /// both of that asset's source domains before testing whether the slot is
+    /// empty. This is constant work and also covers a lapsed bucket that no
+    /// portfolio references, which account-local crank discovery cannot
+    /// otherwise select. (upstream 379fbfea)
+    fn expire_lapsed_source_backing_for_asset_not_atomic(
+        &mut self,
+        asset_index: usize,
+        now_slot: u64,
+    ) -> V16Result<()> {
+        for side in [SideV16::Long, SideV16::Short] {
+            let domain = self.insurance_domain_index(asset_index, side)?;
+            let bucket = self.backing_bucket_for_domain(domain)?;
+            if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= now_slot {
+                self.expire_source_backing_bucket_not_atomic(domain, now_slot)?;
+            }
+            let bucket = self.backing_bucket_for_domain(domain)?;
+            let normalized = V16Core::kernel_retirement_backing_normalization(bucket);
+            if normalized != bucket {
+                self.set_backing_bucket_for_domain(domain, normalized)?;
+            }
+        }
+        Ok(())
     }
 
     /// Restarts an empty Recovery/Retired asset with a fresh market_id.

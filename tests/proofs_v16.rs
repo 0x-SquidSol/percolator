@@ -13336,3 +13336,175 @@ fn proof_v16_trade_margin_gate_is_skipped_only_for_strict_risk_reduction() {
         assert!(next.unsigned_abs() < current.unsigned_abs());
     }
 }
+
+// upstream a7577b0b: post-snapshot expiry credits the released principal to both
+// persisted snapshots and raises the common payout rate, touching nothing else.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_post_snapshot_backing_expiry_credits_junior_pool() {
+    let backing_atoms: u16 = kani::any();
+    let junior_atoms: u16 = kani::any();
+    let receipted_atoms: u16 = kani::any();
+    let unreceipted_atoms: u16 = kani::any();
+    let snapshot_slot: u64 = kani::any();
+    let payout_halted: bool = kani::any();
+    let finalized: bool = kani::any();
+    let backing = backing_atoms as u128;
+    let junior = junior_atoms as u128;
+    let receipted_num = (receipted_atoms as u128) * BOUND_SCALE;
+    let unreceipted_num = (unreceipted_atoms as u128) * BOUND_SCALE;
+    let claim_num = receipted_num + unreceipted_num;
+    kani::assume(claim_num > 0);
+    let before = ResolvedPayoutLedgerV16 {
+        snapshot_residual: junior,
+        terminal_claim_exact_receipts_num: receipted_num,
+        terminal_claim_bound_unreceipted_num: unreceipted_num,
+        current_payout_rate_num: (junior * BOUND_SCALE).min(claim_num),
+        current_payout_rate_den: claim_num,
+        snapshot_slot,
+        payout_halted,
+        finalized,
+    };
+    let (ledger, legacy_snapshot) =
+        MarketGroupV16ViewMut::<u64>::kani_kernel_credit_post_snapshot_residual(
+            before, junior, backing,
+        )
+        .unwrap();
+
+    kani::cover!(
+        junior * BOUND_SCALE < claim_num && (junior + backing) * BOUND_SCALE >= claim_num,
+        "expiry raises a haircut payout rate to full"
+    );
+    kani::cover!(
+        (junior + backing) * BOUND_SCALE < claim_num,
+        "expiry improves but does not eliminate a haircut"
+    );
+    kani::cover!(
+        backing > 0 && receipted_num > 0 && unreceipted_num > 0,
+        "expiry preserves a mixed terminal-claim partition"
+    );
+    kani::cover!(backing == 0, "zero release is an exact identity credit");
+    assert_eq!(legacy_snapshot, junior + backing);
+    assert_eq!(ledger.snapshot_residual, junior + backing);
+    assert_eq!(ledger.terminal_claim_exact_receipts_num, receipted_num);
+    assert_eq!(ledger.terminal_claim_bound_unreceipted_num, unreceipted_num);
+    assert_eq!(ledger.current_payout_rate_den, claim_num);
+    assert_eq!(
+        ledger.current_payout_rate_num,
+        ((junior + backing) * BOUND_SCALE).min(claim_num)
+    );
+    assert_eq!(ledger.snapshot_slot, before.snapshot_slot);
+    assert_eq!(ledger.payout_halted, before.payout_halted);
+    assert_eq!(ledger.finalized, before.finalized);
+}
+
+// upstream 379fbfea: retirement normalizes only an economically empty expired
+// bucket; impaired obligations survive.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_retire_normalizes_unreferenced_lapsed_backing() {
+    let fresh_num: u128 = kani::any();
+    let liened_num: u128 = kani::any();
+    let market_id: u64 = kani::any();
+    let expiry_slot: u64 = kani::any();
+    let late: bool = kani::any();
+    kani::assume(market_id != 0);
+    kani::assume(fresh_num.checked_add(liened_num).is_some());
+    let total_num = fresh_num + liened_num;
+    kani::assume(total_num > 0);
+    kani::assume(!late || expiry_slot < u64::MAX);
+    let now_slot = if late { expiry_slot + 1 } else { expiry_slot };
+    let bucket = BackingBucketV16 {
+        market_id,
+        fresh_unliened_backing_num: fresh_num,
+        valid_liened_backing_num: liened_num,
+        expiry_slot,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    };
+    let source = SourceCreditStateV16 {
+        fresh_reserved_backing_num: total_num,
+        valid_liened_backing_num: liened_num,
+        ..SourceCreditStateV16::EMPTY
+    };
+    let (expired, source_after) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_expiry_delta(
+            bucket, source, now_slot,
+        )
+        .unwrap();
+    let normalized = MarketGroupV16ViewMut::<u64>::kani_retirement_backing_normalization(expired);
+
+    kani::cover!(
+        !late && fresh_num > 0 && liened_num == 0,
+        "retirement normalizes nonzero backing at the exact expiry boundary"
+    );
+    kani::cover!(
+        late && fresh_num > 0 && liened_num == 0,
+        "retirement normalizes nonzero backing after expiry"
+    );
+    kani::cover!(
+        liened_num > 0,
+        "retirement leaves an impaired backing obligation nonempty"
+    );
+    assert_eq!(source_after.fresh_reserved_backing_num, 0);
+    assert_eq!(source_after.valid_liened_backing_num, 0);
+    assert_eq!(source_after.impaired_liened_backing_num, liened_num);
+    if liened_num == 0 {
+        assert_eq!(normalized, BackingBucketV16::empty_for_market(market_id));
+    } else {
+        assert_eq!(expired.status, BackingBucketStatusV16::Impaired);
+        assert_eq!(normalized, expired);
+        assert_eq!(normalized.impaired_liened_backing_num, liened_num);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_retirement_backing_normalization_never_erases_obligations() {
+    let market_id: u64 = kani::any();
+    let fresh_unliened_backing_num: u128 = kani::any();
+    let valid_liened_backing_num: u128 = kani::any();
+    let consumed_liened_backing_num: u128 = kani::any();
+    let impaired_liened_backing_num: u128 = kani::any();
+    let utilization_fee_earnings: u128 = kani::any();
+    let expiry_slot: u64 = kani::any();
+    let expired: bool = kani::any();
+    let bucket = BackingBucketV16 {
+        market_id,
+        fresh_unliened_backing_num,
+        valid_liened_backing_num,
+        consumed_liened_backing_num,
+        impaired_liened_backing_num,
+        utilization_fee_earnings,
+        expiry_slot,
+        status: if expired {
+            BackingBucketStatusV16::Expired
+        } else {
+            BackingBucketStatusV16::Fresh
+        },
+    };
+    let normalized = MarketGroupV16ViewMut::<u64>::kani_retirement_backing_normalization(bucket);
+    let has_obligation = fresh_unliened_backing_num != 0
+        || valid_liened_backing_num != 0
+        || consumed_liened_backing_num != 0
+        || impaired_liened_backing_num != 0
+        || utilization_fee_earnings != 0;
+
+    kani::cover!(
+        expired && !has_obligation,
+        "inert expired metadata canonicalizes"
+    );
+    kani::cover!(
+        expired && has_obligation,
+        "expired bucket with an obligation remains unchanged"
+    );
+    kani::cover!(!expired, "non-expired bucket remains unchanged");
+    if expired && !has_obligation {
+        assert_eq!(normalized, BackingBucketV16::empty_for_market(market_id));
+    } else {
+        assert_eq!(normalized, bucket);
+    }
+}
