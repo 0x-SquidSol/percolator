@@ -4067,6 +4067,25 @@ fn v16_source_backed_conversion_clears_sparse_source_domain_slot() {
     market.validate_shape().unwrap();
 }
 
+/// 3c01f42b drops the preflight's own `validate_with_market` because
+/// `ensure_favorable_action_allowed`, two statements below, already performs it.
+/// Nothing in the suite pinned that surviving validation, so this test does: a
+/// provenance-mismatched account must still be rejected with ProvenanceMismatch,
+/// not with whatever later gate happens to trip first.
+#[test]
+fn v16_released_pnl_conversion_still_rejects_a_foreign_account() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 81);
+    account_header.provenance_header.market_group_id = [9u8; 32];
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    assert_eq!(
+        market.convert_released_pnl_to_capital_not_atomic(&mut account),
+        Err(V16Error::ProvenanceMismatch)
+    );
+}
+
 #[test]
 fn v16_sparse_source_domains_reject_unoccupied_tagged_slot() {
     let (mut header, mut markets) = market_fixture(1, 1);

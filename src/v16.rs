@@ -9350,6 +9350,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         effective_credit: u128,
     ) -> V16Result<SourceCreditConsumptionV16> {
         account.validate_with_market(&self.as_view())?;
+        self.create_and_consume_validated_account_source_credit_for_effective_not_atomic(
+            account,
+            effective_credit,
+        )
+    }
+
+    fn create_and_consume_validated_account_source_credit_for_effective_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        effective_credit: u128,
+    ) -> V16Result<SourceCreditConsumptionV16> {
         if effective_credit == 0 {
             return Ok(SourceCreditConsumptionV16 {
                 face_burn: 0,
@@ -15360,7 +15371,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         &self,
         account: &PortfolioV16View<'_>,
     ) -> V16Result<()> {
-        account.validate_with_market(&self.as_view())?;
+        // The account is validated once, two statements below, by
+        // ensure_favorable_action_allowed; a second full scan here only costs
+        // compute on the max-source shape.
         if decode_market_mode(self.header.mode)? != MarketModeV16::Live
             || decode_bool(self.header.payout_snapshot_captured)?
         {
@@ -15378,12 +15391,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if released == 0 {
             return Ok(0);
         }
-        if Self::account_has_source_claims(&account.as_view())?
-            && self.account_has_active_source_claim_exposure(&account.as_view())?
-        {
+        let has_source_claims = Self::account_has_source_claims(&account.as_view())?;
+        if has_source_claims && self.account_has_active_source_claim_exposure(&account.as_view())? {
             return Err(V16Error::LockActive);
         }
-        let converted = if Self::account_has_source_claims(&account.as_view())? {
+        let converted = if has_source_claims {
             self.account_source_realizable_support(&account.as_view(), released)?
         } else if decode_market_mode(self.header.mode)? == MarketModeV16::Live {
             0
@@ -15394,8 +15406,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Err(V16Error::LockActive);
         }
         let vault_before = self.header.vault.get();
-        let consumption = if Self::account_has_source_claims(&account.as_view())? {
-            self.create_and_consume_account_source_credit_for_effective_not_atomic(
+        let consumption = if has_source_claims {
+            self.create_and_consume_validated_account_source_credit_for_effective_not_atomic(
                 account, converted,
             )?
         } else {
