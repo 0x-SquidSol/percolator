@@ -4287,3 +4287,103 @@ fn direct_live_lien_release_leaves_a_certificate_the_conversion_can_use() {
          certificate that release retired"
     );
 }
+
+// upstream f06a04a7 "Keep strict trade reductions open below initial margin"
+// (2026-08-06): an account whose fill is a STRICT reduction of its position on
+// the asset skips the final initial-margin gate (and the IM source-lien /
+// locked-lane no-positive-credit gates), so an under-margin owner can hand risk
+// to a margin-healthy counterparty. Fork adaptation: the taker flag is passed
+// explicitly (taker-only fee model, KL-ENGINE-TAKER-ONLY-FEE).
+#[test]
+fn v16_under_margin_owner_can_transfer_risk_to_margin_healthy_counterparty() {
+    const OPEN_Q: u128 = 100 * POS_SCALE;
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.config.maintenance_margin_bps = V16PodU64::new(1_000);
+    header.config.initial_margin_bps = V16PodU64::new(5_000);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(1_000);
+    header.config.max_accrual_dt_slots = V16PodU64::new(1);
+    let mut owner_header = account_fixture(1, 12);
+    let mut original_short_header = account_fixture(1, 13);
+    let mut new_holder_header = account_fixture(1, 14);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut owner = PortfolioV16ViewMut::new(&mut owner_header);
+    let mut original_short = PortfolioV16ViewMut::new(&mut original_short_header);
+    let mut new_holder = PortfolioV16ViewMut::new(&mut new_holder_header);
+    market.deposit_not_atomic(&mut owner, 5_001).unwrap();
+    market
+        .deposit_not_atomic(&mut original_short, 100_000)
+        .unwrap();
+    market.deposit_not_atomic(&mut new_holder, 10_000).unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut owner,
+            &mut original_short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(OPEN_Q),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+
+    market
+        .set_asset_raw_oracle_target_not_atomic(0, 90)
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(0, 2, 90, 0, true)
+        .unwrap();
+    market
+        .full_account_refresh_not_atomic(&mut original_short)
+        .unwrap();
+    let owner_cert = market.full_account_refresh_not_atomic(&mut owner).unwrap();
+    market
+        .full_account_refresh_not_atomic(&mut new_holder)
+        .unwrap();
+    assert!(
+        owner_cert.certified_equity >= 0
+            && (owner_cert.certified_equity as u128) < owner_cert.certified_initial_req,
+        "owner must be below IM before the transfer"
+    );
+
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut owner,
+            &mut new_holder,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: -signed_q(POS_SCALE),
+                exec_price: 90,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .expect("strict reducer may exit while the new risk holder passes IM");
+
+    assert_eq!(
+        owner.header.legs[0].try_to_runtime().unwrap().basis_pos_q,
+        signed_q(99 * POS_SCALE)
+    );
+    assert_eq!(
+        new_holder.header.legs[0]
+            .try_to_runtime()
+            .unwrap()
+            .basis_pos_q,
+        signed_q(POS_SCALE)
+    );
+    let new_holder_cert = new_holder.header.health_cert.try_to_runtime().unwrap();
+    assert!(
+        new_holder_cert.valid
+            && new_holder_cert.certified_equity >= 0
+            && (new_holder_cert.certified_equity as u128) >= new_holder_cert.certified_initial_req,
+        "new risk holder remains fully margined"
+    );
+    market.validate_shape().unwrap();
+    owner.validate_with_market(&market.as_view()).unwrap();
+    original_short
+        .validate_with_market(&market.as_view())
+        .unwrap();
+    new_holder.validate_with_market(&market.as_view()).unwrap();
+}
