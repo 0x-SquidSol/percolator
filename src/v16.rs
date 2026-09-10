@@ -1475,6 +1475,22 @@ impl V16Core {
         !already_cleared && prior_reset_obligation && !pending_close_residual
     }
 
+    /// PRODUCTION KERNEL: a liquidation error is successful public progress only
+    /// when the same call committed the matching Recovery state. Every other
+    /// error, including an incomplete Recovery marker, remains unchanged.
+    fn kernel_commit_declared_liquidation_recovery(
+        error: V16Error,
+        mode: MarketModeV16,
+        reason: Option<PermissionlessRecoveryReasonV16>,
+    ) -> V16Result<PermissionlessProgressOutcomeV16> {
+        match (error, mode, reason) {
+            (V16Error::RecoveryRequired, MarketModeV16::Recovery, Some(reason)) => {
+                Ok(PermissionlessProgressOutcomeV16::RecoveryDeclared(reason))
+            }
+            _ => Err(error),
+        }
+    }
+
     pub(crate) fn select_auto_crank_plan(
         summary: ActionableSummaryV16,
         b_stale_slot: usize,
@@ -2453,6 +2469,15 @@ pub fn kani_should_clear_prior_reset_obligation(
         prior_reset_obligation,
         pending_close_residual,
     )
+}
+
+#[cfg(kani)]
+pub fn kani_commit_declared_liquidation_recovery(
+    error: V16Error,
+    mode: MarketModeV16,
+    reason: Option<PermissionlessRecoveryReasonV16>,
+) -> V16Result<PermissionlessProgressOutcomeV16> {
+    V16Core::kernel_commit_declared_liquidation_recovery(error, mode, reason)
 }
 
 #[cfg(kani)]
@@ -12584,7 +12609,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             PermissionlessCrankActionV16::Liquidate(_) => {
                 if let PermissionlessCrankActionV16::Liquidate(liq) = request.action {
                     let liquidated_asset_index = liq.asset_index;
-                    self.liquidate_account_not_atomic(account, liq)?;
+                    // A liquidation whose only bounded terminal is Recovery declares
+                    // it and then returns RecoveryRequired. Propagating that error
+                    // would roll the declaration back on SVM, so the account never
+                    // moves. Convert it to progress -- but ONLY when this same call
+                    // left a complete Recovery marker behind.
+                    if let Err(error) = self.liquidate_account_not_atomic(account, liq) {
+                        let mode = decode_market_mode(self.header.mode)?;
+                        let reason = self.header.recovery_reason.try_to_runtime()?;
+                        return V16Core::kernel_commit_declared_liquidation_recovery(
+                            error, mode, reason,
+                        );
+                    }
                     liquidated_asset_index == request.asset_index
                 } else {
                     unreachable!()

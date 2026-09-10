@@ -5952,6 +5952,131 @@ fn v16_auto_crank_liquidates_current_account_without_observation() {
     account.validate_with_market(&market.as_view()).unwrap();
 }
 
+// A cross-margin bankruptcy whose uncovered loss cannot be booked in one bounded
+// step has exactly one terminal: Recovery. The liquidation discovers that itself,
+// declares Recovery and returns RecoveryRequired -- and if the public crank
+// propagates that error, SVM rolls the declaration back and the account never
+// moves. The crank must report the COMMITTED declaration as progress, and the
+// next call must then finalize Recovery into Resolved so terminal close is
+// reachable. Value must not move at either step.
+#[test]
+fn v16_auto_crank_commits_recovery_for_uncovered_cross_margin_liquidation() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut account_header = account_fixture(2, 15);
+    header.current_slot = V16PodU64::new(10);
+    header.slot_last = V16PodU64::new(10);
+    header.vault = V16PodU128::new(50);
+    header.insurance = V16PodU128::new(50);
+    header.negative_pnl_account_count = V16PodU64::new(1);
+
+    for (asset_index, market_slot) in markets.iter_mut().enumerate() {
+        let mut asset = market_slot.engine.asset.try_to_runtime().unwrap();
+        asset.slot_last = 10;
+        asset.oi_eff_long_q = 2 * POS_SCALE;
+        asset.oi_eff_short_q = 2 * POS_SCALE;
+        asset.loss_weight_sum_long = 2 * POS_SCALE;
+        asset.loss_weight_sum_short = 2 * POS_SCALE;
+        asset.stored_pos_count_long = 2;
+        asset.stored_pos_count_short = 2;
+        market_slot.engine.asset = AssetStateV16Account::from_runtime(&asset);
+        account_header.legs[asset_index] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+            active: true,
+            asset_index: asset_index as u32,
+            market_id: asset.market_id,
+            side: SideV16::Long,
+            basis_pos_q: POS_SCALE as i128,
+            a_basis: ADL_ONE,
+            k_snap: asset.k_long,
+            f_snap: asset.f_long_num,
+            kf_epoch_snap: 0,
+            epoch_snap: asset.epoch_long,
+            loss_weight: POS_SCALE,
+            b_snap: asset.b_long_num,
+            b_rem: 0,
+            b_epoch_snap: asset.epoch_long,
+            b_stale: false,
+            stale: false,
+        });
+    }
+    header.resolved_payout_blocker_count = V16PodU64::new(8);
+    account_header.active_bitmap[0] = V16PodU64::new(0b11);
+    account_header.pnl = V16PodI128::new(-5);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market
+        .full_account_refresh_not_atomic(&mut account)
+        .expect("setup must produce a current cross-margin liquidation cert");
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    // The classifier does NOT pre-scan for this: the liquidation itself is what
+    // discovers the terminal, which is the whole point of doing it this way.
+    assert!(summary.liquidatable && !summary.recovery_eligible);
+
+    let bitmap_before = account.header.active_bitmap;
+    let pnl_before = account.header.pnl;
+    let capital_before = account.header.capital;
+    let vault_before = market.header.vault;
+    let c_tot_before = market.header.c_tot;
+    let insurance_before = market.header.insurance;
+    let result = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: 10,
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("recovery-required liquidation must be successful crank progress");
+
+    assert_eq!(
+        result.selected,
+        AutoCrankPlanV16::Liquidate { asset_index: 0 }
+    );
+    assert_eq!(
+        result.outcome,
+        AutoCrankOutcomeV16::Progressed(PermissionlessProgressOutcomeV16::RecoveryDeclared(
+            PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+        ))
+    );
+    assert_eq!(market.header.mode, 2, "market must commit Recovery mode");
+    assert_eq!(account.header.active_bitmap, bitmap_before);
+    assert_eq!(account.header.pnl, pnl_before);
+    assert_eq!(account.header.capital, capital_before);
+    assert_eq!(market.header.vault, vault_before);
+    assert_eq!(market.header.c_tot, c_tot_before);
+    assert_eq!(market.header.insurance, insurance_before);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+
+    let recovery_reason_before = market.header.recovery_reason;
+    let finalized = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: 10,
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("the next public crank must finalize Recovery into Resolved");
+    assert_eq!(finalized.selected, AutoCrankPlanV16::FinalizeRecovery);
+    assert_eq!(finalized.outcome, AutoCrankOutcomeV16::RecoveryResolved);
+    assert_eq!(
+        market.header.mode, 1,
+        "terminal close must become reachable"
+    );
+    assert_eq!(market.header.recovery_reason, recovery_reason_before);
+    assert_eq!(account.header.active_bitmap, bitmap_before);
+    assert_eq!(account.header.pnl, pnl_before);
+    assert_eq!(account.header.capital, capital_before);
+    assert_eq!(market.header.vault, vault_before);
+    assert_eq!(market.header.c_tot, c_tot_before);
+    assert_eq!(market.header.insurance, insurance_before);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
 // A market in Recovery is a DEAD END for the single public crank unless the
 // engine offers the Recovery-to-Resolved step itself: permissionless_crank_not_atomic
 // rejects every non-Recover action outside Live, so terminal account close stays
