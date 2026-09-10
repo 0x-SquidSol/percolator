@@ -5677,11 +5677,15 @@ fn v16_resolved_foreign_expiry_impairs_account_lien_before_release() {
     let mut target_peer_header = account_fixture(1, 45);
     let mut expiry_trigger_header = account_fixture(1, 46);
     let mut trigger_peer_header = account_fixture(1, 47);
+    let mut sibling_target_header = account_fixture(1, 48);
+    let mut sibling_peer_header = account_fixture(1, 49);
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
     let mut target = PortfolioV16ViewMut::new(&mut target_header);
     let mut target_peer = PortfolioV16ViewMut::new(&mut target_peer_header);
     let mut expiry_trigger = PortfolioV16ViewMut::new(&mut expiry_trigger_header);
     let mut trigger_peer = PortfolioV16ViewMut::new(&mut trigger_peer_header);
+    let mut sibling_target = PortfolioV16ViewMut::new(&mut sibling_target_header);
+    let mut sibling_peer = PortfolioV16ViewMut::new(&mut sibling_peer_header);
 
     market
         .deposit_fresh_counterparty_backing_not_atomic(1, 100_000, 3)
@@ -5696,9 +5700,16 @@ fn v16_resolved_foreign_expiry_impairs_account_lien_before_release() {
     market
         .deposit_not_atomic(&mut trigger_peer, 1_000_000)
         .unwrap();
+    market
+        .deposit_not_atomic(&mut sibling_target, 52_501)
+        .unwrap();
+    market
+        .deposit_not_atomic(&mut sibling_peer, 1_000_000)
+        .unwrap();
     for (long, short) in [
         (&mut target, &mut target_peer),
         (&mut expiry_trigger, &mut trigger_peer),
+        (&mut sibling_target, &mut sibling_peer),
     ] {
         market
             .execute_trade_with_fee_loss_stale_scoped_not_atomic(
@@ -5724,27 +5735,41 @@ fn v16_resolved_foreign_expiry_impairs_account_lien_before_release() {
     for account in [
         &mut target_peer,
         &mut trigger_peer,
+        &mut sibling_peer,
         &mut target,
         &mut expiry_trigger,
+        &mut sibling_target,
     ] {
         market.full_account_refresh_not_atomic(account).unwrap();
     }
-    market
-        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
-            &mut target,
-            &mut target_peer,
-            TradeRequestV16 {
-                asset_index: 0,
-                size_q: signed_q(INCREASE_Q),
-                exec_price: 105,
-                fee_bps: 0,
-            },
-            true,
-        )
-        .unwrap();
+    for (long, short) in [
+        (&mut target, &mut target_peer),
+        (&mut sibling_target, &mut sibling_peer),
+    ] {
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                long,
+                short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(INCREASE_Q),
+                    exec_price: 105,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+    }
     let lien_before = target.header.source_domains[0];
+    let sibling_lien_before = sibling_target.header.source_domains[0];
     assert!(lien_before.source_claim_counterparty_liened_num.get() > 0);
     assert!(lien_before.source_lien_counterparty_backing_num.get() > 0);
+    assert!(
+        sibling_lien_before
+            .source_lien_counterparty_backing_num
+            .get()
+            > 0
+    );
     assert_eq!(lien_before.source_claim_impaired_num.get(), 0);
     assert!(
         expiry_trigger.header.source_domains[0]
@@ -5801,17 +5826,81 @@ fn v16_resolved_foreign_expiry_impairs_account_lien_before_release() {
     );
     assert_eq!(
         impaired.source_lien_impaired_effective_reserved.get(),
-        lien_before.source_lien_effective_reserved.get()
+        0,
+        "expired provider principal must not be reclassified as impaired insurance"
     );
+    let bucket_after_target_relabel = market.markets[0]
+        .engine
+        .backing_short
+        .try_to_runtime()
+        .unwrap();
     assert_eq!(
-        market.markets[0]
-            .engine
-            .backing_short
-            .try_to_runtime()
-            .unwrap(),
-        bucket_before,
-        "account-local relabel must not mutate the already-impaired aggregate bucket"
+        bucket_after_target_relabel.impaired_liened_backing_num,
+        bucket_before.impaired_liened_backing_num
+            - lien_before.source_lien_counterparty_backing_num.get(),
+        "the target must retire exactly its own expired provider-lien label"
     );
+    assert!(
+        bucket_after_target_relabel.impaired_liened_backing_num
+            >= sibling_lien_before
+                .source_lien_counterparty_backing_num
+                .get(),
+        "the first relabel must preserve its sibling's provider-lien label"
+    );
+
+    let mut all_closed = false;
+    let mut last_outcomes = Vec::new();
+    for _ in 0..16 {
+        last_outcomes.clear();
+        for account in [
+            &mut target_peer,
+            &mut trigger_peer,
+            &mut sibling_peer,
+            &mut expiry_trigger,
+            &mut target,
+            &mut sibling_target,
+        ] {
+            last_outcomes.push(
+                market
+                    .close_resolved_account_not_atomic(account, 0)
+                    .expect("foreign-expired source claims must retain a terminal continuation"),
+            );
+        }
+        all_closed = [
+            &target_peer,
+            &trigger_peer,
+            &sibling_peer,
+            &expiry_trigger,
+            &target,
+            &sibling_target,
+        ]
+        .iter()
+        .all(|account| {
+            account.header.capital.get() == 0
+                && account.header.pnl.get() == 0
+                && active_bitmap_is_empty(account.header.active_bitmap.map(V16PodU64::get))
+        });
+        if all_closed {
+            break;
+        }
+    }
+    assert!(
+        all_closed,
+        "foreign-expired source claims did not terminate: last={last_outcomes:?}"
+    );
+    let bucket_after = market.markets[0]
+        .engine
+        .backing_short
+        .try_to_runtime()
+        .unwrap();
+    let source_after = market.markets[0]
+        .engine
+        .source_credit_short
+        .try_to_runtime()
+        .unwrap();
+    assert_eq!(bucket_after.status, BackingBucketStatusV16::Expired);
+    assert_eq!(bucket_after.impaired_liened_backing_num, 0);
+    assert_eq!(source_after.impaired_liened_backing_num, 0);
     market.validate_shape().unwrap();
     target.validate_with_market(&market.as_view()).unwrap();
 }
