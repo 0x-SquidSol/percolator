@@ -17876,7 +17876,7 @@ pub fn kani_position_change_requires_unit_adl(current: i128, new: i128) -> bool 
     V16Core::kernel_position_route_requires_unit_adl(route, current, new)
 }
 
-#[cfg(any(kani, feature = "fuzz"))]
+#[cfg(kani)]
 pub fn kani_source_lien_fee_after_backing_release(
     fee_revenue: u128,
     backing_before: u128,
