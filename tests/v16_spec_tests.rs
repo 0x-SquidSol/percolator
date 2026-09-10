@@ -1,6 +1,7 @@
 use percolator::active_bitmap_is_empty;
 use percolator::{
     v16_domain_count_for_market_slots, AssetLifecycleV16, AssetStateV16Account,
+    AutoCrankObservationV16, AutoCrankOutcomeV16, AutoCrankPlanV16, AutoCrankWorkV16,
     BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, CloseProgressLedgerV16,
     CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HealthCertV16, HealthCertV16Account,
     LiquidationRequestV16, Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut,
@@ -5682,4 +5683,471 @@ fn v16_favorable_action_rejects_a_certificate_stale_on_the_risk_epoch_alone() {
         market.convert_released_pnl_to_capital_not_atomic(&mut account),
         Err(V16Error::Stale)
     );
+}
+
+#[test]
+fn v16_auto_crank_classifies_fresh_account_stale_then_refreshes_to_clean() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 21);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
+        market.deposit_not_atomic(&mut account, 1_000).unwrap();
+    }
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    // A fresh (uncertified) account in a Live market is classified stale ONLY.
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(summary.stale, "fresh uncertified account must be stale");
+    assert!(
+        !summary.b_stale
+            && !summary.pending_close
+            && !summary.expired_close
+            && !summary.liquidatable
+            && !summary.recovery_eligible
+            && !summary.resolved_winner,
+        "no other actionable class on a fresh empty account"
+    );
+
+    let obs = [AutoCrankObservationV16 {
+        asset_index: 0,
+        effective_price: 100,
+        funding_rate_e9: 0,
+    }];
+    let work = AutoCrankWorkV16 {
+        now_slot: 5,
+        observations: &obs,
+        liquidation_max_close_q: 0,
+        resolved_close_fee_rate_per_slot: 0,
+    };
+
+    // The engine selects RefreshAccount (engine-chosen asset) and dispatches it;
+    // the account becomes current (real liveness progress, no caller-chosen action).
+    let r = market
+        .permissionless_auto_crank_not_atomic(&mut account, work)
+        .unwrap();
+    assert!(matches!(
+        r.selected,
+        AutoCrankPlanV16::RefreshAccount { .. }
+    ));
+    assert_eq!(
+        r.outcome,
+        AutoCrankOutcomeV16::Progressed(PermissionlessProgressOutcomeV16::AccountCurrent)
+    );
+
+    // Now certified & clean -> not actionable -> NoAction (terminates).
+    let summary2 = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        !summary2.is_actionable(),
+        "a refreshed, clean account is not actionable"
+    );
+    let r2 = market
+        .permissionless_auto_crank_not_atomic(&mut account, work)
+        .unwrap();
+    assert_eq!(r2.selected, AutoCrankPlanV16::NoAction);
+    assert_eq!(r2.outcome, AutoCrankOutcomeV16::NoAction);
+
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_auto_crank_drives_stale_underwater_account_to_derisked_fixed_point() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut account_header = account_fixture(2, 13);
+    header.current_slot = V16PodU64::new(10);
+    header.slot_last = V16PodU64::new(9);
+    header.loss_stale_active = 1;
+    header.vault = V16PodU128::new(50);
+    header.insurance = V16PodU128::new(50);
+    header.negative_pnl_account_count = V16PodU64::new(1);
+
+    let mut asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset0.slot_last = 10;
+    asset0.oi_eff_long_q = 2 * POS_SCALE;
+    asset0.oi_eff_short_q = 2 * POS_SCALE;
+    asset0.loss_weight_sum_long = 2 * POS_SCALE;
+    asset0.loss_weight_sum_short = 2 * POS_SCALE;
+    asset0.stored_pos_count_long = 2;
+    asset0.stored_pos_count_short = 2;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+    let mut asset1 = markets[1].engine.asset.try_to_runtime().unwrap();
+    asset1.slot_last = 9;
+    asset1.oi_eff_long_q = POS_SCALE;
+    asset1.oi_eff_short_q = POS_SCALE;
+    asset1.loss_weight_sum_long = POS_SCALE;
+    asset1.loss_weight_sum_short = POS_SCALE;
+    asset1.stored_pos_count_long = 1;
+    asset1.stored_pos_count_short = 1;
+    markets[1].engine.asset = AssetStateV16Account::from_runtime(&asset1);
+    header.resolved_payout_blocker_count = V16PodU64::new(6);
+
+    account_header.pnl = V16PodI128::new(-5);
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset0.market_id,
+        side: SideV16::Long,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap: asset0.k_long,
+        f_snap: asset0.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset0.epoch_long,
+        loss_weight: POS_SCALE,
+        b_snap: asset0.b_long_num,
+        b_rem: 0,
+        b_epoch_snap: asset0.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    let obs = [AutoCrankObservationV16 {
+        asset_index: 0,
+        effective_price: 100,
+        funding_rate_e9: 0,
+    }];
+    let work = AutoCrankWorkV16 {
+        now_slot: 10,
+        observations: &obs,
+        liquidation_max_close_q: POS_SCALE,
+        resolved_close_fee_rate_per_slot: 0,
+    };
+
+    // Drive the engine auto-crank to a fixed point. It MUST converge (no-DoS)
+    // within a bounded number of steps, self-selecting the asset each step.
+    let mut plans = Vec::new();
+    let mut saw_refresh = false;
+    let mut saw_liquidate = false;
+    let mut steps = 0;
+    loop {
+        let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+        let r = match market.permissionless_auto_crank_not_atomic(&mut account, work) {
+            Ok(r) => r,
+            Err(e) => panic!(
+                "step {steps} dispatch err {e:?}; summary={summary:?}; plans={plans:?}; bitmap={}",
+                account.header.active_bitmap[0].get()
+            ),
+        };
+        match r.selected {
+            AutoCrankPlanV16::NoAction => break,
+            AutoCrankPlanV16::RefreshAccount { .. } => saw_refresh = true,
+            AutoCrankPlanV16::Liquidate { .. } => saw_liquidate = true,
+            _ => {}
+        }
+        plans.push(r.selected);
+        steps += 1;
+        assert!(
+            steps < 12,
+            "engine auto-crank must converge (no-DoS); selected so far: {:?}",
+            plans
+        );
+    }
+
+    // The engine escalated: it refreshed the stale account, then liquidated
+    // the underwater position — and reached a non-actionable fixed point.
+    assert!(
+        saw_refresh,
+        "must refresh the uncertified account: {:?}",
+        plans
+    );
+    assert!(
+        saw_liquidate,
+        "must liquidate the underwater position: {:?}",
+        plans
+    );
+    assert_eq!(
+        account.header.active_bitmap[0].get(),
+        0,
+        "position must be liquidated at the fixed point"
+    );
+
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_auto_crank_liquidates_current_account_without_observation() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 14);
+    header.current_slot = V16PodU64::new(10);
+    header.slot_last = V16PodU64::new(10);
+    header.vault = V16PodU128::new(50);
+    header.insurance = V16PodU128::new(50);
+    header.negative_pnl_account_count = V16PodU64::new(1);
+
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.slot_last = 10;
+    asset.oi_eff_long_q = 2 * POS_SCALE;
+    asset.oi_eff_short_q = 2 * POS_SCALE;
+    asset.loss_weight_sum_long = 2 * POS_SCALE;
+    asset.loss_weight_sum_short = 2 * POS_SCALE;
+    asset.stored_pos_count_long = 2;
+    asset.stored_pos_count_short = 2;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    header.resolved_payout_blocker_count = V16PodU64::new(4);
+
+    account_header.pnl = V16PodI128::new(-5);
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Long,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap: asset.k_long,
+        f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_long,
+        loss_weight: POS_SCALE,
+        b_snap: asset.b_long_num,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market
+        .full_account_refresh_not_atomic(&mut account)
+        .expect("setup must produce a current liquidation cert");
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        summary.liquidatable && !summary.stale && !summary.b_stale,
+        "setup must be current and liquidatable: {summary:?}"
+    );
+
+    let work = AutoCrankWorkV16 {
+        now_slot: 10,
+        observations: &[],
+        liquidation_max_close_q: POS_SCALE,
+        resolved_close_fee_rate_per_slot: 0,
+    };
+    let result = market
+        .permissionless_auto_crank_not_atomic(&mut account, work)
+        .expect("current liquidation must not require a fresh observation");
+
+    assert_eq!(
+        result.selected,
+        AutoCrankPlanV16::Liquidate { asset_index: 0 }
+    );
+    assert!(matches!(
+        result.outcome,
+        AutoCrankOutcomeV16::Progressed(PermissionlessProgressOutcomeV16::AccountCurrent)
+    ));
+    assert_eq!(
+        account.header.active_bitmap[0].get(),
+        0,
+        "liquidation must close the selected position"
+    );
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_auto_crank_declares_recovery_for_expired_live_close() {
+    use percolator::{CloseProgressLedgerV16, CloseProgressLedgerV16Account};
+
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 41);
+    header.current_slot = V16PodU64::new(10);
+
+    // An active, outstanding (residual>0), EXPIRED close ledger on asset 0.
+    let market_id = markets[0].engine.asset.try_to_runtime().unwrap().market_id;
+    account_header.close_progress =
+        CloseProgressLedgerV16Account::from_runtime(&CloseProgressLedgerV16 {
+            active: true,
+            finalized: false,
+            canceled: false,
+            close_id: 1,
+            asset_index: 0,
+            market_id,
+            domain_side: SideV16::Short,
+            gross_loss_at_close_start: 10,
+            drift_reference_slot: 1,
+            max_close_slot: 2, // < current_slot 10 => expired
+            support_consumed: 0,
+            junior_face_burned: 0,
+            insurance_spent: 0,
+            b_loss_booked: 0,
+            explicit_loss_assigned: 0,
+            quantity_adl_applied_q: 0,
+            drift_consumed: 0,
+            residual_remaining: 10,
+        });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        summary.expired_close,
+        "outstanding expired close ledger must classify expired_close: {summary:?}"
+    );
+    assert!(!summary.recovery_eligible && !summary.resolved_winner);
+
+    // DeclareRecovery needs no observation (empty work).
+    let work = AutoCrankWorkV16 {
+        now_slot: 10,
+        observations: &[],
+        liquidation_max_close_q: 0,
+        resolved_close_fee_rate_per_slot: 0,
+    };
+    let vault_before = market.header.vault;
+    let r = market
+        .permissionless_auto_crank_not_atomic(&mut account, work)
+        .unwrap();
+    assert_eq!(
+        r.selected,
+        AutoCrankPlanV16::DeclareRecovery {
+            reason: PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
+        }
+    );
+    assert_eq!(
+        r.outcome,
+        AutoCrankOutcomeV16::Progressed(PermissionlessProgressOutcomeV16::RecoveryDeclared(
+            PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
+        ))
+    );
+    // recovery declaration moves no value.
+    assert_eq!(market.header.vault, vault_before);
+    market.validate_shape().unwrap();
+}
+
+#[test]
+fn v16_auto_crank_classifies_payout_ready_resolved_winner_without_snapshot() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 42);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market.resolve_market_not_atomic(1).unwrap();
+    }
+    header.vault = V16PodU128::new(50);
+    // Positive PnL, all blocking counts clear (resolved_positive_payout_ready);
+    // payout_snapshot_captured stays 0 — the property under test.
+    account_header.pnl = V16PodI128::new(5);
+
+    let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let account = PortfolioV16ViewMut::new(&mut account_header);
+    assert_eq!(
+        market.header.payout_snapshot_captured, 0,
+        "snapshot intentionally NOT captured"
+    );
+
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        summary.resolved_winner,
+        "a payout-ready resolved winner must be resolved_winner even before the \
+         snapshot is captured (no snapshot gate -> no first-winner deadlock): {summary:?}"
+    );
+    assert!(!summary.recovery_eligible && !summary.stale && !summary.liquidatable);
+}
+
+#[test]
+fn v16_auto_crank_settles_b_stale_leg() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 51);
+    header.current_slot = V16PodU64::new(10);
+    header.slot_last = V16PodU64::new(10);
+    let mut asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset0.slot_last = 10;
+    asset0.oi_eff_long_q = POS_SCALE;
+    asset0.oi_eff_short_q = POS_SCALE;
+    asset0.loss_weight_sum_long = POS_SCALE;
+    asset0.loss_weight_sum_short = POS_SCALE;
+    asset0.stored_pos_count_long = 1;
+    asset0.stored_pos_count_short = 1;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+
+    // Active leg flagged b-stale, with b_snap already at the current target so the
+    // settle resolves to a clean delta_b=0 clear (progress: clears the b-stale flag).
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset0.market_id,
+        side: SideV16::Long,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap: asset0.k_long,
+        f_snap: asset0.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset0.epoch_long,
+        loss_weight: POS_SCALE,
+        b_snap: asset0.b_long_num,
+        b_rem: 0,
+        b_epoch_snap: asset0.epoch_long,
+        b_stale: true,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        summary.b_stale,
+        "b-stale leg must classify b_stale: {summary:?}"
+    );
+
+    let work = AutoCrankWorkV16 {
+        now_slot: 10,
+        observations: &[],
+        liquidation_max_close_q: 0,
+        resolved_close_fee_rate_per_slot: 0,
+    };
+    let r = market
+        .permissionless_auto_crank_not_atomic(&mut account, work)
+        .unwrap();
+    // b_stale has priority over the stale-cert refresh, so SettleBChunk is selected
+    // with the engine-chosen asset (the b-stale leg's asset) and dispatched to the
+    // real B-chunk settle entrypoint (AccountBChunk outcome). The rank-decreasing
+    // B-advance for a genuinely drifted leg (delta_b>0) is proven at the A2 kernel.
+    assert_eq!(
+        r.selected,
+        AutoCrankPlanV16::SettleBChunk { asset_index: 0 }
+    );
+    assert!(matches!(
+        r.outcome,
+        AutoCrankOutcomeV16::Progressed(PermissionlessProgressOutcomeV16::AccountBChunk(_))
+    ));
+    market.validate_shape().unwrap();
+}
+
+#[test]
+fn v16_auto_crank_missing_observation_is_clean_nonprogress_no_mutation() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 71);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
+        market.deposit_not_atomic(&mut account, 1_000).unwrap();
+    }
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    // fresh account -> selector wants RefreshAccount, which needs an observation;
+    // supply NONE -> clean NonProgress, no mutation.
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(summary.stale);
+    let cert_before = account.header.health_cert;
+    let work = AutoCrankWorkV16 {
+        now_slot: 5,
+        observations: &[],
+        liquidation_max_close_q: 0,
+        resolved_close_fee_rate_per_slot: 0,
+    };
+    let r = market.permissionless_auto_crank_not_atomic(&mut account, work);
+    assert_eq!(r, Err(percolator::V16Error::NonProgress));
+    // no mutation (SVM would roll back anyway, but the engine did not commit).
+    assert_eq!(account.header.health_cert, cert_before);
+    market.validate_shape().unwrap();
 }
