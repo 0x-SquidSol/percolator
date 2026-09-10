@@ -439,11 +439,27 @@ fn terminal_close_with_expired_backing_does_not_strand() {
     assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
 
     let vault_before = market.header.vault.get();
-    let outcome = market
-        .close_resolved_account_not_atomic(&mut account, 0)
-        .expect("expired-backing winner close must not revert (liveness)");
-    let closed = matches!(outcome, ResolvedCloseOutcomeV16::Closed { payout: _ });
+    // Upstream e57296cd makes the lapsed-bucket expiry its own bounded step, so
+    // the close now reports ProgressOnly once before finishing. Drive the
+    // continuation to completion; the end state asserted below is unchanged.
+    let mut closed = false;
+    let mut steps = 0;
+    while steps < 8 {
+        steps += 1;
+        let outcome = market
+            .close_resolved_account_not_atomic(&mut account, 0)
+            .expect("expired-backing winner close must not revert (liveness)");
+        if matches!(outcome, ResolvedCloseOutcomeV16::Closed { payout: _ }) {
+            closed = true;
+            break;
+        }
+        assert_eq!(outcome, ResolvedCloseOutcomeV16::ProgressOnly);
+    }
     assert!(closed, "expired-backing winner did not fully close");
+    assert!(
+        steps >= 2,
+        "the lapsed bucket must be expired by its own bounded step before the close finishes"
+    );
     let paid = vault_before - market.header.vault.get();
 
     // Expiry forfeits the lapsed principal to the junior pool: the winner is
