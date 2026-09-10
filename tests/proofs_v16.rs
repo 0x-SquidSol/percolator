@@ -21,16 +21,17 @@ use percolator::v16::{
     kani_pending_domain_loss_barrier_blocks_position_change,
     kani_position_change_requires_unit_adl, kani_position_delta_increases_risk,
     kani_prepare_asset_recovery_transition, kani_select_auto_crank_plan,
-    kani_settle_kf_stale_cohort, kani_should_clear_prior_reset_obligation,
-    kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
-    kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
-    kani_validate_positive_pnl_source_attribution, ActionableSummaryV16, AssetLifecycleV16,
-    AssetStateV16, AssetStateV16Account, AutoCrankPlanV16, BackingBucketStatusV16,
-    BackingBucketV16, BackingBucketV16Account, BatchTradeOutcomeV16, CloseProgressLedgerV16,
-    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16,
-    HealthCertV16Account, InsuranceCreditReservationV16, InsuranceCreditReservationV16Account,
-    Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
-    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
+    kani_settle_kf_stale_cohort, kani_settle_resolved_pnl_after_booking,
+    kani_should_clear_prior_reset_obligation, kani_source_credit_state_realizable_support_for_face,
+    kani_target_effective_lag_adverse_delta, kani_trade_preexisting_oi_reduction_gate,
+    kani_trade_preflight_risk_gate, kani_validate_positive_pnl_source_attribution,
+    ActionableSummaryV16, AssetLifecycleV16, AssetStateV16, AssetStateV16Account, AutoCrankPlanV16,
+    BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, BatchTradeOutcomeV16,
+    CloseProgressLedgerV16, CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16,
+    HealthCertV16, HealthCertV16Account, InsuranceCreditReservationV16,
+    InsuranceCreditReservationV16Account, Market, MarketGroupV16HeaderAccount,
+    MarketGroupV16ViewMut, MarketModeV16, PermissionlessCrankActionV16,
+    PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16,
@@ -14372,5 +14373,55 @@ fn proof_v16_liquidation_error_commits_only_fully_declared_recovery() {
     kani::cover!(
         error != V16Error::RecoveryRequired && mode == MarketModeV16::Recovery && reason.is_some(),
         "Recovery state cannot mask an unrelated engine error"
+    );
+}
+
+// The residual-booking PnL update must only ever move a NEGATIVE PnL toward zero.
+// Over-clearing would mint a spurious positive credit out of absorbed loss, and
+// under-clearing would leave loss double-counted against the account. Upstream
+// pins this with a kani::requires/ensures contract; this fork does not build the
+// `contracts` feature, so the same theorem is stated directly here over the same
+// domain (pnl strictly negative, which BOTH production call sites guard before
+// calling: settle_resolved_bankruptcy_negative_pnl returns early on pnl >= 0 and
+// computes `residual` only when pnl < 0, and advance_pending_close_residual_not_atomic
+// books only when pnl < 0).
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_pnl_after_booking_only_shrinks_the_loss() {
+    let pnl: i128 = kani::any();
+    let booked_loss: u128 = kani::any();
+    let explicit_loss: u128 = kani::any();
+    kani::assume(pnl < 0 && pnl > i128::MIN);
+    kani::assume(booked_loss <= MAX_VAULT_TVL);
+    kani::assume(explicit_loss <= MAX_VAULT_TVL);
+
+    let loss = pnl.unsigned_abs();
+    let cleared = booked_loss.saturating_add(explicit_loss).min(loss);
+    let new_pnl = kani_settle_resolved_pnl_after_booking(pnl, booked_loss, explicit_loss)
+        .expect("bounded absorbed loss against a bounded deficit cannot overflow");
+
+    assert_eq!(new_pnl, pnl + (cleared as i128));
+    // The loss only shrinks toward zero: never past zero into a credit, never away
+    // from zero, and by EXACTLY what the booking absorbed.
+    assert!(new_pnl <= 0);
+    assert!(new_pnl >= pnl);
+    assert_eq!(new_pnl.unsigned_abs(), loss - cleared);
+
+    kani::cover!(
+        booked_loss + explicit_loss < loss && booked_loss != 0 && explicit_loss != 0,
+        "a partial booking leaves a strictly smaller deficit"
+    );
+    kani::cover!(
+        booked_loss.saturating_add(explicit_loss) == loss && loss > 255,
+        "an exact booking clears a nontrivial deficit to zero"
+    );
+    kani::cover!(
+        booked_loss > loss,
+        "a booking larger than the deficit is capped, not over-cleared"
+    );
+    kani::cover!(
+        booked_loss == 0 && explicit_loss == 0 && loss > 255,
+        "an empty booking leaves the deficit untouched"
     );
 }

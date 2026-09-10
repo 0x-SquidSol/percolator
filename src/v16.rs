@@ -1475,6 +1475,32 @@ impl V16Core {
         !already_cleared && prior_reset_obligation && !pending_close_residual
     }
 
+    /// PRODUCTION KERNEL (resolved-bankruptcy settlement): reduce an account's
+    /// NEGATIVE PnL by the loss the residual booking just absorbed.
+    /// `cleared = min(booked_loss + explicit_loss, |pnl|)` — capped at the
+    /// outstanding loss so it can never exceed it — and `new_pnl = pnl + cleared`.
+    /// PROVES the loss only SHRINKS toward zero (pnl <= new_pnl <= 0; never
+    /// over-cleared into a spurious positive credit) and its magnitude drops by
+    /// EXACTLY cleared (|new_pnl| == |pnl| - cleared). Pure scalar; the
+    /// resolved-bankruptcy settle glue calls exactly this for the PnL update after
+    /// book_bankruptcy_residual_chunk_for_account_core.
+    pub(crate) fn kernel_settle_resolved_pnl_after_booking(
+        pnl: i128,
+        booked_loss: u128,
+        explicit_loss: u128,
+    ) -> V16Result<i128> {
+        let loss = pnl.unsigned_abs();
+        let cleared = booked_loss
+            .checked_add(explicit_loss)
+            .ok_or(V16Error::ArithmeticOverflow)?
+            .min(loss);
+        let cleared_i128 = i128::try_from(cleared).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let new_pnl = pnl
+            .checked_add(cleared_i128)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        Ok(new_pnl)
+    }
+
     /// PRODUCTION KERNEL: a liquidation error is successful public progress only
     /// when the same call committed the matching Recovery state. Every other
     /// error, including an incomplete Recovery marker, remains unchanged.
@@ -2469,6 +2495,15 @@ pub fn kani_should_clear_prior_reset_obligation(
         prior_reset_obligation,
         pending_close_residual,
     )
+}
+
+#[cfg(kani)]
+pub fn kani_settle_resolved_pnl_after_booking(
+    pnl: i128,
+    booked_loss: u128,
+    explicit_loss: u128,
+) -> V16Result<i128> {
+    V16Core::kernel_settle_resolved_pnl_after_booking(pnl, booked_loss, explicit_loss)
 }
 
 #[cfg(kani)]
@@ -15720,18 +15755,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             bankrupt_side,
             residual,
         )?;
-        let cleared = outcome
-            .booked_loss
-            .checked_add(outcome.explicit_loss)
-            .ok_or(V16Error::ArithmeticOverflow)?
-            .min(residual);
-        let cleared_i128 = i128::try_from(cleared).map_err(|_| V16Error::ArithmeticOverflow)?;
-        let new_pnl = account
-            .header
-            .pnl
-            .get()
-            .checked_add(cleared_i128)
-            .ok_or(V16Error::ArithmeticOverflow)?;
+        let new_pnl = V16Core::kernel_settle_resolved_pnl_after_booking(
+            account.header.pnl.get(),
+            outcome.booked_loss,
+            outcome.explicit_loss,
+        )?;
         self.set_account_pnl(account, new_pnl)?;
         account.header.health_cert.valid = 0;
         // Residual was booked into explicit/social loss: if this settled the last
