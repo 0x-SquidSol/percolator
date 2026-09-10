@@ -12446,16 +12446,20 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             let active = active_bitmap_get(bitmap, slot) && leg.active;
             if active {
                 let asset = self.asset_state(leg.asset_index as usize)?;
-                let (side_oi, side_mode, asset_epoch) = match leg.side {
-                    SideV16::Long => (asset.oi_eff_long_q, asset.mode_long, asset.epoch_long),
-                    SideV16::Short => (asset.oi_eff_short_q, asset.mode_short, asset.epoch_short),
+                let (side_mode, asset_epoch) = match leg.side {
+                    SideV16::Long => (asset.mode_long, asset.epoch_long),
+                    SideV16::Short => (asset.mode_short, asset.epoch_short),
                 };
+                // A leg can only be liquidated against OI both sides still hold;
+                // a side-local OI reading would offer a liquidation that has
+                // nothing left to match. (upstream 9ffc4749)
+                let matched_oi = asset.oi_eff_long_q.min(asset.oi_eff_short_q);
                 let (b_stale, refresh, liquidatable, reset_obligation) =
                     V16Core::kernel_auto_crank_leg_flags(
                         true,
                         asset.lifecycle,
                         leg.basis_pos_q,
-                        side_oi,
+                        matched_oi,
                         side_mode,
                         asset_epoch,
                         leg.epoch_snap,
@@ -12464,7 +12468,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 b_stale_flags[slot] = b_stale;
                 refresh_flags[slot] = refresh;
                 liquidation_flags[slot] = liquidatable;
-                reset_obligation_flags[slot] = reset_obligation;
+                // A legacy Normal-mode leg whose effective OI is already exhausted
+                // is a reset obligation too, or it stays uncrankable after upgrade.
+                // (upstream 9ffc4749)
+                reset_obligation_flags[slot] =
+                    reset_obligation || Self::leg_has_exhausted_effective_oi(asset, leg);
                 released_obligation_flags[slot] = release_allowed
                     && !leg.stale
                     && !leg.b_stale

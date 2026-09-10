@@ -6000,6 +6000,147 @@ fn v16_auto_crank_retains_released_obligation_while_the_opposite_side_is_live() 
     account.validate_with_market(&market.as_view()).unwrap();
 }
 
+// upstream e1deaf88: a legacy zero-effective-OI residue must stay crankable.
+#[test]
+fn v16_auto_crank_migrates_legacy_normal_adl_residue_into_reset_cleanup() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 25);
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = 0;
+    asset.oi_eff_short_q = 0;
+    asset.a_long = ADL_ONE / 2;
+    asset.loss_weight_sum_long = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    header.resolved_payout_blocker_count = V16PodU64::new(1);
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Long,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap: asset.k_long,
+        f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_long,
+        loss_weight: POS_SCALE,
+        b_snap: asset.b_long_num,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market.deposit_not_atomic(&mut account, 1_000).unwrap();
+    let result = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: 1,
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("a legacy zero-effective-OI residue must remain crankable after upgrade");
+    assert_eq!(
+        result.selected,
+        AutoCrankPlanV16::RefreshAccount {
+            asset_index: Some(0)
+        }
+    );
+    assert_eq!(account.header.active_bitmap[0].get(), 0);
+    assert!(!account.header.legs[0].try_to_runtime().unwrap().active);
+    let reset = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(reset.mode_long, SideModeV16::ResetPending);
+    assert_eq!(reset.stored_pos_count_long, 0);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
+// FORK CONTROL for 9ffc4749's selector hunk. upstream e1deaf88's test above runs on
+// an account with no valid health certificate, so the classifier selects a refresh
+// regardless and the refresh path migrates the residue: deleting the
+// `|| leg_has_exhausted_effective_oi` term leaves it green. The term only matters
+// when the certificate is CURRENT -- then nothing else marks the account stale, and
+// without the term a legacy zero-effective-OI residue classifies as NoAction and is
+// never migrated. Same fixture as e1deaf88, plus a current certificate.
+#[test]
+fn v16_auto_crank_migrates_exhausted_residue_behind_a_current_certificate() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 26);
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = 0;
+    asset.oi_eff_short_q = 0;
+    asset.a_long = ADL_ONE / 2;
+    asset.loss_weight_sum_long = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    header.resolved_payout_blocker_count = V16PodU64::new(1);
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Long,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap: asset.k_long,
+        f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_long,
+        loss_weight: POS_SCALE,
+        b_snap: asset.b_long_num,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market.deposit_not_atomic(&mut account, 1_000).unwrap();
+    account.header.health_cert = HealthCertV16Account::from_runtime(&HealthCertV16 {
+        cert_oracle_epoch: market.header.oracle_epoch.get(),
+        cert_funding_epoch: market.header.funding_epoch.get(),
+        cert_risk_epoch: market.header.risk_epoch.get(),
+        cert_asset_set_epoch: market.header.asset_set_epoch.get(),
+        active_bitmap_at_cert: account.header.active_bitmap.map(V16PodU64::get),
+        valid: true,
+        ..HealthCertV16::default()
+    });
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        summary.stale,
+        "an exhausted legacy residue must be actionable even behind a current certificate: {summary:?}"
+    );
+    let result = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: market.header.current_slot.get(),
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("the residue must be crankable behind a current certificate");
+    assert_eq!(
+        result.selected,
+        AutoCrankPlanV16::RefreshAccount {
+            asset_index: Some(0)
+        }
+    );
+    assert_eq!(account.header.active_bitmap[0].get(), 0);
+    let reset = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(reset.mode_long, SideModeV16::ResetPending);
+    assert_eq!(reset.stored_pos_count_long, 0);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
 #[test]
 fn v16_auto_crank_drives_stale_underwater_account_to_derisked_fixed_point() {
     let (mut header, mut markets) = market_fixture(2, 100);
