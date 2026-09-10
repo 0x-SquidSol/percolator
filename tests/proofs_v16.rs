@@ -13571,6 +13571,15 @@ fn post_snapshot_expiry_fixture(
 // realize step falls through to the junior receipt path instead of reverting.
 // The full close_resolved path is Kani-intractable; the two bounded route
 // bindings below pin this primitive for under-backed and fully-backed claims.
+//
+// FORK NOTE: this fork binds the helper ONCE, fully backed, from
+// proof_v16_fully_backed_expiry_yields_zero_realizable_support (backing 3 against
+// claim 3). Upstream e35f0f6d's second binding lives in its concrete rewrite of
+// proof_v16_expired_backing_yields_zero_realizable_support_after_expiry, which this
+// fork does not adopt: it keeps that proof's earlier SYMBOLIC form (backing and
+// claim each 1..=6, see PR #174), which covers the under-backed case instead. So the
+// pre-snapshot "terminal accounting stays uninitialized" asserts below run only for
+// the fully-backed binding here.
 fn assert_expired_backing_yields_zero_realizable_support(backing: u128) {
     // BOUNDED BINDING (flagged): a symbolic backing value blows the solver
     // budget (the realizable-support query's per-domain U256 credit math on
