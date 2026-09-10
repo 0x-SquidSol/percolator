@@ -4361,6 +4361,141 @@ fn v16_grant_source_positive_pnl_attributes_claims_and_aggregates_in_lockstep() 
     assert_eq!(account.header.pnl.get(), 25);
 }
 
+/// A B-settlement loss must retire the claim of the leg's own opposite-side
+/// source domain before any unrelated domain's claim (upstream 3ed6e11b, made
+/// domain-first with an explicit fallback in ce01590b). The unrelated domain is
+/// granted first so it occupies the earlier portfolio slot, which is exactly the
+/// slot the pre-port generic burn walked first.
+#[test]
+fn v16_b_settlement_loss_retires_the_legs_own_source_domain_first() {
+    const LOT_Q: u128 = 1_000 * POS_SCALE;
+    // loss = loss_weight * delta_b / SOCIAL_LOSS_DEN = 1e9 * 1e13 / 1e21 = 10 atoms.
+    const B_TARGET: u128 = 10_000_000_000_000;
+    const LOSS_ATOMS: u128 = 10;
+    const GRANT_ATOMS: u128 = 40;
+    const LEG_DOMAIN: usize = 1;
+    const UNRELATED_DOMAIN: usize = 2;
+
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut long_header = account_fixture(2, 71);
+    let mut short_header = account_fixture(2, 72);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        market.deposit_not_atomic(&mut long, 1_000).unwrap();
+        market.deposit_not_atomic(&mut short, 1_000).unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(&mut long, UNRELATED_DOMAIN, GRANT_ATOMS)
+            .unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(&mut long, LEG_DOMAIN, GRANT_ATOMS)
+            .unwrap();
+    }
+    assert_eq!(
+        long_header.source_domains[0].domain.get() as usize,
+        UNRELATED_DOMAIN,
+        "the unrelated domain must occupy the earlier slot for this to be a real test"
+    );
+    assert_eq!(
+        long_header.source_domains[1].domain.get() as usize,
+        LEG_DOMAIN
+    );
+
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = LOT_Q;
+    asset.oi_eff_short_q = LOT_Q;
+    asset.stored_pos_count_long = 1;
+    asset.stored_pos_count_short = 1;
+    asset.loss_weight_sum_long = LOT_Q;
+    asset.loss_weight_sum_short = LOT_Q;
+    asset.b_long_num = B_TARGET;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+
+    long_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Long,
+        basis_pos_q: signed_q(LOT_Q),
+        a_basis: ADL_ONE,
+        k_snap: asset.k_long,
+        f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_long,
+        loss_weight: LOT_Q,
+        b_snap: 0,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    long_header.active_bitmap[0] = V16PodU64::new(1);
+    long_header.health_cert.valid = 0;
+    short_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Short,
+        basis_pos_q: -signed_q(LOT_Q),
+        a_basis: ADL_ONE,
+        k_snap: asset.k_short,
+        f_snap: asset.f_short_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_short,
+        loss_weight: LOT_Q,
+        b_snap: asset.b_short_num,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_short,
+        b_stale: false,
+        stale: false,
+    });
+    short_header.active_bitmap[0] = V16PodU64::new(1);
+    short_header.health_cert.valid = 0;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+
+    let outcome = market
+        .permissionless_crank_not_atomic(
+            &mut long,
+            PermissionlessCrankRequestV16 {
+                now_slot: 1,
+                asset_index: 0,
+                effective_price: 100,
+                funding_rate_e9: 0,
+                action: PermissionlessCrankActionV16::SettleB { asset_index: 0 },
+            },
+        )
+        .unwrap();
+    let PermissionlessProgressOutcomeV16::AccountBChunk(chunk) = outcome else {
+        panic!("SettleB must return a B chunk, got {outcome:?}");
+    };
+    assert_eq!(chunk.delta_b, B_TARGET);
+    assert_eq!(chunk.loss, LOSS_ATOMS);
+    assert_eq!(chunk.remaining_after, 0);
+
+    assert_eq!(
+        long.header.pnl.get() as u128,
+        2 * GRANT_ATOMS - LOSS_ATOMS,
+        "the loss reduces the account's positive PnL"
+    );
+    assert_eq!(
+        long.header.source_domains[1].source_claim_bound_num.get(),
+        (GRANT_ATOMS - LOSS_ATOMS) * BOUND_SCALE,
+        "the leg's own opposite-side domain absorbs the whole B loss"
+    );
+    assert_eq!(
+        long.header.source_domains[0].source_claim_bound_num.get(),
+        GRANT_ATOMS * BOUND_SCALE,
+        "an unrelated domain's claim is untouched by another asset's B loss"
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Protocol-fee design §1A: taker-only trade fee charging.
 // ---------------------------------------------------------------------------
