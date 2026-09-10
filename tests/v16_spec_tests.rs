@@ -4288,6 +4288,146 @@ fn direct_live_lien_release_leaves_a_certificate_the_conversion_can_use() {
     );
 }
 
+// upstream c09d4575 "Fix live source-backing expiry progress" (2026-08-06): a
+// source-backed winner can remain Live past its backing bucket's expiry; the
+// permissionless refresh commits exactly one canonical expiry transition per
+// call (SourceBackingExpired { domain }) before valuation, so repeated cranks
+// drain the bounded domain set. Fork adaptation: upstream drives this through
+// permissionless_auto_crank_not_atomic (not ported); ours uses the Refresh action
+// of permissionless_crank_not_atomic, which reaches the same refresh path with
+// allow_b_chunk = true.
+#[test]
+fn v16_permissionless_refresh_expires_one_lapsed_live_source_domain_per_step() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut account_header = account_fixture(2, 22);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
+        market.deposit_not_atomic(&mut account, 100).unwrap();
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(1, 40, 5)
+            .unwrap();
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(3, 40, 5)
+            .unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(&mut account, 1, 40)
+            .unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(&mut account, 3, 40)
+            .unwrap();
+        market
+            .accrue_asset_to_not_atomic(0, 10, 100, 0, true)
+            .unwrap();
+        market
+            .accrue_asset_to_not_atomic(1, 10, 100, 0, true)
+            .unwrap();
+    }
+
+    let before = markets[0].engine.backing_short.try_to_runtime().unwrap();
+    assert_eq!(before.status, BackingBucketStatusV16::Fresh);
+    assert_eq!(before.expiry_slot, 5);
+    assert_eq!(
+        markets[1]
+            .engine
+            .backing_short
+            .try_to_runtime()
+            .unwrap()
+            .status,
+        BackingBucketStatusV16::Fresh
+    );
+    assert!(header.current_slot.get() > before.expiry_slot);
+    let vault_before = header.vault.get();
+    let c_tot_before = header.c_tot.get();
+    let insurance_before = header.insurance.get();
+    let earnings_before = header.backing_provider_earnings_total.get();
+    let source_backing_before = header.source_fresh_backing_total_num.get();
+    let risk_epoch_before = header.risk_epoch.get();
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    let refresh_request = PermissionlessCrankRequestV16 {
+        now_slot: 10,
+        asset_index: 0,
+        effective_price: 100,
+        funding_rate_e9: 0,
+        action: PermissionlessCrankActionV16::Refresh,
+    };
+    let expiry = market
+        .permissionless_crank_not_atomic(&mut account, refresh_request)
+        .expect("a Live refresh must expire lapsed backing instead of returning Stale");
+    assert_eq!(
+        expiry,
+        PermissionlessProgressOutcomeV16::SourceBackingExpired { domain: 1 }
+    );
+    let after = market.markets[0]
+        .engine
+        .backing_short
+        .try_to_runtime()
+        .unwrap();
+    assert_eq!(after.status, BackingBucketStatusV16::Expired);
+    assert_eq!(after.fresh_unliened_backing_num, 0);
+    assert_eq!(
+        market.markets[1]
+            .engine
+            .backing_short
+            .try_to_runtime()
+            .unwrap()
+            .status,
+        BackingBucketStatusV16::Fresh,
+        "one refresh expires exactly one source domain"
+    );
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.c_tot.get(), c_tot_before);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+    assert_eq!(
+        market.header.backing_provider_earnings_total.get(),
+        earnings_before
+    );
+    assert_eq!(
+        market.header.source_fresh_backing_total_num.get(),
+        source_backing_before - 40 * BOUND_SCALE
+    );
+    assert_eq!(market.header.risk_epoch.get(), risk_epoch_before + 1);
+    assert_eq!(account.header.capital.get(), 100);
+    assert_eq!(account.header.pnl.get(), 80);
+    assert!(!account.header.health_cert.try_to_runtime().unwrap().valid);
+
+    let second_expiry = market
+        .permissionless_crank_not_atomic(&mut account, refresh_request)
+        .expect("the next bounded refresh must expire the next domain");
+    assert_eq!(
+        second_expiry,
+        PermissionlessProgressOutcomeV16::SourceBackingExpired { domain: 3 }
+    );
+    assert_eq!(
+        market.markets[1]
+            .engine
+            .backing_short
+            .try_to_runtime()
+            .unwrap()
+            .status,
+        BackingBucketStatusV16::Expired
+    );
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.c_tot.get(), c_tot_before);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+    assert_eq!(
+        market.header.backing_provider_earnings_total.get(),
+        earnings_before
+    );
+    assert_eq!(market.header.source_fresh_backing_total_num.get(), 0);
+    assert_eq!(market.header.risk_epoch.get(), risk_epoch_before + 2);
+
+    let refresh = market
+        .permissionless_crank_not_atomic(&mut account, refresh_request)
+        .expect("the final bounded refresh must finish account refresh");
+    assert_eq!(refresh, PermissionlessProgressOutcomeV16::AccountCurrent);
+    assert!(account.header.health_cert.try_to_runtime().unwrap().valid);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
 // upstream 650e3fdf "Commit recovery for unbookable terminal forfeits" (2026-08-22):
 // when a Recovery-mode owner forfeit leaves a residual that the absorbing side
 // cannot book (capacity 0), the forfeit COMMITS Recovery as a successful
