@@ -16485,18 +16485,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             AssetLifecycleV16::Active
             | AssetLifecycleV16::DrainOnly
             | AssetLifecycleV16::Recovery => {
-                self.require_empty_asset_lifecycle_state_with_policy(
-                    asset_index,
-                    false,
-                    true,
-                    true,
-                    true,
-                )?;
+                self.normalize_terminal_empty_asset_history_not_atomic(asset_index)?;
                 let (next_asset_set_epoch, next_risk_epoch) =
                     self.checked_asset_set_epoch_bump()?;
-                self.clear_terminal_source_spent_audit(asset_index)?;
-                Self::clear_terminal_social_loss_audit(&mut asset);
-                Self::clear_terminal_price_funding_history(&mut asset);
+                asset = self.asset_state(asset_index)?;
                 asset.lifecycle = AssetLifecycleV16::Retired;
                 asset.retired_slot = now_slot;
                 self.set_asset_state(asset_index, asset)?;
@@ -16505,17 +16497,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 self.validate_shape()
             }
             AssetLifecycleV16::Retired => {
-                self.require_empty_asset_lifecycle_state_with_policy(
-                    asset_index,
-                    false,
-                    true,
-                    true,
-                    true,
-                )?;
-                self.clear_terminal_source_spent_audit(asset_index)?;
-                Self::clear_terminal_social_loss_audit(&mut asset);
-                Self::clear_terminal_price_funding_history(&mut asset);
-                self.set_asset_state(asset_index, asset)?;
+                self.normalize_terminal_empty_asset_history_not_atomic(asset_index)?;
                 self.validate_shape()
             }
             _ => Err(V16Error::LockActive),

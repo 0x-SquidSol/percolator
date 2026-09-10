@@ -2868,6 +2868,54 @@ fn v16_restart_rejects_active_asset() {
     );
 }
 
+/// 573c4e90 ships only a proof; this concrete twin pins the behaviour it adds:
+/// one retirement clears a spent-only domain budget together with the rest of
+/// the inert history, with no preparatory cleanup transition.
+#[test]
+fn v16_retire_clears_spent_only_domain_budget_in_one_transition() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market.deposit_domain_insurance_not_atomic(2, 10).unwrap();
+        market.force_asset_recovery_not_atomic(1, 2).unwrap();
+    }
+    header.insurance = V16PodU128::new(0);
+    header.insurance_domain_budget_remaining_total = V16PodU128::new(0);
+    markets[1].engine.insurance_domain_spent_long = V16PodU128::new(10);
+    let mut historical_asset = markets[1].engine.asset.try_to_runtime().unwrap();
+    historical_asset.k_short = 41;
+    historical_asset.f_epoch_start_long_num = -9;
+    markets[1].engine.asset = AssetStateV16Account::from_runtime(&historical_asset);
+    let vault_before = header.vault.get();
+    let c_tot_before = header.c_tot.get();
+    let insurance_before = header.insurance.get();
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    assert_eq!(market.validate_shape(), Ok(()));
+    market.retire_empty_asset_not_atomic(1, 3).unwrap();
+    let asset = market.markets[1].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(asset.lifecycle, AssetLifecycleV16::Retired);
+    assert_eq!(asset.retired_slot, 3);
+    assert_eq!(asset.k_short, 0);
+    assert_eq!(asset.f_epoch_start_long_num, 0);
+    assert_eq!(
+        market.markets[1].engine.insurance_domain_budget_long.get(),
+        0
+    );
+    assert_eq!(
+        market.markets[1].engine.insurance_domain_spent_long.get(),
+        0
+    );
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.c_tot.get(), c_tot_before);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+    assert_eq!(
+        market.header.insurance_domain_budget_remaining_total.get(),
+        0
+    );
+    market.validate_shape().unwrap();
+}
+
 #[test]
 fn v16_retire_normalizes_only_inert_social_loss_audit_state() {
     let (mut header, mut markets) = market_fixture(1, 100);
