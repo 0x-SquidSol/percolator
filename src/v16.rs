@@ -8663,8 +8663,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if burn_num == 0 {
             return Ok(0);
         }
-        if slot >= PORTFOLIO_SOURCE_DOMAIN_CAP || account.source_domain_slot(domain)? != Some(slot)
-        {
+        if slot >= PORTFOLIO_SOURCE_DOMAIN_CAP {
+            return Err(V16Error::CounterUnderflow);
+        }
+        // Read the slot IN PLACE. Resolving the slot by scanning for `domain`
+        // breaks once an earlier burn has emptied a slot and made the table
+        // sparse: the lookup no longer agrees with the caller's index and a
+        // still-funded later domain is refused. (upstream efa7e6f4)
+        let source = account.header.source_domains[slot];
+        if !source.is_occupied() || source.domain.get() as usize != domain {
             return Err(V16Error::CounterUnderflow);
         }
         let target = burn_num.min(
@@ -10333,7 +10340,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Self::transfer_account_residual_reward_credit(trader, lp, principal_atoms)
     }
 
-    #[cfg(kani)]
+    #[cfg(any(kani, feature = "fuzz"))]
     pub fn kani_set_account_pnl(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,

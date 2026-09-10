@@ -13,6 +13,62 @@ fn ids() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     ([1; 32], [2; 32], [3; 32], [4; 32])
 }
 
+fn source_claim_num(account: &PortfolioAccountV16Account, domain: usize) -> u128 {
+    account
+        .source_domains
+        .iter()
+        .find(|source| {
+            source.source_claim_market_id.get() != 0 && source.domain.get() as usize == domain
+        })
+        .map(|source| source.source_claim_bound_num.get())
+        .unwrap_or(0)
+}
+
+// A burn walks the account's source domains in order. Emptying an earlier domain
+// makes the table SPARSE, and resolving each slot by scanning for its domain then
+// disagrees with the caller's index, refusing a later domain that is still funded.
+// Reading the slot in place keeps the traversal correct. (upstream efa7e6f4)
+#[test]
+fn v16_source_claim_burn_crosses_a_just_emptied_sparse_slot() {
+    let (market_id, _, _, owner) = ids();
+    let cfg = V16Config::public_user_fund_with_market_slots(2, 2, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id, cfg, 2, 0).unwrap();
+    let mut markets = vec![
+        Market::new(0u64, EngineAssetSlotV16Account::default()),
+        Market::new(1u64, EngineAssetSlotV16Account::default()),
+    ];
+    for (asset_index, market) in markets.iter_mut().enumerate() {
+        header
+            .activate_empty_asset_slot_not_atomic(
+                asset_index as u32,
+                &mut market.engine,
+                100,
+                (asset_index + 1) as u64,
+            )
+            .unwrap();
+    }
+    let mut account_header = PortfolioAccountV16Account::default();
+    account_header
+        .init_empty_in_place(ProvenanceHeaderV16Account::from_runtime(
+            &ProvenanceHeaderV16::new(market_id, [11; 32], owner),
+        ))
+        .unwrap();
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market
+        .add_account_source_positive_pnl_not_atomic(&mut account, 1, 100)
+        .unwrap();
+    market
+        .add_account_source_positive_pnl_not_atomic(&mut account, 3, 100)
+        .unwrap();
+
+    market.kani_set_account_pnl(&mut account, 0).unwrap();
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(source_claim_num(account.header, 1), 0);
+    assert_eq!(source_claim_num(account.header, 3), 0);
+}
+
 fn fuzz_group() -> (MarketGroupV16HeaderAccount, Vec<Market<u64>>) {
     let (market_id, _, _, _) = ids();
     let mut cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
