@@ -2580,7 +2580,6 @@ pub struct AutoCrankObservationV16 {
 pub struct AutoCrankWorkV16<'a> {
     pub now_slot: u64,
     pub observations: &'a [AutoCrankObservationV16],
-    pub liquidation_max_close_q: u128,
     pub resolved_close_fee_rate_per_slot: u128,
 }
 
@@ -12057,8 +12056,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         );
         let ledger = account.header.close_progress.try_to_runtime()?;
 
-        let has_open_risk =
-            !active_bitmap_is_empty(account.header.active_bitmap.map(V16PodU64::get));
+        let (_, dispatchable_active_asset) = self.auto_crank_selected_assets(account)?;
+        let has_open_risk = dispatchable_active_asset.is_some();
         // A close ledger with residual_remaining==0 is already fully booked/covered
         // (e.g. insurance absorbed the loss); only OUTSTANDING residual is real,
         // actionable close work. The `active` flag can linger past that.
@@ -12127,20 +12126,30 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// ENGINE asset self-selection (engine.md): scan the account's bounded legs and
     /// return, for each asset-scoped continuation, the engine-chosen asset_index —
     /// the FIRST active b-stale leg's asset (SettleBChunk), and the FIRST active
-    /// leg's asset (used for both Liquidate and the refresh accrual target). The
+    /// leg whose asset is currently accrual/reduction-dispatchable (Active or
+    /// DrainOnly, used for both Liquidate and the refresh accrual target). Recovery
+    /// legs remain refreshable as part of the account scan, but cannot be selected
+    /// as the action asset because both accrual and liquidation reject them. The
     /// selection is proven in-range / actionable / first-match / complete by the
-    /// first_actionable_slot contract; the slot->asset_index read is by inspection.
+    /// first_actionable_slot contract; the slot->asset_index and lifecycle filter
+    /// are bound to production state here.
     fn auto_crank_selected_assets(
+        &self,
         account: &PortfolioV16View<'_>,
     ) -> V16Result<(Option<usize>, Option<usize>)> {
         let bitmap = account.header.active_bitmap.map(V16PodU64::get);
-        let mut active_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut dispatchable_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut b_stale_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
             let active = active_bitmap_get(bitmap, slot) && leg.active;
-            active_flags[slot] = active;
+            if active {
+                dispatchable_flags[slot] = matches!(
+                    self.asset_state(leg.asset_index as usize)?.lifecycle,
+                    AssetLifecycleV16::Active | AssetLifecycleV16::DrainOnly
+                );
+            }
             b_stale_flags[slot] = active && leg.b_stale;
             slot += 1;
         }
@@ -12153,7 +12162,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
         };
         let b_stale_asset = asset_of(V16Core::first_actionable_slot(b_stale_flags))?;
-        let active_asset = asset_of(V16Core::first_actionable_slot(active_flags))?;
+        let active_asset = asset_of(V16Core::first_actionable_slot(dispatchable_flags))?;
         Ok((b_stale_asset, active_asset))
     }
 
@@ -12166,10 +12175,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// Calling convention (wrapper side):
     /// 1. Decode a public auto-crank instruction carrying a bounded set of oracle
     ///    OBSERVATIONS (asset, authenticated price, funding) — one per asset the
-    ///    keeper has fresh data for — plus a `liquidation_max_close_q` work budget
-    ///    and the `resolved_close_fee_rate_per_slot`.
+    ///    keeper has fresh data for — plus the `resolved_close_fee_rate_per_slot`.
     /// 2. Authenticate clock/slot + each observation against the oracle.
-    /// 3. Build `AutoCrankWorkV16 { now_slot, observations, liquidation_max_close_q,
+    /// 3. Build `AutoCrankWorkV16 { now_slot, observations,
     ///    resolved_close_fee_rate_per_slot }` and call this ONCE (one ix = one step;
     ///    never loop to a fixed point — CU).
     /// 4. The engine classifies the account, selects the highest-priority step AND
@@ -12189,7 +12197,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         work: AutoCrankWorkV16<'_>,
     ) -> V16Result<AutoCrankResultV16> {
         let summary = self.build_actionable_summary(&account.as_view())?;
-        let (b_stale_asset, active_asset) = Self::auto_crank_selected_assets(&account.as_view())?;
+        let (b_stale_asset, active_asset) = self.auto_crank_selected_assets(&account.as_view())?;
         let recovery_reason = if summary.expired_close {
             PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
         } else {
@@ -12281,10 +12289,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 // Fee policy and close sizing both come from CONFIG and the
                 // engine's own liquidation selector, never from a caller hint.
                 // Upstream's f5d291eb form passed close_q and fee_bps in the
-                // request; both fields were removed from LiquidationRequestV16
-                // later, and this fork already carries the reduced tip shape, so
-                // the request is built in its tip form. work.liquidation_max_close_q
-                // stays in AutoCrankWorkV16 for wire compatibility with upstream.
+                // request and carried a liquidation_max_close_q budget in the
+                // work; b97e1746 removed all three, and this fork already carries
+                // the reduced shape, so the request is built in its tip form.
                 AutoCrankOutcomeV16::Progressed(crank_with(
                     self,
                     account,
