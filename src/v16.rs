@@ -1426,6 +1426,16 @@ impl V16Core {
         None
     }
 
+    /// PRODUCTION KERNEL: ordinary refresh accrual and liquidation can target
+    /// only a live or draining asset. Recovery legs remain account obligations,
+    /// but selecting one as the action asset would deterministically fail.
+    fn kernel_auto_crank_lifecycle_dispatchable(lifecycle: AssetLifecycleV16) -> bool {
+        matches!(
+            lifecycle,
+            AssetLifecycleV16::Active | AssetLifecycleV16::DrainOnly
+        )
+    }
+
     pub(crate) fn select_auto_crank_plan(
         summary: ActionableSummaryV16,
         b_stale_slot: usize,
@@ -2365,6 +2375,33 @@ pub fn auto_crank_plan_requires_caller_observation(plan: &AutoCrankPlanV16) -> b
         | AutoCrankPlanV16::CloseResolved
         | AutoCrankPlanV16::NoAction => false,
     }
+}
+
+#[cfg(kani)]
+pub fn kani_auto_crank_lifecycle_dispatchable(lifecycle: AssetLifecycleV16) -> bool {
+    V16Core::kernel_auto_crank_lifecycle_dispatchable(lifecycle)
+}
+
+#[cfg(kani)]
+pub fn kani_first_actionable_slot(flags: [bool; V16_MAX_PORTFOLIO_ASSETS_N]) -> Option<usize> {
+    V16Core::first_actionable_slot(flags)
+}
+
+#[cfg(kani)]
+pub fn kani_select_auto_crank_plan(
+    summary: ActionableSummaryV16,
+    b_stale_asset_index: usize,
+    liquidate_asset_index: usize,
+    refresh_asset_index: Option<usize>,
+    recovery_reason: PermissionlessRecoveryReasonV16,
+) -> AutoCrankPlanV16 {
+    V16Core::select_auto_crank_plan(
+        summary,
+        b_stale_asset_index,
+        liquidate_asset_index,
+        refresh_asset_index,
+        recovery_reason,
+    )
 }
 
 #[cfg(kani)]
@@ -12172,10 +12209,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             let active = active_bitmap_get(bitmap, slot) && leg.active;
             if active {
                 let asset = self.asset_state(leg.asset_index as usize)?;
-                let lifecycle_dispatchable = matches!(
-                    asset.lifecycle,
-                    AssetLifecycleV16::Active | AssetLifecycleV16::DrainOnly
-                );
+                let lifecycle_dispatchable =
+                    V16Core::kernel_auto_crank_lifecycle_dispatchable(asset.lifecycle);
                 refresh_flags[slot] = lifecycle_dispatchable;
                 let side_oi = match leg.side {
                     SideV16::Long => asset.oi_eff_long_q,
