@@ -16297,11 +16297,39 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             slot += 1;
         }
 
+        // Keep the terminal continuation bounded: a multi-leg account advances
+        // one canonical slot per call and the caller observes ProgressOnly until
+        // the bitmap is empty. The close is capped by whichever effective
+        // quantity is smaller, so a post-ADL leg cannot subtract more open
+        // interest than its side still carries.
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
             if leg.active {
-                self.clear_leg(account, leg.asset_index as usize)?;
+                let asset_index = leg.asset_index as usize;
+                let asset = self.asset_state(asset_index)?;
+                let side_effective_oi_q = match leg.side {
+                    SideV16::Long => asset.oi_eff_long_q,
+                    SideV16::Short => asset.oi_eff_short_q,
+                };
+                let account_effective_q = V16Core::effective_abs_quantity_for_leg(asset, leg)?;
+                let close_q = side_effective_oi_q.min(account_effective_q);
+                if close_q == 0 {
+                    // Zero-effective legs are either prior-reset residue or a
+                    // released pending-loss obligation. They own no live OI,
+                    // but still have to detach so resolved close can finish.
+                    self.clear_leg_at_slot_inner(account, asset_index, slot, false, Some(0))?;
+                    self.begin_zero_oi_residue_resets(asset_index)?;
+                    return Ok(());
+                }
+                let close_q = i128::try_from(close_q).map_err(|_| V16Error::ArithmeticOverflow)?;
+                let delta_q = match leg.side {
+                    SideV16::Long => close_q.checked_neg().ok_or(V16Error::ArithmeticOverflow)?,
+                    SideV16::Short => close_q,
+                };
+                self.apply_position_delta(account, asset_index, delta_q)?;
+                self.begin_zero_oi_residue_resets(asset_index)?;
+                return Ok(());
             }
             slot += 1;
         }
