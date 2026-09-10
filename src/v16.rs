@@ -1278,7 +1278,7 @@ impl V16Core {
     ) -> V16Result<u128> {
         if raw_abs_q > MAX_POSITION_ABS_Q
             || !(MIN_A_SIDE..=ADL_ONE).contains(&a_basis)
-            || !(MIN_A_SIDE..=a_basis).contains(&current_a)
+            || !(1..=a_basis).contains(&current_a)
         {
             return Err(V16Error::InvalidLeg);
         }
@@ -1324,7 +1324,7 @@ impl V16Core {
     ) -> V16Result<u128> {
         if effective_abs_q > MAX_POSITION_ABS_Q
             || !(MIN_A_SIDE..=ADL_ONE).contains(&a_basis)
-            || !(MIN_A_SIDE..=a_basis).contains(&current_a)
+            || !(1..=a_basis).contains(&current_a)
         {
             return Err(V16Error::InvalidLeg);
         }
