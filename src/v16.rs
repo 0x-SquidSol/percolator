@@ -4199,6 +4199,74 @@ pub struct AccrueAssetOutcomeV16 {
     pub loss_stale_after: bool,
 }
 
+/// Maximum canonical one-slot accrual steps that one public wrapper call may commit.
+/// Longer gaps remain actionable across additional bounded calls.
+pub const V16_MAX_ACCRUAL_PATH_STEPS: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccrualStepV16 {
+    pub effective_price: u64,
+    pub funding_rate_e9: i128,
+    pub price_move_remainder_before_bps_num: u16,
+    pub price_move_remainder_after_bps_num: u16,
+}
+
+/// Computes one canonical price-cap step while carrying sub-atom movement forward.
+///
+/// `cap_anchor` is fixed for the lifetime of one raw-oracle target. Using that stable anchor makes
+/// the cumulative movement exactly the configured linear `max_change_bps * dt` envelope instead
+/// of compounding the cap at caller-selected transaction boundaries. The remainder is the
+/// numerator left after division by `MAX_MARGIN_BPS`; carrying it across calls prevents permanent
+/// low-price target pinning.
+pub fn canonical_accrual_price_step_v16(
+    current: u64,
+    target: u64,
+    cap_anchor: u64,
+    max_change_bps: u64,
+    exposed: bool,
+    remainder_before_bps_num: u16,
+) -> V16Result<(u64, u16)> {
+    if current == 0
+        || target == 0
+        || cap_anchor == 0
+        || current > MAX_ORACLE_PRICE
+        || target > MAX_ORACLE_PRICE
+        || cap_anchor > MAX_ORACLE_PRICE
+        || remainder_before_bps_num as u64 >= MAX_MARGIN_BPS
+    {
+        return Err(V16Error::InvalidConfig);
+    }
+    if !exposed {
+        return Ok((target, 0));
+    }
+    if current == target || max_change_bps == 0 {
+        return Ok((current, 0));
+    }
+    let numerator = (cap_anchor as u128)
+        .checked_mul(max_change_bps as u128)
+        .and_then(|value| value.checked_add(remainder_before_bps_num as u128))
+        .ok_or(V16Error::ArithmeticOverflow)?;
+    let max_delta = numerator / MAX_MARGIN_BPS as u128;
+    let remainder_after = u16::try_from(numerator % MAX_MARGIN_BPS as u128)
+        .map_err(|_| V16Error::ArithmeticOverflow)?;
+    let distance = current.abs_diff(target) as u128;
+    if max_delta >= distance {
+        return Ok((target, 0));
+    }
+    let delta = u64::try_from(max_delta).map_err(|_| V16Error::ArithmeticOverflow)?;
+    let next = if target > current {
+        current
+            .checked_add(delta)
+            .ok_or(V16Error::ArithmeticOverflow)?
+    } else {
+        current
+            .checked_sub(delta)
+            .ok_or(V16Error::ArithmeticOverflow)?
+    };
+    Ok((next, remainder_after))
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TradeRequestV16 {
@@ -11729,7 +11797,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         asset.f_long_num = add_non_min_i128(asset.f_long_num, funding_delta_long)?;
         asset.f_short_num = add_non_min_i128(asset.f_short_num, funding_delta_short)?;
         asset.effective_price = effective_price;
-        asset.fund_px_last = effective_price;
+        // Canonical path accrual uses this persisted nonzero field as its stable price-cap anchor.
+        // A direct price move starts a new trajectory; zero-move funding must preserve an active
+        // trajectory anchor so transaction partitioning cannot change later price movement.
+        if effective_price != old.effective_price || effective_price == old.raw_oracle_target_price
+        {
+            asset.fund_px_last = effective_price;
+        }
         asset.slot_last = asset
             .slot_last
             .checked_add(segment_dt)
@@ -11773,6 +11847,179 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             price_move_active: activity.price_move_active,
             funding_active: activity.funding_active,
             equity_active: activity.equity_active,
+            loss_stale_after,
+        })
+    }
+
+    /// Applies the unique canonical one-slot accrual prefix for this asset.
+    ///
+    /// Requiring the complete bounded prefix prevents a caller from choosing transaction
+    /// boundaries that change price compounding or funding sampling. The wrapper may construct up
+    /// to `V16_MAX_ACCRUAL_PATH_STEPS` deterministic steps; a longer stale interval remains
+    /// actionable through another call with the same authenticated `now_slot`.
+    pub fn accrue_asset_path_to_not_atomic(
+        &mut self,
+        asset_index: usize,
+        now_slot: u64,
+        raw_oracle_target_price: u64,
+        steps: &[AccrualStepV16],
+        protective_progress_committed: bool,
+    ) -> V16Result<AccrueAssetOutcomeV16> {
+        let config = self.header.config.try_to_runtime_shape()?;
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Live
+            || asset_index >= config.max_market_slots as usize
+            || asset_index >= self.markets.len()
+            || raw_oracle_target_price == 0
+            || raw_oracle_target_price > MAX_ORACLE_PRICE
+            || now_slot < self.header.current_slot.get()
+        {
+            return Err(V16Error::InvalidConfig);
+        }
+        self.require_asset_accruable(asset_index)?;
+        let mut asset = self.asset_state(asset_index)?;
+        let k_long_before = asset.k_long;
+        let k_short_before = asset.k_short;
+        let f_long_before = asset.f_long_num;
+        let f_short_before = asset.f_short_num;
+        if now_slot < asset.slot_last {
+            return Err(V16Error::InvalidConfig);
+        }
+        let expected_steps_u64 = (now_slot - asset.slot_last)
+            .min(config.max_accrual_dt_slots)
+            .min(V16_MAX_ACCRUAL_PATH_STEPS as u64);
+        let expected_steps =
+            usize::try_from(expected_steps_u64).map_err(|_| V16Error::ArithmeticOverflow)?;
+        if steps.len() != expected_steps {
+            return Err(V16Error::InvalidConfig);
+        }
+        let target_changed = asset.raw_oracle_target_price != raw_oracle_target_price;
+        let price_cap_anchor = if target_changed {
+            asset.effective_price
+        } else {
+            asset.fund_px_last
+        };
+        if price_cap_anchor == 0 || price_cap_anchor > MAX_ORACLE_PRICE {
+            return Err(V16Error::InvalidConfig);
+        }
+        if target_changed {
+            asset.fund_px_last = asset.effective_price;
+        }
+
+        let mut price_move_count = 0u64;
+        let mut funding_count = 0u64;
+        let mut expected_remainder = steps
+            .first()
+            .map(|step| step.price_move_remainder_before_bps_num)
+            .unwrap_or(0);
+        for (index, step) in steps.iter().enumerate() {
+            if step.effective_price == 0
+                || step.effective_price > MAX_ORACLE_PRICE
+                || step.funding_rate_e9.unsigned_abs() > config.max_abs_funding_e9_per_slot as u128
+                || (index == 0 && target_changed && step.price_move_remainder_before_bps_num != 0)
+                || step.price_move_remainder_before_bps_num != expected_remainder
+            {
+                return Err(V16Error::InvalidConfig);
+            }
+            let exposed = asset.oi_eff_long_q != 0 || asset.oi_eff_short_q != 0;
+            let (expected_price, remainder_after) = canonical_accrual_price_step_v16(
+                asset.effective_price,
+                raw_oracle_target_price,
+                price_cap_anchor,
+                config.max_price_move_bps_per_slot,
+                exposed,
+                step.price_move_remainder_before_bps_num,
+            )?;
+            if step.effective_price != expected_price
+                || step.price_move_remainder_after_bps_num != remainder_after
+            {
+                return Err(V16Error::InvalidConfig);
+            }
+            expected_remainder = remainder_after;
+            let activity = V16Core::accrual_activity_for_asset_segment(
+                asset,
+                1,
+                step.effective_price,
+                step.funding_rate_e9,
+            );
+            if activity.equity_active && !protective_progress_committed {
+                return Err(V16Error::NonProgress);
+            }
+
+            let price_delta = step.effective_price as i128 - asset.effective_price as i128;
+            let funding_index_delta = if activity.funding_active {
+                let n = step
+                    .funding_rate_e9
+                    .checked_mul(step.effective_price as i128)
+                    .ok_or(V16Error::ArithmeticOverflow)?;
+                floor_div_signed_conservative_i128(n, FUNDING_DEN)
+            } else {
+                0
+            };
+            let (k_delta_long, k_delta_short, funding_delta_long, funding_delta_short) =
+                V16Core::kernel_adl_scaled_accrual_index_deltas(
+                    price_delta,
+                    funding_index_delta,
+                    asset.a_long,
+                    asset.a_short,
+                )?;
+
+            asset.k_long = add_non_min_i128(asset.k_long, k_delta_long)?;
+            asset.k_short = add_non_min_i128(asset.k_short, k_delta_short)?;
+            asset.f_long_num = add_non_min_i128(asset.f_long_num, funding_delta_long)?;
+            asset.f_short_num = add_non_min_i128(asset.f_short_num, funding_delta_short)?;
+            asset.effective_price = step.effective_price;
+            asset.slot_last = asset
+                .slot_last
+                .checked_add(1)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            price_move_count = price_move_count
+                .checked_add(u64::from(activity.price_move_active))
+                .ok_or(V16Error::CounterOverflow)?;
+            funding_count = funding_count
+                .checked_add(u64::from(activity.funding_active))
+                .ok_or(V16Error::CounterOverflow)?;
+        }
+
+        if asset.effective_price == raw_oracle_target_price {
+            asset.fund_px_last = asset.effective_price;
+        }
+
+        let long_kf_changed = asset.k_long != k_long_before || asset.f_long_num != f_long_before;
+        let short_kf_changed =
+            asset.k_short != k_short_before || asset.f_short_num != f_short_before;
+        asset = V16Core::kernel_mark_kf_stale_cohorts(
+            asset,
+            long_kf_changed,
+            short_kf_changed,
+            asset.slot_last,
+        )?;
+        asset.raw_oracle_target_price = raw_oracle_target_price;
+        self.set_asset_state(asset_index, asset)?;
+        self.header.current_slot = V16PodU64::new(now_slot);
+        self.header.slot_last = V16PodU64::new(asset.slot_last);
+        let loss_stale_after = asset_is_loss_stale_at_slot(asset, now_slot);
+        self.header.loss_stale_active = encode_bool(loss_stale_after);
+        self.header.oracle_epoch = V16PodU64::new(
+            self.header
+                .oracle_epoch
+                .get()
+                .checked_add(price_move_count)
+                .and_then(|value| value.checked_add(u64::from(target_changed)))
+                .ok_or(V16Error::CounterOverflow)?,
+        );
+        self.header.funding_epoch = V16PodU64::new(
+            self.header
+                .funding_epoch
+                .get()
+                .checked_add(funding_count)
+                .ok_or(V16Error::CounterOverflow)?,
+        );
+        self.validate_shape_audit_scan()?;
+        Ok(AccrueAssetOutcomeV16 {
+            dt: expected_steps_u64,
+            price_move_active: price_move_count != 0,
+            funding_active: funding_count != 0,
+            equity_active: price_move_count != 0 || funding_count != 0,
             loss_stale_after,
         })
     }

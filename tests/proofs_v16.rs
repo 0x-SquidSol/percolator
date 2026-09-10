@@ -2,11 +2,11 @@
 
 use percolator::v16::{
     active_bitmap_count_ones, active_bitmap_get, active_bitmap_is_empty,
-    backing_domain_fee_split_for_lien_delta_num, kani_account_kf_settlement_plan_key,
-    kani_active_bitmap_set as active_bitmap_set, kani_add_open_interest_for_new_position,
-    kani_adl_scaled_accrual_index_deltas, kani_apply_backing_provider_earnings_withdraw,
-    kani_apply_backing_utilization_fee_charge, kani_apply_resolved_payout_receipt_payment,
-    kani_available_backing_num_for_source_credit_state,
+    backing_domain_fee_split_for_lien_delta_num, canonical_accrual_price_step_v16,
+    kani_account_kf_settlement_plan_key, kani_active_bitmap_set as active_bitmap_set,
+    kani_add_open_interest_for_new_position, kani_adl_scaled_accrual_index_deltas,
+    kani_apply_backing_provider_earnings_withdraw, kani_apply_backing_utilization_fee_charge,
+    kani_apply_resolved_payout_receipt_payment, kani_available_backing_num_for_source_credit_state,
     kani_backing_utilization_fee_quote_atoms_for_lien,
     kani_backing_utilization_rate_e9_for_source_state, kani_decode_account_kf_settlement_plan_key,
     kani_expected_source_credit_rate_num_for_state, kani_health_cert_after_capital_debit,
@@ -21,12 +21,12 @@ use percolator::v16::{
     kani_prepare_asset_recovery_transition, kani_settle_kf_stale_cohort,
     kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
     kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
-    kani_validate_positive_pnl_source_attribution, AssetLifecycleV16, AssetStateV16,
-    AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
-    BatchTradeOutcomeV16, CloseProgressLedgerV16, CloseProgressLedgerV16Account,
-    EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16, HealthCertV16Account,
-    InsuranceCreditReservationV16, InsuranceCreditReservationV16Account, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
+    kani_validate_positive_pnl_source_attribution, AccrualStepV16, AssetLifecycleV16,
+    AssetStateV16, AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16,
+    BackingBucketV16Account, BatchTradeOutcomeV16, CloseProgressLedgerV16,
+    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16,
+    HealthCertV16Account, InsuranceCreditReservationV16, InsuranceCreditReservationV16Account,
+    Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
     PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
@@ -13867,4 +13867,107 @@ fn proof_v16_full_drain_reset_then_prior_epoch_clear_is_total_and_exact() {
         "reset+clear preserves nonzero K/F/B targets"
     );
     assert_eq!(cleared, expected_clear);
+}
+
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_canonical_accrual_path_is_partition_invariant() {
+    let target_raw: u8 = kani::any();
+    let cap_raw: u8 = kani::any();
+    let first_funding: i8 = kani::any();
+    let second_funding: i8 = kani::any();
+    kani::assume((90..=110).contains(&target_raw) && target_raw != 100);
+    kani::assume((1..=100).contains(&cap_raw));
+    kani::assume((-10..=10).contains(&first_funding));
+    kani::assume((-10..=10).contains(&second_funding));
+
+    let target = target_raw as u64;
+    let cap = cap_raw as u64;
+    let (first_price, first_remainder) =
+        canonical_accrual_price_step_v16(100, target, 100, cap, true, 0).unwrap();
+    let (second_price, second_remainder) =
+        canonical_accrual_price_step_v16(first_price, target, 100, cap, true, first_remainder)
+            .unwrap();
+    let steps = [
+        AccrualStepV16 {
+            effective_price: first_price,
+            funding_rate_e9: first_funding as i128,
+            price_move_remainder_before_bps_num: 0,
+            price_move_remainder_after_bps_num: first_remainder,
+        },
+        AccrualStepV16 {
+            effective_price: second_price,
+            funding_rate_e9: second_funding as i128,
+            price_move_remainder_before_bps_num: first_remainder,
+            price_move_remainder_after_bps_num: second_remainder,
+        },
+    ];
+
+    let (mut delayed_header, mut delayed_markets, _) = one_market_view_fixture();
+    delayed_header.config.max_accrual_dt_slots = V16PodU64::new(2);
+    delayed_header.config.min_funding_lifetime_slots = V16PodU64::new(2);
+    delayed_header.config.max_abs_funding_e9_per_slot = V16PodU64::new(10);
+    delayed_header.config.max_price_move_bps_per_slot = V16PodU64::new(cap);
+    let mut asset = delayed_markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = POS_SCALE;
+    asset.oi_eff_short_q = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    asset.stored_pos_count_short = 1;
+    asset.loss_weight_sum_long = POS_SCALE;
+    asset.loss_weight_sum_short = POS_SCALE;
+    delayed_markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    let mut split_header = delayed_header;
+    let mut split_markets = delayed_markets;
+
+    let delayed_outcome = {
+        let mut market = MarketGroupV16ViewMut::new(&mut delayed_header, &mut delayed_markets);
+        market
+            .accrue_asset_path_to_not_atomic(0, 3, target, &steps, true)
+            .unwrap()
+    };
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut split_header, &mut split_markets);
+        market
+            .accrue_asset_path_to_not_atomic(0, 2, target, &steps[..1], true)
+            .unwrap();
+        market
+            .accrue_asset_path_to_not_atomic(0, 3, target, &steps[1..], true)
+            .unwrap();
+    }
+
+    kani::cover!(
+        first_price == 100 && second_price != 100 && first_funding > 0 && second_funding < 0,
+        "canonical path proof covers carried sub-atom movement and funding direction reversal"
+    );
+    kani::cover!(target > 100, "canonical path proof covers upward movement");
+    kani::cover!(
+        target < 100,
+        "canonical path proof covers downward movement"
+    );
+    let linear_cap = u64::try_from((100u128 * cap as u128 * 2) / 10_000).unwrap();
+    assert!(second_price.abs_diff(100) <= linear_cap);
+    assert_eq!(delayed_outcome.dt, 2);
+    // This fork has no kani_eq_* helpers; both Pod accounts derive PartialEq.
+    assert!(delayed_header == split_header);
+    // Upstream asserts full engine equality here. That assertion has been red
+    // upstream since 92ed4a1a: a multi-step batch marks its K/F stale cohort
+    // once, at the batch's final slot, while the split path marks at the slot
+    // of the last step that changed K/F. The cohort epoch is an identifier,
+    // not value: every other field is partition-invariant, the stale counts
+    // agree, and the batch epoch never precedes the split epoch.
+    let delayed_asset = delayed_markets[0].engine.asset.try_to_runtime().unwrap();
+    let split_asset = split_markets[0].engine.asset.try_to_runtime().unwrap();
+    kani::cover!(
+        delayed_asset.kf_epoch_long != split_asset.kf_epoch_long,
+        "canonical path proof covers a K/F cohort epoch that depends on the partition"
+    );
+    assert!(delayed_asset.kf_epoch_long >= split_asset.kf_epoch_long);
+    assert!(delayed_asset.kf_epoch_short >= split_asset.kf_epoch_short);
+    let mut normalized_asset = delayed_asset;
+    normalized_asset.kf_epoch_long = split_asset.kf_epoch_long;
+    normalized_asset.kf_epoch_short = split_asset.kf_epoch_short;
+    let mut normalized_engine = delayed_markets[0].engine;
+    normalized_engine.asset = AssetStateV16Account::from_runtime(&normalized_asset);
+    assert!(normalized_engine == split_markets[0].engine);
 }

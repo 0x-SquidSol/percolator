@@ -1,4 +1,5 @@
 use percolator::active_bitmap_is_empty;
+use percolator::{canonical_accrual_price_step_v16, AccrualStepV16};
 use percolator::{
     v16_domain_count_for_market_slots, AssetLifecycleV16, AssetStateV16Account,
     BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, CloseProgressLedgerV16,
@@ -67,6 +68,44 @@ fn funding_market_fixture(init_price: u64) -> (MarketGroupV16HeaderAccount, Vec<
         view.validate_shape().unwrap();
     }
     (header, markets)
+}
+
+fn canonical_path_market_fixture(
+    init_price: u64,
+) -> (MarketGroupV16HeaderAccount, Vec<Market<u64>>) {
+    let (market_id, _, _) = ids();
+    let mut cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    cfg.max_accrual_dt_slots = 10;
+    cfg.min_funding_lifetime_slots = 10;
+    cfg.max_abs_funding_e9_per_slot = 10_000;
+    cfg.max_price_move_bps_per_slot = 100;
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id, cfg, 1, 0).unwrap();
+    let mut markets = vec![Market::new(0, EngineAssetSlotV16Account::default())];
+    header
+        .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, init_price, 1)
+        .unwrap();
+    (header, markets)
+}
+
+fn canonical_up_path(mut price: u64, count: usize) -> (u64, Vec<AccrualStepV16>) {
+    let target = price.checked_mul(2).unwrap();
+    let cap_anchor = price;
+    let mut remainder = 0;
+    let steps = (0..count)
+        .map(|index| {
+            let remainder_before = remainder;
+            (price, remainder) =
+                canonical_accrual_price_step_v16(price, target, cap_anchor, 100, true, remainder)
+                    .unwrap();
+            AccrualStepV16 {
+                effective_price: price,
+                funding_rate_e9: if index % 2 == 0 { 10_000 } else { -7_500 },
+                price_move_remainder_before_bps_num: remainder_before,
+                price_move_remainder_after_bps_num: remainder,
+            }
+        })
+        .collect();
+    (target, steps)
 }
 
 fn account_fixture(market_slots: u32, account_seed: u8) -> PortfolioAccountV16Account {
@@ -483,6 +522,326 @@ fn market_fixture_with_trade_fee(
         view.validate_shape().unwrap();
     }
     (header, markets)
+}
+
+#[test]
+fn v16_canonical_accrual_path_matches_every_complete_transaction_partition() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    let (target, steps) = canonical_up_path(INITIAL_PRICE, 10);
+    assert_eq!(target, 2_000_000);
+    assert_eq!(steps.last().unwrap().effective_price, 1_100_000);
+
+    let run = |fragmented: bool| {
+        let (mut header, mut markets) = canonical_path_market_fixture(INITIAL_PRICE);
+        let mut long_account = account_fixture(1, 41);
+        let mut short_account = account_fixture(1, 42);
+        {
+            let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+            let mut long = PortfolioV16ViewMut::new(&mut long_account);
+            let mut short = PortfolioV16ViewMut::new(&mut short_account);
+            open_one_lot_pair(&mut market, &mut long, &mut short);
+
+            if fragmented {
+                for (index, step) in steps.iter().enumerate() {
+                    let now_slot = u64::try_from(index + 2).unwrap();
+                    let outcome = market
+                        .accrue_asset_path_to_not_atomic(
+                            0,
+                            now_slot,
+                            target,
+                            core::slice::from_ref(step),
+                            true,
+                        )
+                        .unwrap();
+                    assert_eq!(outcome.dt, 1);
+                }
+            } else {
+                let outcome = market
+                    .accrue_asset_path_to_not_atomic(0, 11, target, &steps, true)
+                    .unwrap();
+                assert_eq!(outcome.dt, 10);
+            }
+        }
+        (header, markets.remove(0).engine.asset)
+    };
+
+    let (fragmented_header, fragmented_asset) = run(true);
+    let (delayed_header, delayed_asset) = run(false);
+    assert_eq!(delayed_asset, fragmented_asset);
+    assert_eq!(delayed_asset.effective_price.get(), 1_100_000);
+    assert_eq!(delayed_asset.fund_px_last.get(), INITIAL_PRICE);
+    assert_eq!(delayed_header.current_slot, fragmented_header.current_slot);
+    assert_eq!(delayed_header.slot_last, fragmented_header.slot_last);
+    assert_eq!(delayed_header.oracle_epoch, fragmented_header.oracle_epoch);
+    assert_eq!(
+        delayed_header.funding_epoch,
+        fragmented_header.funding_epoch
+    );
+    assert_eq!(
+        delayed_header.loss_stale_active,
+        fragmented_header.loss_stale_active
+    );
+}
+
+#[test]
+fn v16_canonical_accrual_path_requires_the_complete_bounded_prefix() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    let (target, steps) = canonical_up_path(INITIAL_PRICE, 10);
+    let (mut header, mut markets) = canonical_path_market_fixture(INITIAL_PRICE);
+    let mut long_account = account_fixture(1, 43);
+    let mut short_account = account_fixture(1, 44);
+    let before_header;
+    let before_asset;
+    let result;
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_account);
+        let mut short = PortfolioV16ViewMut::new(&mut short_account);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        before_header = *market.header;
+        before_asset = market.markets[0].engine.asset;
+        result = market.accrue_asset_path_to_not_atomic(0, 11, target, &steps[..9], true);
+    }
+
+    assert_eq!(result, Err(V16Error::InvalidConfig));
+    assert_eq!(header, before_header);
+    assert_eq!(markets[0].engine.asset, before_asset);
+}
+
+#[test]
+fn v16_canonical_accrual_path_bounds_long_gap_work_and_remains_actionable() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    let (target, steps) = canonical_up_path(INITIAL_PRICE, percolator::V16_MAX_ACCRUAL_PATH_STEPS);
+    let (mut header, mut markets) = canonical_path_market_fixture(INITIAL_PRICE);
+    header.config.max_accrual_dt_slots = V16PodU64::new(64);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(64);
+    let mut long_account = account_fixture(1, 45);
+    let mut short_account = account_fixture(1, 46);
+    let outcome;
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_account);
+        let mut short = PortfolioV16ViewMut::new(&mut short_account);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        outcome = market
+            .accrue_asset_path_to_not_atomic(0, 65, target, &steps, true)
+            .unwrap();
+    }
+
+    assert_eq!(outcome.dt as usize, percolator::V16_MAX_ACCRUAL_PATH_STEPS);
+    assert!(outcome.loss_stale_after);
+    assert_eq!(markets[0].engine.asset.slot_last.get(), 33);
+    assert_eq!(header.current_slot.get(), 65);
+    assert_eq!(header.loss_stale_active, 1);
+}
+
+#[test]
+fn v16_canonical_accrual_path_carries_sub_atom_price_progress_across_calls() {
+    let mut price = 100;
+    let mut remainder = 0;
+    let mut steps = Vec::new();
+    for _ in 0..5 {
+        let before = remainder;
+        (price, remainder) =
+            canonical_accrual_price_step_v16(price, 200, 100, 20, true, remainder).unwrap();
+        steps.push(AccrualStepV16 {
+            effective_price: price,
+            funding_rate_e9: 0,
+            price_move_remainder_before_bps_num: before,
+            price_move_remainder_after_bps_num: remainder,
+        });
+    }
+    assert_eq!(price, 101);
+    assert_eq!(remainder, 0);
+
+    let run = |fragmented: bool| {
+        let (mut header, mut markets) = canonical_path_market_fixture(100);
+        header.config.max_accrual_dt_slots = V16PodU64::new(5);
+        header.config.min_funding_lifetime_slots = V16PodU64::new(5);
+        header.config.max_price_move_bps_per_slot = V16PodU64::new(20);
+        let mut long_account = account_fixture(1, 47);
+        let mut short_account = account_fixture(1, 48);
+        {
+            let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+            let mut long = PortfolioV16ViewMut::new(&mut long_account);
+            let mut short = PortfolioV16ViewMut::new(&mut short_account);
+            open_one_lot_pair(&mut market, &mut long, &mut short);
+            if fragmented {
+                for (index, step) in steps.iter().enumerate() {
+                    market
+                        .accrue_asset_path_to_not_atomic(
+                            0,
+                            u64::try_from(index + 2).unwrap(),
+                            200,
+                            core::slice::from_ref(step),
+                            true,
+                        )
+                        .unwrap();
+                }
+            } else {
+                market
+                    .accrue_asset_path_to_not_atomic(0, 6, 200, &steps, true)
+                    .unwrap();
+            }
+        }
+        (header, markets.remove(0).engine.asset)
+    };
+
+    assert_eq!(run(false), run(true));
+}
+
+/// 149cfe56 hunk without an upstream test: a funding-only accrual at an unchanged
+/// effective price must leave `fund_px_last`, the canonical path's price-cap anchor,
+/// where the active trajectory put it, so the next canonical step is computed from
+/// the same anchor whether or not the funding accrual happened in between.
+#[test]
+fn v16_zero_move_funding_accrual_preserves_canonical_price_anchor() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    const STEP_ATOMS: u64 = INITIAL_PRICE / 100;
+    let (target, steps) = canonical_up_path(INITIAL_PRICE, 1);
+    let (mut header, mut markets) = canonical_path_market_fixture(INITIAL_PRICE);
+    let mut long_account = account_fixture(1, 61);
+    let mut short_account = account_fixture(1, 62);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_account);
+        let mut short = PortfolioV16ViewMut::new(&mut short_account);
+        open_one_lot_pair(&mut market, &mut long, &mut short);
+        market
+            .accrue_asset_path_to_not_atomic(0, 2, target, &steps, true)
+            .unwrap();
+    }
+    let after_path = markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(after_path.effective_price, INITIAL_PRICE + STEP_ATOMS);
+    assert_eq!(after_path.fund_px_last, INITIAL_PRICE);
+
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let outcome = market
+            .accrue_asset_to_not_atomic(0, 3, INITIAL_PRICE + STEP_ATOMS, 10_000, true)
+            .unwrap();
+        assert!(outcome.funding_active);
+        assert!(!outcome.price_move_active);
+    }
+    let after_funding = markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_ne!(after_funding.f_long_num, after_path.f_long_num);
+    assert_eq!(after_funding.effective_price, INITIAL_PRICE + STEP_ATOMS);
+    assert_eq!(after_funding.fund_px_last, INITIAL_PRICE);
+
+    let (next_price, next_remainder) = canonical_accrual_price_step_v16(
+        INITIAL_PRICE + STEP_ATOMS,
+        target,
+        INITIAL_PRICE,
+        100,
+        true,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        (next_price, next_remainder),
+        (INITIAL_PRICE + 2 * STEP_ATOMS, 0)
+    );
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market
+            .accrue_asset_path_to_not_atomic(
+                0,
+                4,
+                target,
+                &[AccrualStepV16 {
+                    effective_price: next_price,
+                    funding_rate_e9: 0,
+                    price_move_remainder_before_bps_num: 0,
+                    price_move_remainder_after_bps_num: next_remainder,
+                }],
+                true,
+            )
+            .unwrap();
+    }
+    let after_next = markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(after_next.effective_price, INITIAL_PRICE + 2 * STEP_ATOMS);
+    assert_eq!(after_next.fund_px_last, INITIAL_PRICE);
+}
+
+#[test]
+fn v16_canonical_accrual_path_rejects_discontinuous_remainder_before_mutation() {
+    let (mut header, mut markets) = canonical_path_market_fixture(100);
+    header.config.max_accrual_dt_slots = V16PodU64::new(2);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(2);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(20);
+    let steps = [
+        AccrualStepV16 {
+            effective_price: 100,
+            funding_rate_e9: 0,
+            price_move_remainder_before_bps_num: 0,
+            price_move_remainder_after_bps_num: 2_000,
+        },
+        AccrualStepV16 {
+            effective_price: 100,
+            funding_rate_e9: 0,
+            price_move_remainder_before_bps_num: 1_999,
+            price_move_remainder_after_bps_num: 4_000,
+        },
+    ];
+    let before_header = header;
+    let before_asset = markets[0].engine.asset;
+    let result = MarketGroupV16ViewMut::new(&mut header, &mut markets)
+        .accrue_asset_path_to_not_atomic(0, 3, 200, &steps, true);
+    assert_eq!(result, Err(V16Error::InvalidConfig));
+    assert_eq!(header, before_header);
+    assert_eq!(markets[0].engine.asset, before_asset);
+}
+
+#[test]
+fn v16_canonical_accrual_path_scales_indices_after_quantity_adl() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    let (target, steps) = canonical_up_path(INITIAL_PRICE, 1);
+    let step = steps[0];
+    let (mut header, mut markets) = canonical_path_market_fixture(INITIAL_PRICE);
+    let mut long_header = account_fixture(1, 225);
+    let mut short_header = account_fixture(1, 226);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        market.deposit_not_atomic(&mut long, 100_000_000).unwrap();
+        market.deposit_not_atomic(&mut short, 100_000_000).unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(4 * POS_SCALE),
+                    exec_price: INITIAL_PRICE,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+        market
+            .rebalance_reduce_position_not_atomic(
+                &mut long,
+                RebalanceRequestV16 {
+                    asset_index: 0,
+                    reduce_q: POS_SCALE,
+                },
+            )
+            .unwrap();
+        market
+            .accrue_asset_path_to_not_atomic(0, 2, target, &steps, true)
+            .unwrap();
+    }
+
+    let asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    let a_short = ADL_ONE * 3 / 4;
+    let price_delta = i128::from(step.effective_price - INITIAL_PRICE);
+    let funding_index_delta = FUNDING_COUNTER_ATOMS_PER_SLOT as i128;
+    assert_eq!(asset.a_short, a_short);
+    assert_eq!(asset.k_long, price_delta * ADL_ONE as i128);
+    assert_eq!(asset.k_short, -(price_delta * a_short as i128));
+    assert_eq!(asset.f_long_num, -(funding_index_delta * ADL_ONE as i128));
+    assert_eq!(asset.f_short_num, funding_index_delta * a_short as i128);
 }
 
 #[test]
