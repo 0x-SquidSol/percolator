@@ -2187,15 +2187,42 @@ fn v16_recovery_forfeit_retains_loss_weight_until_opposite_positions_settle() {
     }
 
     {
-        // Upstream clears the released zero-basis obligation through the
-        // self-classifying auto-crank (Stage D). This fork has no such plan yet;
-        // a second Recovery forfeit reaches the same release path.
+        let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market.header.mode = 2;
+        market.header.recovery_reason = V16OptionalRecoveryReasonAccount::from_runtime(Some(
+            PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+        ));
+        market.validate_shape().unwrap();
+    }
+
+    {
+        // #189 adapted this block to a second Recovery forfeit, because the fork
+        // had no self-classifying crank to reach the release path. Stage D now
+        // carries one, so the adaptation is retired and upstream's own form runs:
+        // a market in global Recovery clears the released obligation FIRST, and
+        // only then finalizes into Resolved.
         let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
         let mut first = PortfolioV16ViewMut::new(&mut first_header);
-        let outcome = market
-            .forfeit_recovery_leg_not_atomic(&mut first, 0, u128::MAX)
-            .expect("released zero-basis obligation must clear once the opposite side is empty");
-        assert!(outcome.detached);
+        let result = market
+            .permissionless_auto_crank_not_atomic(
+                &mut first,
+                AutoCrankWorkV16 {
+                    now_slot: 2,
+                    observations: &[],
+                    resolved_close_fee_rate_per_slot: 0,
+                },
+            )
+            .expect("global Recovery must first clear a released zero-basis obligation");
+        assert_eq!(
+            result.selected,
+            AutoCrankPlanV16::RefreshAccount {
+                asset_index: Some(0)
+            }
+        );
+        assert_eq!(
+            result.outcome,
+            AutoCrankOutcomeV16::Progressed(PermissionlessProgressOutcomeV16::AccountCurrent)
+        );
         assert!(active_bitmap_is_empty(
             first.header.active_bitmap.map(V16PodU64::get)
         ));
@@ -2204,6 +2231,21 @@ fn v16_recovery_forfeit_retains_loss_weight_until_opposite_positions_settle() {
         assert_eq!(asset.pending_obligation_count_short, 0);
         assert_eq!(asset.loss_weight_sum_long, 0);
         assert_eq!(asset.loss_weight_sum_short, 0);
+        market.validate_shape().unwrap();
+        first.validate_with_market(&market.as_view()).unwrap();
+
+        let finalized = market
+            .permissionless_auto_crank_not_atomic(
+                &mut first,
+                AutoCrankWorkV16 {
+                    now_slot: 2,
+                    observations: &[],
+                    resolved_close_fee_rate_per_slot: 0,
+                },
+            )
+            .expect("the next public crank must finalize Recovery");
+        assert_eq!(finalized.selected, AutoCrankPlanV16::FinalizeRecovery);
+        assert_eq!(finalized.outcome, AutoCrankOutcomeV16::RecoveryResolved);
         market.validate_shape().unwrap();
         first.validate_with_market(&market.as_view()).unwrap();
     }

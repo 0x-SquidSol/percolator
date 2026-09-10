@@ -12570,6 +12570,26 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // non-Recover action outside Live.
         if decode_market_mode(self.header.mode)? == MarketModeV16::Recovery {
             account.validate_with_market(&self.as_view())?;
+            // Finalizing Recovery is irreversible, so any obligation this account
+            // still holds that is ALREADY cured must be released first. Resolving
+            // over it would strand the leg on the far side of the transition.
+            let released_obligation_asset = self.auto_crank_selected_assets(&account.as_view())?.4;
+            if let Some(asset_index) = released_obligation_asset {
+                if self.released_obligation_is_current(&account.as_view(), asset_index)? {
+                    self.validate_unconfigured_market_tail()?;
+                    self.clear_leg(account, asset_index)?;
+                    self.validate_shape_audit_scan()?;
+                    account.validate_with_market(&self.as_view())?;
+                    return Ok(AutoCrankResultV16 {
+                        selected: AutoCrankPlanV16::RefreshAccount {
+                            asset_index: Some(asset_index),
+                        },
+                        outcome: AutoCrankOutcomeV16::Progressed(
+                            PermissionlessProgressOutcomeV16::AccountCurrent,
+                        ),
+                    });
+                }
+            }
             self.resolve_market_not_atomic(work.now_slot)?;
             account.validate_with_market(&self.as_view())?;
             return Ok(AutoCrankResultV16 {
