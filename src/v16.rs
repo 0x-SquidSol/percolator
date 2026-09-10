@@ -12470,7 +12470,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     && !leg.b_stale
                     && leg.basis_pos_q == 0
                     && leg.loss_weight != 0
-                    && !self.has_pending_domain_loss_barrier(leg.asset_index as usize, leg.side)?;
+                    && !self.has_pending_domain_loss_barrier(leg.asset_index as usize, leg.side)?
+                    && self.recovery_pending_obligation_release_allowed(
+                        leg.asset_index as usize,
+                        leg.side,
+                    )?;
             }
             slot += 1;
         }

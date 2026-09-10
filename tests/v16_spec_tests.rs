@@ -5913,6 +5913,93 @@ fn v16_auto_crank_releases_current_flat_pending_obligations_on_both_sides() {
     }
 }
 
+// A Recovery obligation may only be released once the OPPOSITE side holds no
+// real (non-obligation) positions -- otherwise the loss weight it carries is
+// still needed to absorb that side's settlement. 6d70fdbe established this rule;
+// this pins the auto-crank selector against it, which is the one place the rule
+// was missing when the released-obligation signal was introduced.
+#[test]
+fn v16_auto_crank_retains_released_obligation_while_the_opposite_side_is_live() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 26);
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.lifecycle = AssetLifecycleV16::Recovery;
+    // The obligation is on the short side; the LONG side still holds one real
+    // position (stored 1, pending 0), so release must wait.
+    asset.stored_pos_count_short = 1;
+    asset.pending_obligation_count_short = 1;
+    asset.loss_weight_sum_short = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    asset.pending_obligation_count_long = 0;
+    asset.loss_weight_sum_long = POS_SCALE;
+    asset.oi_eff_long_q = POS_SCALE;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    header.resolved_payout_blocker_count = V16PodU64::new(1);
+    header.materialized_portfolio_count = V16PodU64::new(1);
+
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Short,
+        basis_pos_q: 0,
+        a_basis: ADL_ONE,
+        k_snap: asset.k_short,
+        f_snap: asset.f_short_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_short,
+        loss_weight: POS_SCALE,
+        b_snap: asset.b_short_num,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_short,
+        b_stale: false,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+    account_header.health_cert = HealthCertV16Account::from_runtime(&HealthCertV16 {
+        cert_oracle_epoch: header.oracle_epoch.get(),
+        cert_funding_epoch: header.funding_epoch.get(),
+        cert_risk_epoch: header.risk_epoch.get(),
+        cert_asset_set_epoch: header.asset_set_epoch.get(),
+        active_bitmap_at_cert: account_header.active_bitmap.map(V16PodU64::get),
+        valid: true,
+        ..HealthCertV16::default()
+    });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+
+    // The selector must NOT offer this obligation, so the account is not stale on
+    // its account: nothing here is releasable yet.
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        !summary.stale,
+        "an obligation whose opposite side is still live is not releasable: {summary:?}"
+    );
+
+    let result = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: market.header.current_slot.get(),
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(result.selected, AutoCrankPlanV16::NoAction);
+    // The leg, its loss weight and every counter it holds open must survive.
+    assert_eq!(account.header.active_bitmap[0].get(), 1);
+    let after = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(after.pending_obligation_count_short, 1);
+    assert_eq!(after.loss_weight_sum_short, POS_SCALE);
+    assert_eq!(market.header.resolved_payout_blocker_count.get(), 1);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
 #[test]
 fn v16_auto_crank_drives_stale_underwater_account_to_derisked_fixed_point() {
     let (mut header, mut markets) = market_fixture(2, 100);
