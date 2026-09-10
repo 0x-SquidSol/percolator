@@ -818,6 +818,10 @@ saturates and never creates payout capacity. Remainder, dust, and explicit-loss
 audit fields remain durable while the asset has any live economic obligation.
 An otherwise empty asset may clear only those inert fields atomically with
 retirement so historical rounding cannot permanently block terminal progress.
+After every source claim, provider receivable, backing amount, lien, and insurance
+reservation is zero, cumulative `spent_backing_num` is likewise audit-only and is
+cleared atomically with retirement. A nonzero provider receivable or consumed backing
+remains a hard retirement blocker.
 
 `finalize_side_reset(side)` requires `ResetPending`, zero OI, zero stale count, and zero stored position count, then sets mode to `Normal`.
 
