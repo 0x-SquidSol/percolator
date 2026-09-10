@@ -10125,7 +10125,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Err(V16Error::LockActive)
     }
 
-    #[cfg(kani)]
+    #[cfg(any(kani, feature = "fuzz"))]
     pub fn kani_create_initial_margin_source_lien_if_needed(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -10370,6 +10370,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         principal_atoms: u128,
     ) -> V16Result<u128> {
         Self::transfer_account_residual_reward_credit(trader, lp, principal_atoms)
+    }
+
+    #[cfg(any(kani, feature = "fuzz"))]
+    pub fn kani_settle_account_b_chunk(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        endpoint_delta_budget: u128,
+    ) -> V16Result<AccountBSettlementChunkV16> {
+        self.settle_account_b_chunk(account, asset_index, endpoint_delta_budget)
     }
 
     #[cfg(any(kani, feature = "fuzz"))]
