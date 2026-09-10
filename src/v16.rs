@@ -1413,6 +1413,25 @@ impl V16Core {
         Ok((required_face_num, required_backing_num))
     }
 
+    /// PRODUCTION KERNEL: the certificate-currentness predicate. A certificate
+    /// is current when it is valid, every epoch it was taken under still matches
+    /// the market, and the account's active-leg bitmap has not changed since.
+    pub(crate) fn kernel_cert_is_current(
+        cert: HealthCertV16,
+        oracle_epoch: u64,
+        funding_epoch: u64,
+        risk_epoch: u64,
+        asset_set_epoch: u64,
+        account_bitmap: V16ActiveBitmap,
+    ) -> bool {
+        cert.valid
+            && cert.cert_oracle_epoch == oracle_epoch
+            && cert.cert_funding_epoch == funding_epoch
+            && cert.cert_risk_epoch == risk_epoch
+            && cert.cert_asset_set_epoch == asset_set_epoch
+            && cert.active_bitmap_at_cert == account_bitmap
+    }
+
     #[inline]
     fn validate_bound_num_atom_aligned(bound_num: u128) -> V16Result<()> {
         if bound_num == 0 {
@@ -2252,6 +2271,25 @@ pub fn kani_available_backing_num_for_source_credit_state(
     state: SourceCreditStateV16,
 ) -> V16Result<u128> {
     V16Core::available_backing_num_for_source_credit_state(state)
+}
+
+#[cfg(kani)]
+pub fn kani_kernel_cert_is_current(
+    cert: HealthCertV16,
+    oracle_epoch: u64,
+    funding_epoch: u64,
+    risk_epoch: u64,
+    asset_set_epoch: u64,
+    account_bitmap: V16ActiveBitmap,
+) -> bool {
+    V16Core::kernel_cert_is_current(
+        cert,
+        oracle_epoch,
+        funding_epoch,
+        risk_epoch,
+        asset_set_epoch,
+        account_bitmap,
+    )
 }
 
 #[cfg(kani)]
@@ -12305,13 +12343,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account: &PortfolioV16View<'_>,
     ) -> V16Result<()> {
         let cert = account.header.health_cert.try_to_runtime()?;
-        if !cert.valid
-            || cert.cert_oracle_epoch != self.header.oracle_epoch.get()
-            || cert.cert_funding_epoch != self.header.funding_epoch.get()
-            || cert.cert_risk_epoch != self.header.risk_epoch.get()
-            || cert.cert_asset_set_epoch != self.header.asset_set_epoch.get()
-            || cert.active_bitmap_at_cert != account.header.active_bitmap.map(V16PodU64::get)
-        {
+        if !V16Core::kernel_cert_is_current(
+            cert,
+            self.header.oracle_epoch.get(),
+            self.header.funding_epoch.get(),
+            self.header.risk_epoch.get(),
+            self.header.asset_set_epoch.get(),
+            account.header.active_bitmap.map(V16PodU64::get),
+        ) {
             return Err(V16Error::Stale);
         }
         Ok(())

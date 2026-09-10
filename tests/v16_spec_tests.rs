@@ -5650,3 +5650,36 @@ fn direct_live_lien_release_leaves_a_certificate_the_conversion_can_use() {
          certificate that release retired"
     );
 }
+
+/// Nothing in the suite pinned the risk-epoch term of the certificate-currency
+/// gate: dropping it from the kernel left every test green. This pins it at the
+/// production entry point, where a certificate that is current in every other
+/// respect but was taken under an older risk epoch must be refused as Stale.
+#[test]
+fn v16_favorable_action_rejects_a_certificate_stale_on_the_risk_epoch_alone() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 91);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
+        market.deposit_not_atomic(&mut account, 1_000).unwrap();
+        market
+            .full_account_refresh_not_atomic(&mut account)
+            .unwrap();
+    }
+    let mut cert = account_header.health_cert.try_to_runtime().unwrap();
+    assert!(
+        cert.valid,
+        "the fixture must start from a valid certificate"
+    );
+    assert_eq!(cert.cert_risk_epoch, header.risk_epoch.get());
+    cert.cert_risk_epoch = cert.cert_risk_epoch.wrapping_add(1);
+    account_header.health_cert = HealthCertV16Account::from_runtime(&cert);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    assert_eq!(
+        market.convert_released_pnl_to_capital_not_atomic(&mut account),
+        Err(V16Error::Stale)
+    );
+}

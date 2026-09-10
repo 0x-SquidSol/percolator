@@ -11,7 +11,7 @@ use percolator::v16::{
     kani_backing_utilization_rate_e9_for_source_state, kani_decode_account_kf_settlement_plan_key,
     kani_expected_source_credit_rate_num_for_state, kani_health_cert_after_capital_debit,
     kani_health_requirements_from_base_and_target_lag,
-    kani_insert_account_kf_settlement_plan_entry,
+    kani_insert_account_kf_settlement_plan_entry, kani_kernel_cert_is_current,
     kani_liquidation_close_would_leave_uncovered_loss_with_open_risk,
     kani_liquidation_engine_close_request_q, kani_liquidation_fee_from_raw_fee,
     kani_liquidation_partial_search_hi, kani_liquidation_projected_healthy_after_close,
@@ -13867,4 +13867,60 @@ fn proof_v16_full_drain_reset_then_prior_epoch_clear_is_total_and_exact() {
         "reset+clear preserves nonzero K/F/B targets"
     );
     assert_eq!(cleared, expected_clear);
+}
+
+// Upstream ships 3d5bba62's coverage as a CONTRACT proof
+// (contract_check_kernel_cert_is_current), which needs the `contracts` feature
+// this fork does not carry. This is the plain-Kani equivalent over the same
+// full domain: the predicate is exactly valid && all four epochs match && the
+// active-leg bitmap matches, which is the decision
+// ensure_favorable_action_current_certificate makes.
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::solver(cadical)]
+fn proof_v16_cert_is_current_matches_the_favorable_action_gate() {
+    let cert = HealthCertV16 {
+        certified_equity: kani::any(),
+        certified_initial_req: kani::any(),
+        certified_maintenance_req: kani::any(),
+        certified_liq_deficit: kani::any(),
+        certified_worst_case_loss: kani::any(),
+        cert_oracle_epoch: kani::any(),
+        cert_funding_epoch: kani::any(),
+        cert_risk_epoch: kani::any(),
+        cert_asset_set_epoch: kani::any(),
+        active_bitmap_at_cert: kani::any(),
+        valid: kani::any(),
+    };
+    let oracle_epoch: u64 = kani::any();
+    let funding_epoch: u64 = kani::any();
+    let risk_epoch: u64 = kani::any();
+    let asset_set_epoch: u64 = kani::any();
+    let bitmap: [u64; V16_ACTIVE_BITMAP_WORDS] = kani::any();
+
+    let current = kani_kernel_cert_is_current(
+        cert,
+        oracle_epoch,
+        funding_epoch,
+        risk_epoch,
+        asset_set_epoch,
+        bitmap,
+    );
+    let expected = cert.valid
+        && cert.cert_oracle_epoch == oracle_epoch
+        && cert.cert_funding_epoch == funding_epoch
+        && cert.cert_risk_epoch == risk_epoch
+        && cert.cert_asset_set_epoch == asset_set_epoch
+        && cert.active_bitmap_at_cert == bitmap;
+
+    kani::cover!(current, "a fully current certificate is reachable");
+    kani::cover!(
+        cert.valid && cert.cert_risk_epoch != risk_epoch,
+        "a valid certificate can be stale on the risk epoch alone"
+    );
+    kani::cover!(
+        cert.valid && cert.active_bitmap_at_cert != bitmap,
+        "a valid certificate can be stale on the leg bitmap alone"
+    );
+    assert_eq!(current, expected);
 }
