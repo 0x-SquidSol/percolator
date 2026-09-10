@@ -4288,6 +4288,80 @@ fn direct_live_lien_release_leaves_a_certificate_the_conversion_can_use() {
     );
 }
 
+// upstream 650e3fdf "Commit recovery for unbookable terminal forfeits" (2026-08-22):
+// when a Recovery-mode owner forfeit leaves a residual that the absorbing side
+// cannot book (capacity 0), the forfeit COMMITS Recovery as a successful
+// transition instead of returning RecoveryRequired. On Solana an Err discards the
+// whole instruction, so the declared mode never persisted and the only path to
+// resolved settlement was unreachable (the dead escalation valve). Fork
+// adaptation: upstream's tail finalizes through permissionless_auto_crank
+// (row 241, not ported); the committed state is asserted directly.
+#[test]
+fn v16_recovery_forfeit_commits_terminal_recovery_when_absorbing_side_is_empty() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 28);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market.force_asset_recovery_not_atomic(0, 2).unwrap();
+    }
+
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = POS_SCALE;
+    asset.loss_weight_sum_long = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    header.negative_pnl_account_count = V16PodU64::new(1);
+    header.resolved_payout_blocker_count = V16PodU64::new(1);
+    account_header.pnl = V16PodI128::new(-5);
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Long,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap: asset.k_long,
+        f_snap: asset.f_long_num,
+        epoch_snap: asset.epoch_long,
+        loss_weight: POS_SCALE,
+        b_snap: asset.b_long_num,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+
+    let outcome = market
+        .forfeit_recovery_leg_not_atomic(&mut account, 0, u128::MAX)
+        .expect("forfeit must commit Recovery instead of returning a rollback-only error");
+    assert!(!outcome.detached);
+    assert_eq!(outcome.residual_booked, 0);
+    assert_eq!(outcome.explicit_loss, 0);
+    assert_eq!(market.header.mode, 2);
+    assert_eq!(
+        market.header.recovery_reason.try_to_runtime().unwrap(),
+        Some(PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress)
+    );
+    assert_eq!(account.header.pnl.get(), -5);
+    assert_eq!(
+        account
+            .header
+            .close_progress
+            .try_to_runtime()
+            .unwrap()
+            .residual_remaining,
+        5
+    );
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
 // upstream f06a04a7 "Keep strict trade reductions open below initial margin"
 // (2026-08-06): an account whose fill is a STRICT reduction of its position on
 // the asset skips the final initial-margin gate (and the IM source-lien /
