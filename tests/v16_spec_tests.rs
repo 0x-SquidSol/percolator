@@ -13,9 +13,7 @@ use percolator::{
     SourceCreditStateV16Account, TradeRequestV16, V16Config, V16Error, V16PodI128, V16PodU128,
     V16PodU32, V16PodU64, V16_EMPTY_ACTIVE_BITMAP,
 };
-use percolator::{
-    ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, MAX_VAULT_TVL, POS_SCALE, SOCIAL_LOSS_DEN,
-};
+use percolator::{ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, POS_SCALE};
 
 const FUNDING_COUNTER_PRICE: u64 = 1_000_000;
 const FUNDING_COUNTER_RATE_E9: i128 = 10_000;
@@ -5651,34 +5649,4 @@ fn direct_live_lien_release_leaves_a_certificate_the_conversion_can_use() {
         "converting straight after a direct release must not be blocked by the \
          certificate that release retired"
     );
-}
-
-/// Concrete twin of upstream's proof_v16_b_settlement_atom_budget_clears_public_scale_gap
-/// (835bb880): the endpoint budget is a collateral-atom budget, converted to a B-index
-/// delta exactly once through loss_weight, so a MAX_VAULT_TVL atom budget clears a
-/// target that a B-delta budget of the same number could not.
-#[test]
-#[cfg(feature = "fuzz")]
-fn v16_b_settlement_atom_budget_clears_public_scale_gap() {
-    const TARGET_B: u128 = 107_486_458_947_473_684_210_526_315;
-    const LOSS_WEIGHT: u128 = 19_000_000;
-    let (mut header, mut markets) = market_fixture(1, 100);
-    header.config.public_b_chunk_atoms = V16PodU128::new(MAX_VAULT_TVL);
-    let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
-    let leg = PortfolioLegV16 {
-        active: true,
-        loss_weight: LOSS_WEIGHT,
-        ..PortfolioLegV16::default()
-    };
-    let full_loss = LOSS_WEIGHT.checked_mul(TARGET_B).unwrap() / SOCIAL_LOSS_DEN;
-    assert!(full_loss > 0 && full_loss < MAX_VAULT_TVL);
-
-    let chunk = market
-        .kani_account_b_settlement_chunk_from_leg(leg, TARGET_B, MAX_VAULT_TVL)
-        .unwrap();
-
-    assert_eq!(chunk.delta_b, TARGET_B);
-    assert_eq!(chunk.loss, full_loss);
-    assert!(chunk.loss <= MAX_VAULT_TVL);
-    assert_eq!(chunk.remaining_after, 0);
 }
