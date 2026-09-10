@@ -2714,10 +2714,47 @@ fn proof_v16_recovery_mode_blocks_fee_sync_and_pnl_conversion_before_mutation() 
     assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
 }
 
+// REALIZABILITY (no-DoS auto-crank dispatch seam): only the no-active-asset
+// RefreshAccount fallback hard-requires a caller-supplied observation; active-
+// asset refresh and every other plan are dispatchable from committed state.
+// Pinning this truth table means a future arm that gates committed-state progress
+// on an observation contradicts a machine-checked theorem. Exhaustive over the
+// seven AutoCrankPlanV16 variants this fork carries; the spec matrix
+// v16_auto_crank_progress_realizable_without_observation_for_every_class ties the
+// predicate to the real dispatch for each reachable class.
+#[kani::proof]
+fn proof_v16_auto_crank_refresh_is_unique_observation_requiring_plan() {
+    use percolator::auto_crank_plan_requires_caller_observation as needs_obs;
+    use percolator::AutoCrankPlanV16;
+    let i: usize = kani::any();
+    // Active-asset refresh can use the committed asset state; only the fallback
+    // with no selected active asset requires a caller observation.
+    assert!(!needs_obs(&AutoCrankPlanV16::RefreshAccount {
+        asset_index: Some(i)
+    }));
+    assert!(needs_obs(&AutoCrankPlanV16::RefreshAccount {
+        asset_index: None
+    }));
+    // No other plan does — committed on-chain state suffices.
+    assert!(!needs_obs(&AutoCrankPlanV16::SettleBChunk {
+        asset_index: i
+    }));
+    assert!(!needs_obs(&AutoCrankPlanV16::Liquidate { asset_index: i }));
+    assert!(!needs_obs(&AutoCrankPlanV16::NoAction));
+    assert!(!needs_obs(&AutoCrankPlanV16::FinalizeRecovery));
+    assert!(!needs_obs(&AutoCrankPlanV16::CloseResolved));
+    // The predicate matches DeclareRecovery { .. } regardless of reason, so a
+    // concrete variant exercises the arm (the reason enum isn't Arbitrary here).
+    assert!(!needs_obs(&AutoCrankPlanV16::DeclareRecovery {
+        reason: PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+    }));
+}
+
 #[kani::proof]
 #[kani::unwind(32)]
 #[kani::solver(cadical)]
 fn proof_v16_public_resolve_market_is_value_neutral_and_clears_loss_stale() {
+    let start_in_recovery: bool = kani::any();
     let current_slot_raw: u8 = kani::any();
     let stale_lag_raw: u8 = kani::any();
     let resolved_delta_raw: u8 = kani::any();
@@ -2740,10 +2777,17 @@ fn proof_v16_public_resolve_market_is_value_neutral_and_clears_loss_stale() {
     header.loss_stale_active = if slot_last < current_slot { 1 } else { 0 };
     header.current_slot = V16PodU64::new(current_slot);
     header.slot_last = V16PodU64::new(slot_last);
+    if start_in_recovery {
+        header.mode = 2;
+        header.recovery_reason = V16OptionalRecoveryReasonAccount::from_runtime(Some(
+            PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+        ));
+    }
     let vault_before = header.vault;
     let c_tot_before = header.c_tot;
     let insurance_before = header.insurance;
     let slot_last_before = header.slot_last;
+    let recovery_reason_before = header.recovery_reason;
     let asset_before = markets[0].engine.asset;
     let long_budget_before = markets[0].engine.insurance_domain_budget_long;
     let short_budget_before = markets[0].engine.insurance_domain_budget_short;
@@ -2763,11 +2807,16 @@ fn proof_v16_public_resolve_market_is_value_neutral_and_clears_loss_stale() {
             && surplus > 255,
         "resolved market transition covers future authenticated slot over wide symbolic value state"
     );
+    kani::cover!(
+        start_in_recovery && c_tot > 255 && insurance > 255,
+        "permissionless Recovery-to-Resolved transition preserves nontrivial senior value"
+    );
     assert_eq!(market.header.mode, 1);
     assert_eq!(market.header.resolved_slot.get(), resolved_slot);
     assert_eq!(market.header.current_slot.get(), resolved_slot);
     assert_eq!(market.header.slot_last, slot_last_before);
     assert_eq!(market.header.loss_stale_active, 0);
+    assert_eq!(market.header.recovery_reason, recovery_reason_before);
     assert_eq!(market.header.vault, vault_before);
     assert_eq!(market.header.c_tot, c_tot_before);
     assert_eq!(market.header.insurance, insurance_before);

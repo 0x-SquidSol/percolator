@@ -14,8 +14,9 @@ use percolator::{
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, RebalanceRequestV16, ResolvedCloseOutcomeV16,
     ResolvedPayoutLedgerV16, ResolvedPayoutLedgerV16Account, ResolvedPayoutReceiptV16,
     ResolvedPayoutReceiptV16Account, SideModeV16, SideV16, SourceCreditStateV16,
-    SourceCreditStateV16Account, TradeRequestV16, V16Config, V16Error, V16PodI128, V16PodU128,
-    V16PodU32, V16PodU64, V16_EMPTY_ACTIVE_BITMAP,
+    SourceCreditStateV16Account, TradeRequestV16, V16Config, V16Error,
+    V16OptionalRecoveryReasonAccount, V16PodI128, V16PodU128, V16PodU32, V16PodU64,
+    V16_EMPTY_ACTIVE_BITMAP,
 };
 
 const FUNDING_COUNTER_PRICE: u64 = 1_000_000;
@@ -5951,6 +5952,58 @@ fn v16_auto_crank_liquidates_current_account_without_observation() {
     account.validate_with_market(&market.as_view()).unwrap();
 }
 
+// A market in Recovery is a DEAD END for the single public crank unless the
+// engine offers the Recovery-to-Resolved step itself: permissionless_crank_not_atomic
+// rejects every non-Recover action outside Live, so terminal account close stays
+// unreachable and the account is stuck. The transition must be value-neutral and
+// must preserve the declared recovery reason so the record of WHY the market
+// recovered survives resolution.
+#[test]
+fn v16_auto_crank_finalizes_recovery_into_resolved_without_moving_value() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 205);
+    header.current_slot = V16PodU64::new(10);
+    header.mode = 2;
+    header.recovery_reason = V16OptionalRecoveryReasonAccount::from_runtime(Some(
+        PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+    ));
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    let vault_before = market.header.vault;
+    let c_tot_before = market.header.c_tot;
+    let insurance_before = market.header.insurance;
+    let recovery_reason_before = market.header.recovery_reason;
+    let pnl_before = account.header.pnl;
+    let capital_before = account.header.capital;
+
+    let result = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: 10,
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("a recovered market must still have a bounded public step");
+
+    assert_eq!(result.selected, AutoCrankPlanV16::FinalizeRecovery);
+    assert_eq!(result.outcome, AutoCrankOutcomeV16::RecoveryResolved);
+    assert_eq!(
+        market.header.mode, 1,
+        "terminal close must become reachable"
+    );
+    assert_eq!(market.header.recovery_reason, recovery_reason_before);
+    assert_eq!(market.header.vault, vault_before);
+    assert_eq!(market.header.c_tot, c_tot_before);
+    assert_eq!(market.header.insurance, insurance_before);
+    assert_eq!(account.header.pnl, pnl_before);
+    assert_eq!(account.header.capital, capital_before);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
 #[test]
 fn v16_auto_crank_declares_recovery_for_expired_live_close() {
     use percolator::{CloseProgressLedgerV16, CloseProgressLedgerV16Account};
@@ -6172,6 +6225,14 @@ fn assert_observation_independent(
     now_slot: u64,
     expected_plan: AutoCrankPlanV16,
     expected_requires_obs: bool,
+    // For a REDUNDANT-observation class: whether dispatching the plan from purely
+    // committed state is expected to SUCCEED. Every class but resolved_winner does;
+    // resolved_winner's committed-state dispatch reaches a legitimate economic
+    // terminal (RecoveryRequired). Declaring this per class is what stops the
+    // outcome-equality check below from passing vacuously when BOTH calls error:
+    // upstream's form guards the selected plan behind `if let Ok(..)`, so a change
+    // that turns a committed-state plan into an unconditional error slips through.
+    expect_committed_dispatch_ok: bool,
 ) {
     // The predicate's claim must equal this class's documented observation need.
     assert_eq!(
@@ -6231,6 +6292,13 @@ fn assert_observation_independent(
             "{label}: observation must not change the outcome (plan is realizable \
              from committed state)"
         );
+        if expect_committed_dispatch_ok {
+            assert!(
+                r_empty.is_ok(),
+                "{label}: a plan realizable from committed state must dispatch \
+                 without an observation, got {r_empty:?}"
+            );
+        }
         if let Ok(res) = r_empty {
             assert_eq!(
                 res.selected, expected_plan,
@@ -6259,6 +6327,7 @@ fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
         0,
         5,
         AutoCrankPlanV16::RefreshAccount { asset_index: None },
+        true,
         true,
     );
 
@@ -6289,6 +6358,7 @@ fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
             asset_index: Some(0),
         },
         false,
+        true,
     );
 
     // --- A2 b_stale: SettleBChunk ignores price -> observation REDUNDANT.
@@ -6333,6 +6403,7 @@ fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
         10,
         AutoCrankPlanV16::SettleBChunk { asset_index: 0 },
         false,
+        true,
     );
 
     // --- A5 liquidatable: Liquidate reads the current cert -> observation REDUNDANT.
@@ -6389,6 +6460,7 @@ fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
         10,
         AutoCrankPlanV16::Liquidate { asset_index: 0 },
         false,
+        true,
     );
 
     // --- A4 expired_close: DeclareRecovery needs no price -> observation REDUNDANT.
@@ -6429,6 +6501,27 @@ fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
             reason: PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
         },
         false,
+        true,
+    );
+
+    // --- A6 terminal Recovery: the next step is a value-neutral transition to
+    // Resolved and needs no oracle observation.
+    assert_observation_independent(
+        "finalize_recovery",
+        || {
+            let (mut header, markets) = market_fixture(1, 100);
+            let account_header = account_fixture(1, 205);
+            header.mode = 2;
+            header.recovery_reason = V16OptionalRecoveryReasonAccount::from_runtime(Some(
+                PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+            ));
+            (header, markets, account_header)
+        },
+        0,
+        10,
+        AutoCrankPlanV16::FinalizeRecovery,
+        false,
+        true,
     );
 
     // --- A7 resolved_winner: CloseResolved needs no price -> observation REDUNDANT.
@@ -6450,6 +6543,7 @@ fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
         0,
         10,
         AutoCrankPlanV16::CloseResolved,
+        false,
         false,
     );
 }

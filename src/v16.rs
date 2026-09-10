@@ -2393,8 +2393,9 @@ pub fn kani_available_backing_num_for_source_credit_state(
 /// price. `RefreshAccount { asset_index: Some(_) }` and EVERY other plan are
 /// dispatchable from committed on-chain state alone — `SettleBChunk` ignores
 /// price, `Liquidate` reads the current health cert, `DeclareRecovery` /
-/// `CloseResolved` / `NoAction` take no price — so a keeper holding no fresh
-/// observation can still drive the account forward (no liveness stall). A wrapper
+/// `FinalizeRecovery` / `CloseResolved` / `NoAction` take no price — so a keeper
+/// holding no fresh observation can still drive the account forward (no liveness
+/// stall). A wrapper
 /// may call this to decide whether it must source an oracle observation before
 /// cranking.
 ///
@@ -2411,6 +2412,7 @@ pub fn auto_crank_plan_requires_caller_observation(plan: &AutoCrankPlanV16) -> b
         AutoCrankPlanV16::SettleBChunk { .. }
         | AutoCrankPlanV16::Liquidate { .. }
         | AutoCrankPlanV16::DeclareRecovery { .. }
+        | AutoCrankPlanV16::FinalizeRecovery
         | AutoCrankPlanV16::CloseResolved
         | AutoCrankPlanV16::NoAction => false,
     }
@@ -2714,16 +2716,18 @@ pub enum AutoCrankPlanV16 {
     DeclareRecovery {
         reason: PermissionlessRecoveryReasonV16,
     },
+    FinalizeRecovery,
     CloseResolved,
 }
 
 /// The outcome of one self-classifying crank step: nothing actionable, a
 /// permissionless-progress outcome (refresh / settle-B / liquidate / recovery),
-/// or a resolved-close outcome.
+/// a Recovery-to-Resolved transition, or a resolved-close outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoCrankOutcomeV16 {
     NoAction,
     Progressed(PermissionlessProgressOutcomeV16),
+    RecoveryResolved,
     ResolvedClose(ResolvedCloseOutcomeV16),
 }
 
@@ -9504,14 +9508,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.consume_domain_insurance_for_negative_pnl(asset_index, bankrupt_side, account)
     }
 
-    fn preflight_liquidation_residual_durability(
-        &mut self,
+    fn liquidation_residual_after_principal_and_insurance(
+        &self,
         asset_index: usize,
         bankrupt_side: SideV16,
         account: &PortfolioV16View<'_>,
-    ) -> V16Result<()> {
+    ) -> V16Result<u128> {
         let domain = self.insurance_domain_index(asset_index, opposite_side(bankrupt_side))?;
-        let residual_after_principal_and_insurance = if account.header.pnl.get() < 0 {
+        Ok(if account.header.pnl.get() < 0 {
             account
                 .header
                 .pnl
@@ -9521,16 +9525,46 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 .saturating_sub(self.available_domain_insurance(domain)?)
         } else {
             0
-        };
+        })
+    }
+
+    fn liquidation_residual_exceeds_single_step_capacity(
+        &self,
+        asset_index: usize,
+        bankrupt_side: SideV16,
+        account: &PortfolioV16View<'_>,
+    ) -> V16Result<bool> {
+        let residual_after_principal_and_insurance = self
+            .liquidation_residual_after_principal_and_insurance(
+                asset_index,
+                bankrupt_side,
+                account,
+            )?;
         if residual_after_principal_and_insurance == 0 {
-            return Ok(());
+            return Ok(false);
+        }
+        if self.header.config.public_b_chunk_atoms.get() < residual_after_principal_and_insurance {
+            return Ok(true);
         }
         let capacity = self.bankruptcy_residual_single_step_capacity(
             asset_index,
             bankrupt_side,
             residual_after_principal_and_insurance,
         )?;
-        if capacity < residual_after_principal_and_insurance {
+        Ok(capacity < residual_after_principal_and_insurance)
+    }
+
+    fn preflight_liquidation_residual_durability(
+        &mut self,
+        asset_index: usize,
+        bankrupt_side: SideV16,
+        account: &PortfolioV16View<'_>,
+    ) -> V16Result<()> {
+        if self.liquidation_residual_exceeds_single_step_capacity(
+            asset_index,
+            bankrupt_side,
+            account,
+        )? {
             self.declare_permissionless_recovery(
                 PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
             )?;
@@ -12351,15 +12385,31 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// 5. On `Ok(result)`, mirror any wrapper-owned token/custody movement keyed off
     ///    `result.selected` (the `AutoCrankPlanV16`): refresh / settle-B move no
     ///    custody; liquidate / close-resolved may. `NoAction` => nothing was needed.
-    ///    `Err(NonProgress)` => the selected step needed an observation the caller
-    ///    did not supply (currently the no-active-asset refresh fallback, or a
-    ///    stale/late tx whose task changed) — no mutation, so SVM rollback is a
-    ///    clean no-op and arbitrary landing order is safe.
+    ///    In Recovery, the next call selects `FinalizeRecovery` and performs the
+    ///    value-neutral transition to Resolved so terminal account close remains
+    ///    publicly reachable. `Err(NonProgress)` => the selected step needed an
+    ///    observation the caller did not supply (currently the no-active-asset
+    ///    refresh fallback, or a stale/late tx whose task changed) — no mutation,
+    ///    so SVM rollback is a clean no-op and arbitrary landing order is safe.
     pub fn permissionless_auto_crank_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
         work: AutoCrankWorkV16<'_>,
     ) -> V16Result<AutoCrankResultV16> {
+        // A market already in Recovery has exactly one bounded public step left:
+        // the value-neutral transition to Resolved, which puts terminal account
+        // close back within reach. Without it Recovery is a dead end for the single
+        // public crank, because permissionless_crank_not_atomic rejects every
+        // non-Recover action outside Live.
+        if decode_market_mode(self.header.mode)? == MarketModeV16::Recovery {
+            account.validate_with_market(&self.as_view())?;
+            self.resolve_market_not_atomic(work.now_slot)?;
+            account.validate_with_market(&self.as_view())?;
+            return Ok(AutoCrankResultV16 {
+                selected: AutoCrankPlanV16::FinalizeRecovery,
+                outcome: AutoCrankOutcomeV16::RecoveryResolved,
+            });
+        }
         let summary = self.build_actionable_summary(&account.as_view())?;
         let (b_stale_asset, refresh_asset, liquidatable_asset, _) =
             self.auto_crank_selected_assets(&account.as_view())?;
@@ -12478,6 +12528,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     },
                 )?)
             }
+            AutoCrankPlanV16::FinalizeRecovery => return Err(V16Error::InvalidConfig),
             AutoCrankPlanV16::CloseResolved => {
                 AutoCrankOutcomeV16::ResolvedClose(self.close_resolved_account_not_atomic(
                     account,
@@ -16594,9 +16645,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     pub fn resolve_market_not_atomic(&mut self, resolved_slot: u64) -> V16Result<()> {
-        if decode_market_mode(self.header.mode)? == MarketModeV16::Recovery {
-            return Err(V16Error::LockActive);
-        }
+        decode_market_mode(self.header.mode)?;
         if resolved_slot < self.header.current_slot.get() {
             return Err(V16Error::Stale);
         }
