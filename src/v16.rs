@@ -907,6 +907,23 @@ impl V16Core {
         }
     }
 
+    /// PRODUCTION KERNEL: admit an authenticated clock observation into terminal
+    /// settlement. Resolved routes do not accrue markets, but expiry-sensitive
+    /// backing still requires a monotonic current slot. (upstream 44847fd5)
+    fn kernel_advance_resolved_slot(
+        mode: MarketModeV16,
+        current_slot: u64,
+        authenticated_slot: u64,
+    ) -> V16Result<u64> {
+        if mode != MarketModeV16::Resolved {
+            return Err(V16Error::LockActive);
+        }
+        if authenticated_slot < current_slot {
+            return Err(V16Error::Stale);
+        }
+        Ok(authenticated_slot)
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -13534,6 +13551,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
+    #[cfg(kani)]
+    pub fn kani_advance_resolved_slot(
+        mode: MarketModeV16,
+        current_slot: u64,
+        authenticated_slot: u64,
+    ) -> V16Result<u64> {
+        V16Core::kernel_advance_resolved_slot(mode, current_slot, authenticated_slot)
+    }
+
     fn account_no_positive_credit_equity(account: &PortfolioV16View<'_>) -> V16Result<i128> {
         validate_non_min_i128(account.header.pnl.get())?;
         validate_fee_credits(account.header.fee_credits.get())?;
@@ -15363,6 +15389,20 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // sentinels to the no-envelope-open state BEFORE validate_shape so the pairing invariant holds.
         self.clear_stress_envelope_v16();
         self.validate_shape()
+    }
+
+    /// Advances only the clock used by resolved settlement. The wrapper must
+    /// authenticate `authenticated_slot` (for Solana, from the Clock sysvar).
+    /// No price, funding, value, claim, or lifecycle field is changed.
+    /// (upstream 44847fd5)
+    pub fn advance_resolved_slot_not_atomic(&mut self, authenticated_slot: u64) -> V16Result<()> {
+        let next = V16Core::kernel_advance_resolved_slot(
+            decode_market_mode(self.header.mode)?,
+            self.header.current_slot.get(),
+            authenticated_slot,
+        )?;
+        self.header.current_slot = V16PodU64::new(next);
+        Ok(())
     }
 
     // A resolved-payout receipt that has been paid its full entitlement at the TERMINAL
