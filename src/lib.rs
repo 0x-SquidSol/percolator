@@ -79,6 +79,10 @@ pub use v16::{
 #[cfg(all(not(kani), feature = "fork-facade"))]
 pub use v16::kani_active_bitmap_set;
 
+// ADL effective-quantity kernels for the fuzz targets (kani builds get them from the blanket re-export).
+#[cfg(all(not(kani), feature = "fuzz"))]
+pub use v16::{kani_adl_effective_quantity_ceil, kani_raw_basis_for_adl_effective_quantity};
+
 // v17 fork-facade re-exports — present only when the fork-facade feature is enabled (the wrapper
 // opts in on its engine dep). Keeps the production frozen surface minimal by default. Under kani the
 // blanket `pub use v16::*` above already covers these.
