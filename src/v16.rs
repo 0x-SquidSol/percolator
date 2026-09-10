@@ -12278,14 +12278,27 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         &self,
         account: &PortfolioV16View<'_>,
     ) -> V16Result<ActionableSummaryV16> {
+        self.build_actionable_summary_at_slot(account, self.header.current_slot.get())
+    }
+
+    /// Classifies clock-driven work against an authenticated execution slot even
+    /// when no oracle observation was supplied to advance the committed market
+    /// slot. The caller must authenticate `now_slot`; execution remains bounded
+    /// to one selected continuation.
+    pub fn build_actionable_summary_at_slot(
+        &self,
+        account: &PortfolioV16View<'_>,
+        now_slot: u64,
+    ) -> V16Result<ActionableSummaryV16> {
         Ok(self
-            .build_actionable_summary_and_selected_assets(account)?
+            .build_actionable_summary_and_selected_assets(account, now_slot)?
             .0)
     }
 
     fn build_actionable_summary_and_selected_assets(
         &self,
         account: &PortfolioV16View<'_>,
+        now_slot: u64,
     ) -> V16Result<(
         ActionableSummaryV16,
         (
@@ -12296,6 +12309,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             Option<usize>,
         ),
     )> {
+        if now_slot < self.header.current_slot.get() {
+            return Err(V16Error::InvalidConfig);
+        }
         let mode = decode_market_mode(self.header.mode)?;
         let live = mode == MarketModeV16::Live;
         let resolved = mode == MarketModeV16::Resolved;
@@ -12336,8 +12352,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // therefore classifier-unreachable (the proven selector still admits it).
         let pending_close = false;
         // Expired outstanding close -> terminal recovery (Recover needs no leg).
-        let expired_close =
-            live && close_outstanding && self.header.current_slot.get() > ledger.max_close_slot;
+        let expired_close = live && close_outstanding && now_slot > ledger.max_close_slot;
         // liquidatable requires a current certified deficit AND actual open risk:
         // a stale cert can still report a deficit after the position was already
         // closed, but with no active leg there is nothing to liquidate (the real
@@ -12565,7 +12580,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let (
             summary,
             (b_stale_asset, refresh_asset, liquidatable_asset, _, released_obligation_asset),
-        ) = self.build_actionable_summary_and_selected_assets(&account.as_view())?;
+        ) = self.build_actionable_summary_and_selected_assets(&account.as_view(), work.now_slot)?;
         let recovery_reason = if summary.expired_close {
             PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
         } else {

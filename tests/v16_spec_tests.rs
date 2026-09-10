@@ -5831,12 +5831,13 @@ fn v16_auto_crank_releases_current_flat_pending_obligations_on_both_sides() {
                 .unwrap()
                 .stale
         );
+        let current_slot = market.header.current_slot.get();
 
         let result = market
             .permissionless_auto_crank_not_atomic(
                 &mut account,
                 AutoCrankWorkV16 {
-                    now_slot: 0,
+                    now_slot: current_slot,
                     observations: &[],
                     resolved_close_fee_rate_per_slot: 0,
                 },
@@ -6240,6 +6241,104 @@ fn v16_auto_crank_finalizes_recovery_into_resolved_without_moving_value() {
     assert_eq!(market.header.insurance, insurance_before);
     assert_eq!(account.header.pnl, pnl_before);
     assert_eq!(account.header.capital, capital_before);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
+// Clock-driven work must be classifiable at the AUTHENTICATED execution slot,
+// not only at the committed market slot. Advancing the committed slot needs an
+// oracle observation; if expiry were read from it, a close that has genuinely
+// lapsed would stay invisible to the crank until somebody happened to supply a
+// price -- and a keeper holding no observation is exactly the caller this crank
+// exists for. The reverse direction must fail closed: a caller cannot backdate
+// now_slot to classify against a clock the market has already moved past.
+//
+// ADAPTED CONTROL: upstream pins this with
+// v16_auto_crank_classifies_lapsed_source_backing_with_current_certificate,
+// which drives the property through first_lapsed_source_backing_for_account_at_slot.
+// That function arrives with c09d4575/0e773c77 and is not on this branch yet, so
+// the same property is driven through the other clock-driven signal we do carry,
+// expired_close.
+#[test]
+fn v16_auto_crank_classifies_close_expiry_at_the_authenticated_slot() {
+    use percolator::{CloseProgressLedgerV16, CloseProgressLedgerV16Account};
+
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 42);
+    header.current_slot = V16PodU64::new(2);
+
+    let market_id = markets[0].engine.asset.try_to_runtime().unwrap().market_id;
+    account_header.close_progress =
+        CloseProgressLedgerV16Account::from_runtime(&CloseProgressLedgerV16 {
+            active: true,
+            finalized: false,
+            canceled: false,
+            close_id: 1,
+            asset_index: 0,
+            market_id,
+            domain_side: SideV16::Short,
+            gross_loss_at_close_start: 10,
+            drift_reference_slot: 1,
+            // Not expired at the COMMITTED slot 2, expired at slot 10.
+            max_close_slot: 2,
+            support_consumed: 0,
+            junior_face_burned: 0,
+            insurance_spent: 0,
+            b_loss_booked: 0,
+            explicit_loss_assigned: 0,
+            quantity_adl_applied_q: 0,
+            drift_consumed: 0,
+            residual_remaining: 10,
+        });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    // At the committed slot the close has not lapsed.
+    assert!(
+        !market
+            .build_actionable_summary(&account.as_view())
+            .unwrap()
+            .expired_close
+    );
+    // At an authenticated later slot it has, with no observation supplied and no
+    // change to the committed market clock.
+    assert!(
+        market
+            .build_actionable_summary_at_slot(&account.as_view(), 10)
+            .unwrap()
+            .expired_close
+    );
+    assert_eq!(
+        market.header.current_slot.get(),
+        2,
+        "classification is pure"
+    );
+
+    // A backdated slot is refused rather than silently classified.
+    assert_eq!(
+        market.build_actionable_summary_at_slot(&account.as_view(), 1),
+        Err(V16Error::InvalidConfig)
+    );
+
+    // And the public crank dispatches on the authenticated slot.
+    let r = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: 10,
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("an expired close must be actionable without an oracle hint");
+    assert_eq!(
+        r.selected,
+        AutoCrankPlanV16::DeclareRecovery {
+            reason: PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
+        }
+    );
+    assert_eq!(market.header.mode, 2);
     market.validate_shape().unwrap();
     account.validate_with_market(&market.as_view()).unwrap();
 }
