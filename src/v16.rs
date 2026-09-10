@@ -2338,15 +2338,16 @@ pub fn kani_available_backing_num_for_source_credit_state(
 
 /// REALIZABILITY — the no-DoS auto-crank dispatch-seam invariant.
 ///
-/// `RefreshAccount` is the UNIQUE [`AutoCrankPlanV16`] whose dispatch hard-requires
-/// a caller-supplied oracle observation: it must accrue a NEW price, which is not
-/// derivable from committed state, so with no observation it justifiably returns
-/// `NonProgress`. EVERY other plan is dispatchable from committed on-chain state
-/// alone — `SettleBChunk` ignores price, `Liquidate` reads the current health
-/// cert, `DeclareRecovery`/`CloseResolved`/`NoAction` take no price — so a keeper
-/// holding no fresh observation can still drive the account forward (no liveness
-/// stall). A wrapper may call this to decide whether it must source an oracle
-/// observation before cranking.
+/// `RefreshAccount { asset_index: None }` is the UNIQUE [`AutoCrankPlanV16`] whose
+/// dispatch hard-requires a caller-supplied oracle observation: there is no active
+/// account leg from which to choose a committed asset, so it must accrue a NEW
+/// price. `RefreshAccount { asset_index: Some(_) }` and EVERY other plan are
+/// dispatchable from committed on-chain state alone — `SettleBChunk` ignores
+/// price, `Liquidate` reads the current health cert, `DeclareRecovery` /
+/// `CloseResolved` / `NoAction` take no price — so a keeper holding no fresh
+/// observation can still drive the account forward (no liveness stall). A wrapper
+/// may call this to decide whether it must source an oracle observation before
+/// cranking.
 ///
 /// The exhaustive match forces a conscious classification if a plan variant is
 /// added. `proof_v16_auto_crank_refresh_is_unique_observation_requiring_plan` pins
@@ -2357,7 +2358,7 @@ pub fn kani_available_backing_num_for_source_credit_state(
 /// b-stale / committed-state-liquidation stall before the observation fallback.
 pub fn auto_crank_plan_requires_caller_observation(plan: &AutoCrankPlanV16) -> bool {
     match plan {
-        AutoCrankPlanV16::RefreshAccount { .. } => true,
+        AutoCrankPlanV16::RefreshAccount { asset_index } => asset_index.is_none(),
         AutoCrankPlanV16::SettleBChunk { .. }
         | AutoCrankPlanV16::Liquidate { .. }
         | AutoCrankPlanV16::DeclareRecovery { .. }
@@ -12179,8 +12180,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     ///    `result.selected` (the `AutoCrankPlanV16`): refresh / settle-B move no
     ///    custody; liquidate / close-resolved may. `NoAction` => nothing was needed.
     ///    `Err(NonProgress)` => the selected step needed an observation the caller
-    ///    did not supply (a stale/late tx whose task changed) — no mutation, so SVM
-    ///    rollback is a clean no-op and arbitrary landing order is safe.
+    ///    did not supply (currently the no-active-asset refresh fallback, or a
+    ///    stale/late tx whose task changed) — no mutation, so SVM rollback is a
+    ///    clean no-op and arbitrary landing order is safe.
     pub fn permissionless_auto_crank_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -12203,13 +12205,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             recovery_reason,
         );
 
-        let obs_for = |i: usize| -> V16Result<AutoCrankObservationV16> {
-            work.observations
-                .iter()
-                .copied()
-                .find(|o| o.asset_index == i)
-                .ok_or(V16Error::NonProgress)
-        };
         let obs_or_current_asset = |me: &Self, i: usize| -> V16Result<AutoCrankObservationV16> {
             match work
                 .observations
@@ -12249,10 +12244,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let outcome = match plan {
             AutoCrankPlanV16::NoAction => AutoCrankOutcomeV16::NoAction,
             AutoCrankPlanV16::RefreshAccount { asset_index } => {
-                // accrue the engine-selected asset; if none, use the first
-                // supplied observation (account/market refresh needs price data).
+                // Accrue the engine-selected active asset from either a fresh
+                // observation or committed state; if no active asset exists, use
+                // the first supplied observation to give the refresh a price.
                 let (ai, obs) = match asset_index {
-                    Some(i) => (i, obs_for(i)?),
+                    Some(i) => (i, obs_or_current_asset(self, i)?),
                     None => {
                         let o = work
                             .observations

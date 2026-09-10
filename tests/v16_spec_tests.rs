@@ -1,5 +1,8 @@
 use percolator::active_bitmap_is_empty;
 use percolator::{
+    auto_crank_plan_requires_caller_observation, ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, POS_SCALE,
+};
+use percolator::{
     v16_domain_count_for_market_slots, AssetLifecycleV16, AssetStateV16Account,
     AutoCrankObservationV16, AutoCrankOutcomeV16, AutoCrankPlanV16, AutoCrankWorkV16,
     BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, CloseProgressLedgerV16,
@@ -14,7 +17,6 @@ use percolator::{
     SourceCreditStateV16Account, TradeRequestV16, V16Config, V16Error, V16PodI128, V16PodU128,
     V16PodU32, V16PodU64, V16_EMPTY_ACTIVE_BITMAP,
 };
-use percolator::{ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, POS_SCALE};
 
 const FUNDING_COUNTER_PRICE: u64 = 1_000_000;
 const FUNDING_COUNTER_RATE_E9: i128 = 10_000;
@@ -6150,4 +6152,318 @@ fn v16_auto_crank_missing_observation_is_clean_nonprogress_no_mutation() {
     // no mutation (SVM would roll back anyway, but the engine did not commit).
     assert_eq!(account.header.health_cert, cert_before);
     market.validate_shape().unwrap();
+}
+
+// REALIZABILITY MATRIX — closes the no-DoS dispatch seam that hid the b-stale /
+// committed-state-liquidation stall. The faithful invariant is OBSERVATION-
+// INDEPENDENCE: for a plan that `auto_crank_plan_requires_caller_observation`
+// reports as NOT requiring one, the single public crank must return the SAME
+// outcome whether or not an observation is supplied (the observation is redundant
+// — the plan is realizable from committed state). For the one form that DOES
+// require one (RefreshAccount with no active asset), the empty-observation call
+// cleanly stalls (NonProgress) while supplying the observation progresses. This
+// both guards liveness AND ties the pure predicate to the REAL dispatch per class,
+// so the predicate cannot drift from behaviour. Note: a committed-state plan may
+// still return a genuine economic terminal (e.g. RecoveryRequired) — that is fine,
+// because it returns the SAME terminal with or without the observation; the bug
+// was an outcome that DIFFERED on the observation.
+fn assert_observation_independent(
+    label: &str,
+    build: impl Fn() -> (
+        MarketGroupV16HeaderAccount,
+        Vec<Market<u64>>,
+        PortfolioAccountV16Account,
+    ),
+    obs_asset_index: usize,
+    now_slot: u64,
+    liquidation_max_close_q: u128,
+    expected_plan: AutoCrankPlanV16,
+    expected_requires_obs: bool,
+) {
+    // The predicate's claim must equal this class's documented observation need.
+    assert_eq!(
+        auto_crank_plan_requires_caller_observation(&expected_plan),
+        expected_requires_obs,
+        "{label}: predicate disagrees with documented observation-requirement"
+    );
+
+    let run = |observations: &[AutoCrankObservationV16]| {
+        let (mut header, mut markets, mut account_header) = build();
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
+        market.permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot,
+                observations,
+                liquidation_max_close_q,
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+    };
+
+    let r_empty = run(&[]);
+
+    // The observation a keeper would otherwise supply: the asset's *committed*
+    // price (the value the cert was already certified against) and zero funding.
+    let committed_price = {
+        let (_h, m, _a) = build();
+        m[obs_asset_index]
+            .engine
+            .asset
+            .try_to_runtime()
+            .unwrap()
+            .effective_price
+    };
+    let obs = [AutoCrankObservationV16 {
+        asset_index: obs_asset_index,
+        effective_price: committed_price,
+        funding_rate_e9: 0,
+    }];
+    let r_obs = run(&obs);
+
+    if expected_requires_obs {
+        assert_eq!(
+            r_empty,
+            Err(percolator::V16Error::NonProgress),
+            "{label}: a plan requiring an observation must cleanly stall without one"
+        );
+        assert!(
+            r_obs.is_ok(),
+            "{label}: must progress once the observation is supplied, got {r_obs:?}"
+        );
+    } else {
+        // The whole bug class: outcome differing on a redundant observation.
+        assert_eq!(
+            r_empty, r_obs,
+            "{label}: observation must not change the outcome (plan is realizable \
+             from committed state)"
+        );
+        if let Ok(res) = r_empty {
+            assert_eq!(
+                res.selected, expected_plan,
+                "{label}: unexpected selected plan"
+            );
+        }
+    }
+}
+
+#[test]
+fn v16_auto_crank_progress_realizable_without_observation_for_every_class() {
+    // --- A1 stale with no active asset: fallback refresh has no committed asset
+    // to use, so it still needs a caller observation.
+    assert_observation_independent(
+        "stale_empty_account",
+        || {
+            let (mut header, mut markets) = market_fixture(1, 100);
+            let mut account_header = account_fixture(1, 200);
+            let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+            let mut account = PortfolioV16ViewMut::new(&mut account_header);
+            market.deposit_not_atomic(&mut account, 1_000).unwrap();
+            drop(market);
+            drop(account);
+            (header, markets, account_header)
+        },
+        0,
+        5,
+        0,
+        AutoCrankPlanV16::RefreshAccount { asset_index: None },
+        true,
+    );
+
+    // --- A1 stale with an active asset: refresh is realizable from committed
+    // state. This is the no-DoS case for stale multi-asset accounts whose first
+    // active asset does not have a fresh oracle observation available.
+    assert_observation_independent(
+        "stale_active_asset",
+        || {
+            let (mut header, mut markets) = market_fixture(1, 100);
+            let mut account_header = account_fixture(1, 209);
+            let mut counterparty_header = account_fixture(1, 210);
+            let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+            let mut account = PortfolioV16ViewMut::new(&mut account_header);
+            let mut counterparty = PortfolioV16ViewMut::new(&mut counterparty_header);
+            market.deposit_not_atomic(&mut account, 1_000).unwrap();
+            market.deposit_not_atomic(&mut counterparty, 1_000).unwrap();
+            open_one_lot_pair(&mut market, &mut account, &mut counterparty);
+            account.header.health_cert.valid = 0;
+            drop(market);
+            drop(account);
+            drop(counterparty);
+            (header, markets, account_header)
+        },
+        0,
+        5,
+        0,
+        AutoCrankPlanV16::RefreshAccount {
+            asset_index: Some(0),
+        },
+        false,
+    );
+
+    // --- A2 b_stale: SettleBChunk ignores price -> observation REDUNDANT.
+    assert_observation_independent(
+        "b_stale",
+        || {
+            let (mut header, mut markets) = market_fixture(1, 100);
+            let mut account_header = account_fixture(1, 201);
+            header.current_slot = V16PodU64::new(10);
+            header.slot_last = V16PodU64::new(10);
+            let mut asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+            asset0.slot_last = 10;
+            asset0.oi_eff_long_q = POS_SCALE;
+            asset0.oi_eff_short_q = POS_SCALE;
+            asset0.loss_weight_sum_long = POS_SCALE;
+            asset0.loss_weight_sum_short = POS_SCALE;
+            asset0.stored_pos_count_long = 1;
+            asset0.stored_pos_count_short = 1;
+            markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+            account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+                active: true,
+                asset_index: 0,
+                market_id: asset0.market_id,
+                side: SideV16::Long,
+                basis_pos_q: POS_SCALE as i128,
+                a_basis: ADL_ONE,
+                k_snap: asset0.k_long,
+                f_snap: asset0.f_long_num,
+                kf_epoch_snap: 0,
+                epoch_snap: asset0.epoch_long,
+                loss_weight: POS_SCALE,
+                b_snap: asset0.b_long_num,
+                b_rem: 0,
+                b_epoch_snap: asset0.epoch_long,
+                b_stale: true,
+                stale: false,
+            });
+            account_header.active_bitmap[0] = V16PodU64::new(1);
+            (header, markets, account_header)
+        },
+        0,
+        10,
+        0,
+        AutoCrankPlanV16::SettleBChunk { asset_index: 0 },
+        false,
+    );
+
+    // --- A5 liquidatable: Liquidate reads the current cert -> observation REDUNDANT.
+    assert_observation_independent(
+        "liquidatable",
+        || {
+            let (mut header, mut markets) = market_fixture(1, 100);
+            let mut account_header = account_fixture(1, 202);
+            header.current_slot = V16PodU64::new(10);
+            header.slot_last = V16PodU64::new(10);
+            header.vault = V16PodU128::new(50);
+            header.insurance = V16PodU128::new(50);
+            header.negative_pnl_account_count = V16PodU64::new(1);
+            let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+            asset.slot_last = 10;
+            asset.oi_eff_long_q = 2 * POS_SCALE;
+            asset.oi_eff_short_q = 2 * POS_SCALE;
+            asset.loss_weight_sum_long = 2 * POS_SCALE;
+            asset.loss_weight_sum_short = 2 * POS_SCALE;
+            asset.stored_pos_count_long = 2;
+            asset.stored_pos_count_short = 2;
+            markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+            header.resolved_payout_blocker_count = V16PodU64::new(4);
+            account_header.pnl = V16PodI128::new(-5);
+            account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+                active: true,
+                asset_index: 0,
+                market_id: asset.market_id,
+                side: SideV16::Long,
+                basis_pos_q: POS_SCALE as i128,
+                a_basis: ADL_ONE,
+                k_snap: asset.k_long,
+                f_snap: asset.f_long_num,
+                kf_epoch_snap: 0,
+                epoch_snap: asset.epoch_long,
+                loss_weight: POS_SCALE,
+                b_snap: asset.b_long_num,
+                b_rem: 0,
+                b_epoch_snap: asset.epoch_long,
+                b_stale: false,
+                stale: false,
+            });
+            account_header.active_bitmap[0] = V16PodU64::new(1);
+            {
+                let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+                let mut account = PortfolioV16ViewMut::new(&mut account_header);
+                market
+                    .full_account_refresh_not_atomic(&mut account)
+                    .expect("setup must produce a current liquidation cert");
+            }
+            (header, markets, account_header)
+        },
+        0,
+        10,
+        POS_SCALE,
+        AutoCrankPlanV16::Liquidate { asset_index: 0 },
+        false,
+    );
+
+    // --- A4 expired_close: DeclareRecovery needs no price -> observation REDUNDANT.
+    assert_observation_independent(
+        "expired_close",
+        || {
+            use percolator::{CloseProgressLedgerV16, CloseProgressLedgerV16Account};
+            let (mut header, mut markets) = market_fixture(1, 100);
+            let mut account_header = account_fixture(1, 203);
+            header.current_slot = V16PodU64::new(10);
+            let market_id = markets[0].engine.asset.try_to_runtime().unwrap().market_id;
+            account_header.close_progress =
+                CloseProgressLedgerV16Account::from_runtime(&CloseProgressLedgerV16 {
+                    active: true,
+                    finalized: false,
+                    canceled: false,
+                    close_id: 1,
+                    asset_index: 0,
+                    market_id,
+                    domain_side: SideV16::Short,
+                    gross_loss_at_close_start: 10,
+                    drift_reference_slot: 1,
+                    max_close_slot: 2,
+                    support_consumed: 0,
+                    junior_face_burned: 0,
+                    insurance_spent: 0,
+                    b_loss_booked: 0,
+                    explicit_loss_assigned: 0,
+                    quantity_adl_applied_q: 0,
+                    drift_consumed: 0,
+                    residual_remaining: 10,
+                });
+            (header, markets, account_header)
+        },
+        0,
+        10,
+        0,
+        AutoCrankPlanV16::DeclareRecovery {
+            reason: PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+        },
+        false,
+    );
+
+    // --- A7 resolved_winner: CloseResolved needs no price -> observation REDUNDANT.
+    // (Previously only its CLASSIFICATION was tested; the empty-observation DISPATCH
+    // — including a legitimate RecoveryRequired terminal — was uncovered.)
+    assert_observation_independent(
+        "resolved_winner",
+        || {
+            let (mut header, mut markets) = market_fixture(1, 100);
+            let mut account_header = account_fixture(1, 204);
+            {
+                let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+                market.resolve_market_not_atomic(1).unwrap();
+            }
+            header.vault = V16PodU128::new(50);
+            account_header.pnl = V16PodI128::new(5);
+            (header, markets, account_header)
+        },
+        0,
+        10,
+        0,
+        AutoCrankPlanV16::CloseResolved,
+        false,
+    );
 }
