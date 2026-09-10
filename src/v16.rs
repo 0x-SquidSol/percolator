@@ -11232,6 +11232,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let bitmap = account.header.active_bitmap.map(V16PodU64::get);
         let mut seen_assets = [u32::MAX; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut seen_asset_count = 0usize;
+        let mut reset_obligation_cleared = false;
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
@@ -11306,6 +11307,23 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     ));
                 }
                 return Err(V16Error::BStale);
+            }
+            // A prior-reset leg no longer owns effective OI. Once its terminal
+            // K/F/B claims are settled above, detaching it is bookkeeping, not
+            // a position close. Clear at most one per call to keep max-shape CU
+            // bounded; the classifier keeps another obligation actionable.
+            if !reset_obligation_cleared
+                && Self::leg_is_prior_reset_obligation(asset, refreshed)
+                && !account
+                    .header
+                    .close_progress
+                    .try_to_runtime()?
+                    .has_pending_residual()
+            {
+                self.clear_leg(account, asset_index)?;
+                reset_obligation_cleared = true;
+                slot += 1;
+                continue;
             }
             let price = if let Some((override_asset, override_price)) = price_override {
                 if override_asset == asset_index {
@@ -12026,7 +12044,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// state to the ActionableState summary the self-classifying crank dispatches
     /// from. Each flag is exactly its production eligibility predicate, MODE-
     /// GATED so every flag that can be set has a currently-valid dispatch target:
-    ///   stale            — Live, health cert not current (kernel_cert_is_current==false)
+    ///   stale            — Live, health cert not current or a settled prior-reset
+    ///                      obligation still needs permissionless detachment
     ///   b_stale          — Live, some active leg flagged b-stale (has_b_stale_leg)
     ///   pending_close    — Live, a close-progress ledger is active
     ///   expired_close    — Live, that ledger is past its max-close slot
@@ -12056,13 +12075,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         );
         let ledger = account.header.close_progress.try_to_runtime()?;
 
-        let (_, dispatchable_active_asset) = self.auto_crank_selected_assets(account)?;
-        let has_open_risk = dispatchable_active_asset.is_some();
+        let (_, _, liquidatable_asset, reset_obligation_asset) =
+            self.auto_crank_selected_assets(account)?;
+        let has_open_risk = liquidatable_asset.is_some();
         // A close ledger with residual_remaining==0 is already fully booked/covered
         // (e.g. insurance absorbed the loss); only OUTSTANDING residual is real,
         // actionable close work. The `active` flag can linger past that.
         let close_outstanding = ledger.active && ledger.residual_remaining > 0;
-        let stale = live && !cert_current;
+        let stale = live && (!cert_current || reset_obligation_asset.is_some());
         let b_stale = live && Self::has_b_stale_leg(account)?;
         // pending_close is NOT proactively classified: the close-ledger residual is
         // booked ONLY inside the liquidation/resolved path that owns it
@@ -12081,7 +12101,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // a stale cert can still report a deficit after the position was already
         // closed, but with no active leg there is nothing to liquidate (the real
         // liquidate entrypoint requires an active leg), so the flag must be false.
-        let liquidatable = live && cert_current && cert.certified_liq_deficit != 0 && has_open_risk;
+        let liquidatable = live
+            && cert_current
+            && cert.certified_liq_deficit != 0
+            && has_open_risk
+            && reset_obligation_asset.is_none();
         // Permissionless recovery (declare_permissionless_recovery) is a LIVE-mode
         // action — it rejects Resolved mode with LockActive. The proactive Live
         // recovery condition the auto-crank declares is an EXPIRED outstanding
@@ -12136,19 +12160,33 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     fn auto_crank_selected_assets(
         &self,
         account: &PortfolioV16View<'_>,
-    ) -> V16Result<(Option<usize>, Option<usize>)> {
+    ) -> V16Result<(Option<usize>, Option<usize>, Option<usize>, Option<usize>)> {
         let bitmap = account.header.active_bitmap.map(V16PodU64::get);
-        let mut dispatchable_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut refresh_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut liquidation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
+        let mut reset_obligation_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut b_stale_flags = [false; V16_MAX_PORTFOLIO_ASSETS_N];
         let mut slot = 0usize;
         while slot < V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = account.header.legs[slot].try_to_runtime()?;
             let active = active_bitmap_get(bitmap, slot) && leg.active;
             if active {
-                dispatchable_flags[slot] = matches!(
-                    self.asset_state(leg.asset_index as usize)?.lifecycle,
+                let asset = self.asset_state(leg.asset_index as usize)?;
+                let lifecycle_dispatchable = matches!(
+                    asset.lifecycle,
                     AssetLifecycleV16::Active | AssetLifecycleV16::DrainOnly
                 );
+                refresh_flags[slot] = lifecycle_dispatchable;
+                let side_oi = match leg.side {
+                    SideV16::Long => asset.oi_eff_long_q,
+                    SideV16::Short => asset.oi_eff_short_q,
+                };
+                let prior_reset_obligation = Self::leg_is_prior_reset_obligation(asset, leg);
+                reset_obligation_flags[slot] = prior_reset_obligation;
+                liquidation_flags[slot] = lifecycle_dispatchable
+                    && leg.basis_pos_q != 0
+                    && side_oi != 0
+                    && !prior_reset_obligation;
             }
             b_stale_flags[slot] = active && leg.b_stale;
             slot += 1;
@@ -12162,8 +12200,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
         };
         let b_stale_asset = asset_of(V16Core::first_actionable_slot(b_stale_flags))?;
-        let active_asset = asset_of(V16Core::first_actionable_slot(dispatchable_flags))?;
-        Ok((b_stale_asset, active_asset))
+        let refresh_asset = asset_of(V16Core::first_actionable_slot(refresh_flags))?;
+        let liquidatable_asset = asset_of(V16Core::first_actionable_slot(liquidation_flags))?;
+        let reset_obligation_asset =
+            asset_of(V16Core::first_actionable_slot(reset_obligation_flags))?;
+        Ok((
+            b_stale_asset,
+            refresh_asset,
+            liquidatable_asset,
+            reset_obligation_asset,
+        ))
     }
 
     /// THE SINGLE PUBLIC PERMISSIONLESS CRANK (engine.md): the only crank the
@@ -12197,7 +12243,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         work: AutoCrankWorkV16<'_>,
     ) -> V16Result<AutoCrankResultV16> {
         let summary = self.build_actionable_summary(&account.as_view())?;
-        let (b_stale_asset, active_asset) = self.auto_crank_selected_assets(&account.as_view())?;
+        let (b_stale_asset, refresh_asset, liquidatable_asset, _) =
+            self.auto_crank_selected_assets(&account.as_view())?;
         let recovery_reason = if summary.expired_close {
             PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
         } else {
@@ -12208,8 +12255,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let plan = V16Core::select_auto_crank_plan(
             summary,
             b_stale_asset.unwrap_or(0),
-            active_asset.unwrap_or(0),
-            active_asset,
+            liquidatable_asset.unwrap_or(0),
+            refresh_asset,
             recovery_reason,
         );
 
