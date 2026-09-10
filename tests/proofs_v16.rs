@@ -19,6 +19,7 @@ use percolator::v16::{
     kani_pending_domain_loss_barrier_blocks_position_change,
     kani_position_change_requires_unit_adl, kani_position_delta_increases_risk,
     kani_prepare_asset_recovery_transition, kani_settle_kf_stale_cohort,
+    kani_source_claim_domain_first_burn_partition,
     kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
     kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
     kani_validate_positive_pnl_source_attribution, AssetLifecycleV16, AssetStateV16,
@@ -11016,6 +11017,279 @@ fn proof_v16_source_credit_lien_face_and_backing_use_scaled_units() {
             "source-credit lien face must be the minimal scaled face that realizes the required backing"
         );
     }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_source_lien_face_burn_releases_only_required_backing() {
+    let face_whole_raw: u8 = kani::any();
+    let effective_raw: u8 = kani::any();
+    let burn_whole_raw: u8 = kani::any();
+    let has_fractional_face: bool = kani::any();
+    let burn_full_face: bool = kani::any();
+    kani::assume(face_whole_raw <= 32);
+    kani::assume(burn_whole_raw <= face_whole_raw);
+    let face_whole = face_whole_raw as u128;
+    let fractional_face = if has_fractional_face {
+        BOUND_SCALE / 2
+    } else {
+        0
+    };
+    let face_num = face_whole * BOUND_SCALE + fractional_face;
+    let max_effective = face_whole + u128::from(has_fractional_face);
+    kani::assume((effective_raw as u128) <= max_effective);
+    let backing_num = (effective_raw as u128) * BOUND_SCALE;
+    let face_burn_num = if burn_full_face {
+        face_num
+    } else {
+        (burn_whole_raw as u128) * BOUND_SCALE
+    };
+
+    let release_num = MarketGroupV16ViewMut::<u64>::kani_source_lien_backing_release_for_face_burn(
+        face_num,
+        backing_num,
+        face_burn_num,
+    )
+    .unwrap();
+    let remaining_face = face_num - face_burn_num;
+    let remaining_face_ceiling =
+        remaining_face / BOUND_SCALE + u128::from(remaining_face % BOUND_SCALE != 0);
+    let remaining_effective = (backing_num - release_num) / BOUND_SCALE;
+    let expected_release_effective = (effective_raw as u128).saturating_sub(remaining_face_ceiling);
+
+    kani::cover!(
+        release_num == 0,
+        "remaining face can preserve the full lien"
+    );
+    kani::cover!(release_num != 0, "face burn can require backing release");
+    kani::cover!(
+        has_fractional_face && face_burn_num != face_num,
+        "fractional scaled face is covered"
+    );
+    assert_eq!(release_num % BOUND_SCALE, 0);
+    assert_eq!(release_num, expected_release_effective * BOUND_SCALE);
+    assert!(remaining_effective <= remaining_face_ceiling);
+    if release_num != 0 {
+        assert!(remaining_effective + 1 > remaining_face_ceiling);
+    }
+    if face_burn_num == face_num {
+        assert_eq!(release_num, backing_num);
+    }
+}
+
+// Live mark-reversal liveness and conservation across both source classes.
+// Full-width source partition: every valid liened-face burn is assigned exactly
+// once, counterparty-first, and the aggregate face rank decreases by the burn.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_source_lien_face_burn_partition_is_total_disjoint_and_strict_progress() {
+    let counterparty_face: u128 = kani::any();
+    let insurance_face: u128 = kani::any();
+    kani::assume(counterparty_face <= u128::MAX - insurance_face);
+    let total_face = counterparty_face + insurance_face;
+    kani::assume(total_face > 0);
+    let face_burn: u128 = kani::any();
+    kani::assume(face_burn > 0 && face_burn <= total_face);
+
+    let (counterparty_burn, insurance_burn) =
+        MarketGroupV16ViewMut::<u64>::kani_source_lien_face_burn_partition(
+            counterparty_face,
+            insurance_face,
+            face_burn,
+        )
+        .unwrap();
+
+    assert_eq!(counterparty_burn, face_burn.min(counterparty_face));
+    assert_eq!(counterparty_burn + insurance_burn, face_burn);
+    assert!(counterparty_burn <= counterparty_face);
+    assert!(insurance_burn <= insurance_face);
+    assert_eq!(
+        (counterparty_face - counterparty_burn) + (insurance_face - insurance_burn),
+        total_face - face_burn
+    );
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn == 0,
+        "counterparty-only partition is reachable"
+    );
+    kani::cover!(
+        counterparty_burn == 0 && insurance_burn > 0,
+        "insurance-only partition is reachable"
+    );
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn > 0,
+        "one burn can cross both source classes"
+    );
+    kani::cover!(face_burn == total_face, "full face burn reaches rank zero");
+}
+
+// Domain-isolation theorem for every representable two-domain claim rank. The
+// affected domain is exhausted before fallback can touch an unrelated domain,
+// while the aggregate claim rank falls by exactly the requested B loss.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn proof_v16_source_claim_burn_partition_is_domain_first_conservative_and_isolated() {
+    let source_claim_num: u128 = kani::any();
+    let unrelated_claim_num: u128 = kani::any();
+    let burn_num: u128 = kani::any();
+    let Some(total_claim_num) = source_claim_num.checked_add(unrelated_claim_num) else {
+        kani::assume(false);
+        return;
+    };
+    kani::assume(burn_num <= total_claim_num);
+
+    let (source_burn_num, fallback_burn_num) =
+        kani_source_claim_domain_first_burn_partition(source_claim_num, burn_num);
+    let source_after = source_claim_num.checked_sub(source_burn_num).unwrap();
+    let unrelated_after = unrelated_claim_num.checked_sub(fallback_burn_num).unwrap();
+
+    assert!(source_burn_num <= source_claim_num);
+    assert!(source_burn_num <= burn_num);
+    assert!(fallback_burn_num <= unrelated_claim_num);
+    assert_eq!(
+        source_burn_num.checked_add(fallback_burn_num),
+        Some(burn_num)
+    );
+    assert_eq!(
+        source_after.checked_add(unrelated_after),
+        total_claim_num.checked_sub(burn_num)
+    );
+    if burn_num <= source_claim_num {
+        assert_eq!(fallback_burn_num, 0);
+        assert_eq!(unrelated_after, unrelated_claim_num);
+    } else {
+        assert_eq!(source_after, 0);
+        assert_eq!(fallback_burn_num, burn_num - source_claim_num);
+    }
+
+    kani::cover!(
+        burn_num > 0 && burn_num < source_claim_num && unrelated_claim_num > 0,
+        "partial source burn frames an unrelated claim"
+    );
+    kani::cover!(
+        source_claim_num > 0
+            && unrelated_claim_num > 0
+            && burn_num > source_claim_num
+            && burn_num < total_claim_num,
+        "fallback burns only a strict uncovered remainder"
+    );
+    kani::cover!(
+        total_claim_num > 1 && burn_num == total_claim_num,
+        "the exact aggregate claim rank can be retired"
+    );
+}
+
+// Bounded composition through the complete production plan. The separate
+// full-width partition theorem and fractional source-local release theorem
+// discharge the amount-independent algebra around this composition seam.
+// Any valid liened-face burn must admit a plan, reduce the face rank exactly,
+// release only the backing no longer supportable by remaining face, and leave
+// counterparty/insurance backing independently bounded by their own claims.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_source_lien_face_burn_plan_is_total_minimal_and_source_isolated() {
+    let counterparty_whole: u8 = kani::any();
+    let insurance_whole: u8 = kani::any();
+    let burn_whole: u8 = kani::any();
+    kani::assume(counterparty_whole <= 8);
+    kani::assume(insurance_whole <= 8);
+    kani::assume(burn_whole <= 16);
+    let counterparty_face = (counterparty_whole as u128) * BOUND_SCALE;
+    let insurance_face = (insurance_whole as u128) * BOUND_SCALE;
+    let total_face = counterparty_face + insurance_face;
+    kani::assume(total_face > 0);
+
+    let counterparty_face_ceiling =
+        counterparty_face / BOUND_SCALE + u128::from(counterparty_face % BOUND_SCALE != 0);
+    let insurance_face_ceiling =
+        insurance_face / BOUND_SCALE + u128::from(insurance_face % BOUND_SCALE != 0);
+    let counterparty_effective: u8 = kani::any();
+    let insurance_effective: u8 = kani::any();
+    kani::assume((counterparty_effective as u128) <= counterparty_face_ceiling);
+    kani::assume((insurance_effective as u128) <= insurance_face_ceiling);
+    let counterparty_backing = (counterparty_effective as u128) * BOUND_SCALE;
+    let insurance_backing = (insurance_effective as u128) * BOUND_SCALE;
+    let face_burn = (burn_whole as u128) * BOUND_SCALE;
+    kani::assume(face_burn > 0 && face_burn <= total_face);
+
+    let (counterparty_burn, insurance_burn, counterparty_release, insurance_release, total_release) =
+        MarketGroupV16ViewMut::<u64>::kani_source_lien_face_burn_plan(
+            counterparty_face,
+            insurance_face,
+            counterparty_backing,
+            insurance_backing,
+            face_burn,
+        )
+        .unwrap();
+
+    assert_eq!(counterparty_burn, face_burn.min(counterparty_face));
+    assert_eq!(counterparty_burn + insurance_burn, face_burn);
+    assert!(counterparty_burn <= counterparty_face);
+    assert!(insurance_burn <= insurance_face);
+    assert_eq!(counterparty_release % BOUND_SCALE, 0);
+    assert_eq!(insurance_release % BOUND_SCALE, 0);
+    assert_eq!(total_release, counterparty_release + insurance_release);
+    assert!(counterparty_release <= counterparty_backing);
+    assert!(insurance_release <= insurance_backing);
+
+    let counterparty_face_after = counterparty_face - counterparty_burn;
+    let insurance_face_after = insurance_face - insurance_burn;
+    let counterparty_backing_after = counterparty_backing - counterparty_release;
+    let insurance_backing_after = insurance_backing - insurance_release;
+    let counterparty_ceiling_after = counterparty_face_after / BOUND_SCALE
+        + u128::from(counterparty_face_after % BOUND_SCALE != 0);
+    let insurance_ceiling_after =
+        insurance_face_after / BOUND_SCALE + u128::from(insurance_face_after % BOUND_SCALE != 0);
+
+    assert_eq!(
+        counterparty_face_after + insurance_face_after,
+        total_face - face_burn,
+        "every successful reversal strictly decreases the liened-face rank"
+    );
+    assert!(counterparty_backing_after / BOUND_SCALE <= counterparty_ceiling_after);
+    assert!(insurance_backing_after / BOUND_SCALE <= insurance_ceiling_after);
+    if counterparty_release != 0 {
+        assert_eq!(
+            counterparty_backing_after / BOUND_SCALE,
+            counterparty_ceiling_after
+        );
+    }
+    if insurance_release != 0 {
+        assert_eq!(
+            insurance_backing_after / BOUND_SCALE,
+            insurance_ceiling_after
+        );
+    }
+    if counterparty_burn == counterparty_face {
+        assert_eq!(counterparty_release, counterparty_backing);
+    }
+    if insurance_burn == insurance_face {
+        assert_eq!(insurance_release, insurance_backing);
+    }
+
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn == 0,
+        "counterparty-only face burn is reachable"
+    );
+    kani::cover!(
+        counterparty_burn == 0 && insurance_burn > 0,
+        "insurance-only face burn is reachable"
+    );
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn > 0,
+        "one burn can cross both source classes"
+    );
+    kani::cover!(
+        total_release == 0,
+        "face can shrink without over-releasing backing"
+    );
+    kani::cover!(total_release > 0, "face shrink can require backing release");
+    kani::cover!(
+        face_burn == total_face,
+        "full reversal releases the complete lien"
+    );
 }
 
 #[kani::proof]

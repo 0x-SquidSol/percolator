@@ -3898,6 +3898,129 @@ fn v16_risk_increasing_trade_creates_source_credit_lien_for_im() {
 }
 
 #[test]
+fn v16_live_mark_reversal_unwinds_source_lien_before_claim_burn() {
+    const OPEN_Q: u128 = 1_000 * POS_SCALE;
+    const INCREASE_Q: u128 = 50 * POS_SCALE;
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.config.maintenance_margin_bps = V16PodU64::new(1_000);
+    header.config.initial_margin_bps = V16PodU64::new(5_000);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(500);
+    header.config.max_accrual_dt_slots = V16PodU64::new(1);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(1);
+    let mut long_header = account_fixture(1, 10);
+    let mut short_header = account_fixture(1, 11);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market
+        .deposit_fresh_counterparty_backing_not_atomic(1, 100_000, 100)
+        .unwrap();
+    market.deposit_not_atomic(&mut long, 52_501).unwrap();
+    market.deposit_not_atomic(&mut short, 1_000_000).unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(OPEN_Q),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+
+    market
+        .set_asset_raw_oracle_target_not_atomic(0, 105)
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(0, 2, 105, 0, true)
+        .unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    assert_eq!(long.header.pnl.get(), 5_000);
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(INCREASE_Q),
+                exec_price: 105,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+    let lien_before = long.header.source_domains[0];
+    assert_eq!(long.header.pnl.get(), 5_000);
+    assert!(lien_before.source_claim_liened_num.get() > 0);
+    assert!(lien_before.source_lien_counterparty_backing_num.get() > 0);
+    let capital_before_reversal = long.header.capital.get();
+    let lien_effective = lien_before.source_lien_effective_reserved.get();
+    let backing_before_reversal = market.markets[0]
+        .engine
+        .backing_short
+        .try_to_runtime()
+        .unwrap();
+
+    market
+        .set_asset_raw_oracle_target_not_atomic(0, 100)
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(0, 3, 100, 0, true)
+        .unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    let cert = market
+        .full_account_refresh_not_atomic(&mut long)
+        .expect("a mark reversal must settle even when the prior positive claim backed IM");
+
+    let backing_after_reversal = market.markets[0]
+        .engine
+        .backing_short
+        .try_to_runtime()
+        .unwrap();
+    let unliened_support_consumed = 5_000 - lien_effective;
+    // Upstream's a0335e57 form wrote `5_250 - unliened_support_consumed` here and
+    // corrected it to `5_250 - 5_000` in 07208fb1 ("Fix source loss face
+    // overburn"): the prior positive face absorbs the reversal one-for-one
+    // before principal is touched. This fork already produces the corrected
+    // number, because its #172 site-1 proportional burn (row 120) reaches the
+    // same split, so the assertion is taken in its 07208fb1 form.
+    let principal_loss = 5_250 - 5_000;
+    assert_eq!(long.header.pnl.get(), 0);
+    assert_eq!(
+        long.header.capital.get(),
+        capital_before_reversal - principal_loss,
+        "the prior positive face absorbs the reversal one-for-one before principal"
+    );
+    assert_eq!(long.header.source_domains[0], Default::default());
+    assert_eq!(
+        backing_after_reversal.fresh_unliened_backing_num,
+        backing_before_reversal
+            .fresh_unliened_backing_num
+            .checked_sub(unliened_support_consumed * BOUND_SCALE)
+            .unwrap()
+            .checked_add(lien_before.source_lien_counterparty_backing_num.get())
+            .unwrap(),
+        "the still-liened backing is unpledged rather than consumed"
+    );
+    assert_eq!(backing_after_reversal.valid_liened_backing_num, 0);
+    assert_eq!(
+        backing_after_reversal.consumed_liened_backing_num,
+        backing_before_reversal.consumed_liened_backing_num
+            + unliened_support_consumed * BOUND_SCALE,
+        "only realizable unliened support offsets the reversal loss"
+    );
+    assert!(cert.valid);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
 fn v16_residual_reward_credit_uses_real_principal_not_notional() {
     let (mut header, mut markets) = market_fixture(1, 1_000);
     header.config.initial_margin_bps = V16PodU64::new(500);
@@ -4255,6 +4378,241 @@ fn v16_grant_source_positive_pnl_attributes_claims_and_aggregates_in_lockstep() 
     let err = market.add_account_source_positive_pnl_not_atomic(&mut account, 0, 1);
     assert_eq!(err, Err(V16Error::LockActive));
     assert_eq!(account.header.pnl.get(), 25);
+}
+
+/// A B-settlement loss must retire the claim of the leg's own opposite-side
+/// source domain before any unrelated domain's claim (upstream 3ed6e11b, made
+/// domain-first with an explicit fallback in ce01590b). The unrelated domain is
+/// granted first so it occupies the earlier portfolio slot, which is exactly the
+/// slot the pre-port generic burn walked first.
+#[test]
+fn v16_b_settlement_loss_retires_the_legs_own_source_domain_first() {
+    const LOT_Q: u128 = 1_000 * POS_SCALE;
+    // loss = loss_weight * delta_b / SOCIAL_LOSS_DEN = 1e9 * 1e13 / 1e21 = 10 atoms.
+    const B_TARGET: u128 = 10_000_000_000_000;
+    const LOSS_ATOMS: u128 = 10;
+    const GRANT_ATOMS: u128 = 40;
+    const LEG_DOMAIN: usize = 1;
+    const UNRELATED_DOMAIN: usize = 2;
+
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut long_header = account_fixture(2, 71);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        market.deposit_not_atomic(&mut long, 1_000).unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(&mut long, UNRELATED_DOMAIN, GRANT_ATOMS)
+            .unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(&mut long, LEG_DOMAIN, GRANT_ATOMS)
+            .unwrap();
+    }
+    assert_eq!(
+        long_header.source_domains[0].domain.get() as usize,
+        UNRELATED_DOMAIN,
+        "the unrelated domain must occupy the earlier slot for this to be a real test"
+    );
+    assert_eq!(
+        long_header.source_domains[1].domain.get() as usize,
+        LEG_DOMAIN
+    );
+
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = LOT_Q;
+    asset.oi_eff_short_q = LOT_Q;
+    asset.stored_pos_count_long = 1;
+    asset.stored_pos_count_short = 1;
+    asset.loss_weight_sum_long = LOT_Q;
+    asset.loss_weight_sum_short = LOT_Q;
+    asset.b_long_num = B_TARGET;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+
+    long_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Long,
+        basis_pos_q: signed_q(LOT_Q),
+        a_basis: ADL_ONE,
+        k_snap: asset.k_long,
+        f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_long,
+        loss_weight: LOT_Q,
+        b_snap: 0,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    long_header.active_bitmap[0] = V16PodU64::new(1);
+    long_header.health_cert.valid = 0;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+
+    let outcome = market
+        .permissionless_crank_not_atomic(
+            &mut long,
+            PermissionlessCrankRequestV16 {
+                now_slot: 1,
+                asset_index: 0,
+                effective_price: 100,
+                funding_rate_e9: 0,
+                action: PermissionlessCrankActionV16::SettleB { asset_index: 0 },
+            },
+        )
+        .unwrap();
+    let PermissionlessProgressOutcomeV16::AccountBChunk(chunk) = outcome else {
+        panic!("SettleB must return a B chunk, got {outcome:?}");
+    };
+    assert_eq!(chunk.delta_b, B_TARGET);
+    assert_eq!(chunk.loss, LOSS_ATOMS);
+    assert_eq!(chunk.remaining_after, 0);
+
+    assert_eq!(
+        long.header.pnl.get() as u128,
+        2 * GRANT_ATOMS - LOSS_ATOMS,
+        "the loss reduces the account's positive PnL"
+    );
+    assert_eq!(
+        long.header.source_domains[1].source_claim_bound_num.get(),
+        (GRANT_ATOMS - LOSS_ATOMS) * BOUND_SCALE,
+        "the leg's own opposite-side domain absorbs the whole B loss"
+    );
+    assert_eq!(
+        long.header.source_domains[0].source_claim_bound_num.get(),
+        GRANT_ATOMS * BOUND_SCALE,
+        "an unrelated domain's claim is untouched by another asset's B loss"
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+}
+
+/// The fallback half of the same rule, which ce01590b makes an explicit
+/// partition: a loss larger than the leg's own domain claim exhausts that domain
+/// and only the strict remainder reaches any other domain.
+#[test]
+fn v16_b_settlement_loss_spills_past_an_exhausted_own_source_domain() {
+    const LOT_Q: u128 = 1_000 * POS_SCALE;
+    // loss = loss_weight * delta_b / SOCIAL_LOSS_DEN = 1e9 * 1e13 / 1e21 = 10 atoms.
+    const B_TARGET: u128 = 10_000_000_000_000;
+    const LOSS_ATOMS: u128 = 10;
+    const UNRELATED_GRANT_ATOMS: u128 = 40;
+    const LEG_GRANT_ATOMS: u128 = 4;
+    const LEG_DOMAIN: usize = 1;
+    const UNRELATED_DOMAIN: usize = 2;
+
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut long_header = account_fixture(2, 71);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        market.deposit_not_atomic(&mut long, 1_000).unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(
+                &mut long,
+                UNRELATED_DOMAIN,
+                UNRELATED_GRANT_ATOMS,
+            )
+            .unwrap();
+        market
+            .add_account_source_positive_pnl_not_atomic(&mut long, LEG_DOMAIN, LEG_GRANT_ATOMS)
+            .unwrap();
+    }
+    assert_eq!(
+        long_header.source_domains[0].domain.get() as usize,
+        UNRELATED_DOMAIN,
+        "the unrelated domain must occupy the earlier slot for this to be a real test"
+    );
+    assert_eq!(
+        long_header.source_domains[1].domain.get() as usize,
+        LEG_DOMAIN
+    );
+
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = LOT_Q;
+    asset.oi_eff_short_q = LOT_Q;
+    asset.stored_pos_count_long = 1;
+    asset.stored_pos_count_short = 1;
+    asset.loss_weight_sum_long = LOT_Q;
+    asset.loss_weight_sum_short = LOT_Q;
+    asset.b_long_num = B_TARGET;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+
+    long_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Long,
+        basis_pos_q: signed_q(LOT_Q),
+        a_basis: ADL_ONE,
+        k_snap: asset.k_long,
+        f_snap: asset.f_long_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_long,
+        loss_weight: LOT_Q,
+        b_snap: 0,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    long_header.active_bitmap[0] = V16PodU64::new(1);
+    long_header.health_cert.valid = 0;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+
+    let outcome = market
+        .permissionless_crank_not_atomic(
+            &mut long,
+            PermissionlessCrankRequestV16 {
+                now_slot: 1,
+                asset_index: 0,
+                effective_price: 100,
+                funding_rate_e9: 0,
+                action: PermissionlessCrankActionV16::SettleB { asset_index: 0 },
+            },
+        )
+        .unwrap();
+    let PermissionlessProgressOutcomeV16::AccountBChunk(chunk) = outcome else {
+        panic!("SettleB must return a B chunk, got {outcome:?}");
+    };
+    assert_eq!(chunk.delta_b, B_TARGET);
+    assert_eq!(chunk.loss, LOSS_ATOMS);
+    assert_eq!(chunk.remaining_after, 0);
+
+    assert_eq!(
+        long.header.pnl.get() as u128,
+        UNRELATED_GRANT_ATOMS + LEG_GRANT_ATOMS - LOSS_ATOMS,
+        "the loss reduces the account's positive PnL"
+    );
+    let claim_for = |domain: usize| -> u128 {
+        long.header
+            .source_domains
+            .iter()
+            .filter(|source| source.domain.get() as usize == domain)
+            .map(|source| source.source_claim_bound_num.get())
+            .sum()
+    };
+    assert_eq!(
+        claim_for(LEG_DOMAIN),
+        0,
+        "the leg's own opposite-side domain is exhausted first"
+    );
+    assert_eq!(
+        claim_for(UNRELATED_DOMAIN),
+        (UNRELATED_GRANT_ATOMS - (LOSS_ATOMS - LEG_GRANT_ATOMS)) * BOUND_SCALE,
+        "only the strict remainder past the exhausted own domain reaches another domain"
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
 }
 
 // ---------------------------------------------------------------------------
