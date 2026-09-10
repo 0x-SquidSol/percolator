@@ -1499,6 +1499,36 @@ impl V16Core {
         ))
     }
 
+    /// PRODUCTION KERNEL: the fee revenue a source lien keeps after part of its
+    /// counterparty backing is released. Revenue scales with the backing that
+    /// remains, floored so the lien can never keep more than it earned. Releasing
+    /// all backing keeps nothing; releasing none keeps everything, without a
+    /// round-trip through mul_div. Backing that GREW is a caller error, not a
+    /// negative release. (upstream 6276d568)
+    fn source_lien_fee_after_backing_release(
+        fee_revenue: u128,
+        backing_before: u128,
+        backing_after: u128,
+    ) -> V16Result<u128> {
+        if backing_after > backing_before {
+            return Err(V16Error::InvalidLeg);
+        }
+        if backing_after == 0 || fee_revenue == 0 {
+            return Ok(0);
+        }
+        if backing_after == backing_before {
+            return Ok(fee_revenue);
+        }
+        if backing_before == 0 {
+            return Err(V16Error::InvalidLeg);
+        }
+        Ok(wide_mul_div_floor_u128(
+            fee_revenue,
+            backing_after,
+            backing_before,
+        ))
+    }
+
     #[inline]
     fn validate_bound_num_atom_aligned(bound_num: u128) -> V16Result<()> {
         if bound_num == 0 {
@@ -8547,20 +8577,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             .get()
             .checked_sub(counterparty_backing_release)
             .ok_or(V16Error::CounterUnderflow)?;
-        let fee_revenue_after = if counterparty_backing_after == 0 {
-            0
-        } else {
-            let counterparty_backing_before =
-                source_before.source_lien_counterparty_backing_num.get();
-            if counterparty_backing_before == 0 {
-                return Err(V16Error::InvalidLeg);
-            }
-            wide_mul_div_floor_u128(
-                source_before.source_lien_capital_at_risk_fee_revenue.get(),
-                counterparty_backing_after,
-                counterparty_backing_before,
-            )
-        };
+        let fee_revenue_after = V16Core::source_lien_fee_after_backing_release(
+            source_before.source_lien_capital_at_risk_fee_revenue.get(),
+            source_before.source_lien_counterparty_backing_num.get(),
+            counterparty_backing_after,
+        )?;
 
         let source = &mut account.header.source_domains[slot];
         source.source_claim_liened_num = V16PodU128::new(
@@ -17843,6 +17864,15 @@ pub fn kani_position_delta_increases_risk(current: i128, delta_q: i128) -> V16Re
 pub fn kani_position_change_requires_unit_adl(current: i128, new: i128) -> bool {
     let route = V16Core::kernel_classify_position_delta(current, new);
     V16Core::kernel_position_route_requires_unit_adl(route, current, new)
+}
+
+#[cfg(any(kani, feature = "fuzz"))]
+pub fn kani_source_lien_fee_after_backing_release(
+    fee_revenue: u128,
+    backing_before: u128,
+    backing_after: u128,
+) -> V16Result<u128> {
+    V16Core::source_lien_fee_after_backing_release(fee_revenue, backing_before, backing_after)
 }
 
 #[cfg(any(kani, feature = "fuzz"))]

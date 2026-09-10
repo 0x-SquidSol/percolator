@@ -20,7 +20,8 @@ use percolator::v16::{
     kani_position_change_requires_unit_adl, kani_position_delta_increases_risk,
     kani_prepare_asset_recovery_transition, kani_settle_kf_stale_cohort,
     kani_source_claim_domain_first_burn_partition,
-    kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
+    kani_source_credit_state_realizable_support_for_face,
+    kani_source_lien_fee_after_backing_release, kani_target_effective_lag_adverse_delta,
     kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
     kani_validate_positive_pnl_source_attribution, AssetLifecycleV16, AssetStateV16,
     AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
@@ -14141,4 +14142,55 @@ fn proof_v16_full_drain_reset_then_prior_epoch_clear_is_total_and_exact() {
         "reset+clear preserves nonzero K/F/B targets"
     );
     assert_eq!(cleared, expected_clear);
+}
+
+// Fee revenue a source lien keeps must track the backing that REMAINS: never
+// more than it earned, exactly all of it when nothing was released, and nothing
+// at all when the backing is gone. (upstream 6276d568)
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_source_lien_fee_proration_tracks_remaining_backing() {
+    let fee_raw: u8 = kani::any();
+    let before_raw: u8 = kani::any();
+    let after_raw: u8 = kani::any();
+    kani::assume(fee_raw <= 32);
+    kani::assume((1..=16).contains(&before_raw));
+    kani::assume(after_raw <= before_raw);
+    let fee = fee_raw as u128;
+    let before = before_raw as u128 * BOUND_SCALE;
+    let after = after_raw as u128 * BOUND_SCALE;
+
+    let remaining = kani_source_lien_fee_after_backing_release(fee, before, after).unwrap();
+
+    kani::cover!(
+        after == before,
+        "unchanged backing preserves all fee history"
+    );
+    kani::cover!(after == 0, "full backing release clears live fee history");
+    kani::cover!(
+        after > 0 && after < before && fee > 0,
+        "partial backing release prorates nonzero fee history"
+    );
+    assert_eq!(remaining, fee * after / before);
+    assert!(remaining <= fee);
+    if after == before {
+        assert_eq!(remaining, fee);
+    }
+    if after == 0 {
+        assert_eq!(remaining, 0);
+    }
+
+    // FORK ADDITION: upstream's proof assumes after <= before, so its own
+    // `backing_after > backing_before -> Err(InvalidLeg)` guard is never
+    // exercised. Backing that GREW is a caller error (a negative release), and
+    // silently prorating it would hand the lien MORE revenue than it earned.
+    // Pin it here rather than ship the guard uncontrolled.
+    if before < 16 * BOUND_SCALE {
+        let grown = before + BOUND_SCALE;
+        assert_eq!(
+            kani_source_lien_fee_after_backing_release(fee, before, grown),
+            Err(V16Error::InvalidLeg)
+        );
+    }
 }
