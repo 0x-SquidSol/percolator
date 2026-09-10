@@ -1,3 +1,4 @@
+use percolator::active_bitmap_count_ones;
 use percolator::active_bitmap_is_empty;
 use percolator::{
     v16_domain_count_for_market_slots, AssetLifecycleV16, AssetStateV16Account,
@@ -1669,6 +1670,60 @@ fn v16_resolved_close_caps_adl_reduced_basis_before_reset_detach() {
     assert_eq!(terminal.stored_pos_count_long, 0);
     market.validate_shape().unwrap();
     account.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_resolved_close_detaches_one_solvent_leg_per_call() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut long_header = account_fixture(2, 203);
+    let mut short_header = account_fixture(2, 204);
+    let requests = [
+        TradeRequestV16 {
+            asset_index: 0,
+            size_q: signed_q(POS_SCALE),
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        TradeRequestV16 {
+            asset_index: 1,
+            size_q: signed_q(POS_SCALE),
+            exec_price: 100,
+            fee_bps: 0,
+        },
+    ];
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.deposit_not_atomic(&mut long, 1_000).unwrap();
+    market.deposit_not_atomic(&mut short, 1_000).unwrap();
+    market
+        .execute_batch_with_fee_loss_stale_scoped_not_atomic(&mut long, &mut short, &requests, true)
+        .unwrap();
+    let resolved_slot = market.header.current_slot.get();
+    market.resolve_market_not_atomic(resolved_slot).unwrap();
+
+    let first = market
+        .close_resolved_account_not_atomic(&mut long, 0)
+        .expect("the first resolved continuation must clear one leg");
+    assert_eq!(first, ResolvedCloseOutcomeV16::ProgressOnly);
+    assert_eq!(
+        active_bitmap_count_ones(long.header.active_bitmap.map(V16PodU64::get)),
+        1
+    );
+    assert_eq!(long.header.capital.get(), 1_000);
+
+    let second = market
+        .close_resolved_account_not_atomic(&mut long, 0)
+        .expect("the final resolved continuation must clear and pay");
+    assert_eq!(second, ResolvedCloseOutcomeV16::Closed { payout: 1_000 });
+    assert!(active_bitmap_is_empty(
+        long.header.active_bitmap.map(V16PodU64::get)
+    ));
+    assert_eq!(long.header.capital.get(), 0);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
 }
 
 #[test]
