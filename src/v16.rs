@@ -12564,6 +12564,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 .try_to_runtime()?
                 .has_pending_residual()
             || self.has_pending_domain_loss_barrier(asset_index, leg.side)?
+            || !self.recovery_pending_obligation_release_allowed(asset_index, leg.side)?
         {
             return Ok(false);
         }
