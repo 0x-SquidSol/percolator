@@ -8977,48 +8977,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         V16Core::prepare_insurance_lien_terminal_release_delta(reservation, source, amount)
     }
 
-    #[cfg(kani)]
-    pub fn kani_apply_insurance_lien_consume_domain_delta(
-        &mut self,
-        domain: usize,
-        amount: u128,
-    ) -> V16Result<()> {
-        self.domain_asset_side(domain)?;
-        if amount == 0 {
-            return Ok(());
-        }
-        let (reservation, source, next_domain_spent, next_insurance) =
-            V16Core::prepare_insurance_lien_consume_delta(
-                self.insurance_reservation_for_domain(domain)?,
-                self.source_credit_for_domain(domain)?,
-                self.domain_insurance_budget_spent(domain)?.1,
-                self.header.insurance.get(),
-                amount,
-            )?;
-        let spend_atoms = self
-            .header
-            .insurance
-            .get()
-            .checked_sub(next_insurance)
-            .ok_or(V16Error::CounterUnderflow)?;
-        let vault_before = self.header.vault.get();
-        let (source, next_risk_epoch) = V16Core::prepare_source_credit_domain_recompute_for_epoch(
-            source,
-            self.header.risk_epoch.get(),
-        )?;
-        TokenValueFlowProofV16::validate_insurance_to_close_insurance_spent(
-            spend_atoms,
-            vault_before,
-            self.header.vault.get(),
-        )?;
-        self.set_insurance_reservation_for_domain(domain, reservation)?;
-        self.set_source_credit_for_domain(domain, source)?;
-        self.header.insurance = V16PodU128::new(next_insurance);
-        self.set_domain_insurance_spent_core(domain, next_domain_spent)?;
-        self.header.risk_epoch = V16PodU64::new(next_risk_epoch);
-        Ok(())
-    }
-
     fn create_account_source_credit_lien_for_effective_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -10430,6 +10388,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             last_slot,
             self.header.current_slot.get(),
         )?;
+        // Carry the floored-away fractional accrual forward: when the rent quote
+        // floors to zero this interval, do NOT advance the fee cursor, so a later
+        // collection over a longer interval crosses >= 1 atom (no free lien). The
+        // lien_backing_num == 0 and last_slot == 0 cases were handled above, so a
+        // stuck cursor here only ever means real, still-accruing rent.
+        // (upstream f7ad3ee9)
+        if fee == 0 {
+            return Ok(0);
+        }
         account.header.source_domains[slot].source_lien_fee_last_slot =
             V16PodU64::new(self.header.current_slot.get());
         let mut bucket = self.backing_bucket_for_domain(domain)?;
@@ -13534,6 +13501,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
+    #[cfg(kani)]
+    pub fn kani_create_resolved_payout_receipt_if_needed(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+    ) -> V16Result<()> {
+        self.create_resolved_payout_receipt_if_needed(account)
+    }
+
     fn account_no_positive_credit_equity(account: &PortfolioV16View<'_>) -> V16Result<i128> {
         validate_non_min_i128(account.header.pnl.get())?;
         validate_fee_credits(account.header.fee_credits.get())?;
@@ -15555,7 +15530,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(payout)
     }
 
-    pub fn refine_resolved_unreceipted_bound_not_atomic(
+    // upstream 2cbca3eb (av#89 for av#88): internal only. The only legitimate
+    // decrement is derived from actual source-backed claim realization; a public
+    // caller could inflate the resolved payout rate and strand later claimants.
+    fn refine_resolved_unreceipted_bound_not_atomic(
         &mut self,
         decrease_num: u128,
     ) -> V16Result<()> {
@@ -17013,6 +16991,21 @@ pub fn kani_liquidation_fee_from_raw_fee(
         liquidation_fee_cap,
         closes_full_position,
     )
+}
+
+/// Per-side trade fee atoms, mirroring the production derivation in
+/// `execute_trade_*` exactly (ceil fee notional -> ceil bps). Proof shim for the
+/// no-free-OI lower bound: a nonzero fill at nonzero price with nonzero fee must
+/// charge >= 1 atom. See `proof_v16_nonzero_trade_charges_positive_fee_per_side`.
+/// (upstream 63891280)
+#[cfg(any(kani, feature = "fuzz"))]
+pub fn kani_trade_fee_atoms_per_side(
+    size_q: u128,
+    exec_price: u64,
+    fee_bps: u64,
+) -> V16Result<u128> {
+    let fee_notional = trade_fee_notional_ceil(size_q, exec_price)?;
+    checked_fee_bps(fee_notional, fee_bps)
 }
 
 fn checked_i128_mul(a: i128, b: i128) -> V16Result<i128> {
