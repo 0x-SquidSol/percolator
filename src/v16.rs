@@ -14416,19 +14416,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if account.header.pnl.get() >= 0 {
             return Ok(());
         }
-        Err(V16Error::RecoveryRequired)
-    }
-
-    fn resolved_unattributed_insolvent_negative_pnl_requires_recovery(
-        &self,
-        account: &PortfolioV16View<'_>,
-    ) -> V16Result<bool> {
-        Ok(
-            decode_market_mode(self.header.mode)? == MarketModeV16::Resolved
-                && account.header.pnl.get() < 0
-                && account.header.pnl.get().unsigned_abs() > account.header.capital.get()
-                && self.resolved_bankruptcy_attribution(account)?.is_none(),
-        )
+        // upstream 228d9b3f: resolved bad-debt wind-down is handled by the
+        // resolved close itself (hlock set, PnL zeroed) rather than a terminal
+        // RecoveryRequired state with no permissionless crank.
+        self.header.bankruptcy_hlock_active = 1;
+        self.set_account_pnl(account, 0)?;
+        account.header.health_cert.valid = 0;
+        Ok(())
     }
 
     fn settle_resolved_bankruptcy_negative_pnl(
@@ -15726,21 +15720,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             self.validate_shape()?;
             return Ok(ResolvedCloseOutcomeV16::ProgressOnly);
         }
-        if self
-            .resolved_unattributed_insolvent_negative_pnl_requires_recovery(&account.as_view())?
-        {
-            return Err(V16Error::RecoveryRequired);
-        }
         self.sync_account_fee_to_slot_not_atomic(
             account,
             self.header.resolved_slot.get(),
             fee_rate_per_slot,
         )?;
-        if self
-            .resolved_unattributed_insolvent_negative_pnl_requires_recovery(&account.as_view())?
-        {
-            return Err(V16Error::RecoveryRequired);
-        }
         self.settle_negative_pnl_from_principal_not_atomic(account)?;
         if account.header.pnl.get() < 0 {
             self.settle_resolved_bankruptcy_negative_pnl(account)?;

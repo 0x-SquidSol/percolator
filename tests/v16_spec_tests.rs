@@ -4756,11 +4756,6 @@ fn v16_post_snapshot_backing_expiry_credits_resolved_payout_ledger() {
 // negative, and liquidates such an account REDUCE-ONLY: no insurance, no
 // bankruptcy residual booked against the surviving asset.
 //
-// Fork adaptation: upstream's test tail resolves the market and closes the
-// account through the 228d9b3f wind-down (PnL zeroed). Our engine returns
-// RecoveryRequired for unattributed negative PnL in Resolved mode (sync row 156,
-// maintainer decision pending), so the "repaid clears the lock" arm is exercised
-// through principal settlement after a deposit instead.
 // ---------------------------------------------------------------------------
 
 fn unattributed_deficit_fixture() -> (
@@ -4883,17 +4878,23 @@ fn v16_trade_does_not_charge_prior_multi_asset_deficit_or_force_market_recovery(
     long.validate_with_market(&market.as_view()).unwrap();
     short.validate_with_market(&market.as_view()).unwrap();
 
-    // repaying the deficit through principal clears the lock (exact, not sticky
-    // past zero): deposit covers the -250 and the next refresh settles it.
-    market.deposit_not_atomic(&mut short, 250).unwrap();
-    let now_slot = market.header.current_slot.get() + 1;
+    // upstream 228d9b3f: explicit market resolution winds the unattributed debt
+    // down inside the resolved close itself (no domain guessing, no recovery).
     market
-        .sync_account_fee_to_slot_not_atomic(&mut short, now_slot, 0)
-        .unwrap();
+        .resolve_market_not_atomic(market.header.current_slot.get())
+        .expect("explicit market resolution handles unattributed terminal debt");
+    let loser_close = market
+        .close_resolved_account_not_atomic(&mut short, 0)
+        .expect("resolved settlement clears unattributed negative PnL without domain guessing");
+    assert!(matches!(
+        loser_close,
+        percolator::ResolvedCloseOutcomeV16::Closed { payout: 0 }
+    ));
     assert_eq!(short.header.pnl.get(), 0);
-    assert_eq!(short.header.capital.get(), 0);
     assert_eq!(short.header.liquidation_lock, 0);
+    assert_eq!(market.header.bankruptcy_hlock_active, 1);
     market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
     short.validate_with_market(&market.as_view()).unwrap();
 }
 
