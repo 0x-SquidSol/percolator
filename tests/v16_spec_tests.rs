@@ -4288,6 +4288,41 @@ fn v16_resolved_clock_advance_is_monotonic_and_value_neutral() {
     assert_eq!(live.header.current_slot, live_slot);
 }
 
+// upstream c0dec8ce "Canonicalize source-domain allocation order" (2026-08-29):
+// the mutable view compacts AND orders occupied source domains by domain index,
+// so bounded one-domain-per-call continuations see one canonical layout
+// regardless of allocation history.
+#[test]
+fn v16_mutable_view_canonicalizes_persisted_source_domain_order() {
+    let mut account_header = account_fixture(2, 120);
+    account_header.source_domains[0].domain = V16PodU32::new(3);
+    account_header.source_domains[0].source_claim_market_id = V16PodU64::new(2);
+    account_header.source_domains[0].source_claim_bound_num = V16PodU128::new(3 * BOUND_SCALE);
+    account_header.source_domains[2].domain = V16PodU32::new(1);
+    account_header.source_domains[2].source_claim_market_id = V16PodU64::new(1);
+    account_header.source_domains[2].source_claim_bound_num = V16PodU128::new(BOUND_SCALE);
+
+    let account = PortfolioV16ViewMut::new(&mut account_header);
+
+    assert_eq!(account.header.source_domains[0].domain.get(), 1);
+    assert_eq!(
+        account.header.source_domains[0]
+            .source_claim_bound_num
+            .get(),
+        BOUND_SCALE
+    );
+    assert_eq!(account.header.source_domains[1].domain.get(), 3);
+    assert_eq!(
+        account.header.source_domains[1]
+            .source_claim_bound_num
+            .get(),
+        3 * BOUND_SCALE
+    );
+    assert!(account.header.source_domains[2..]
+        .iter()
+        .all(|source| *source == PortfolioSourceDomainV16Account::default()));
+}
+
 // upstream c09d4575 "Fix live source-backing expiry progress" (2026-08-06): a
 // source-backed winner can remain Live past its backing bucket's expiry; the
 // permissionless refresh commits exactly one canonical expiry transition per
