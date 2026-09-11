@@ -318,22 +318,22 @@ fn liquidation_uncovered_loss_after_principal(pnl: i128, capital: u128) -> u128 
 }
 
 #[inline]
-fn liquidation_close_would_leave_uncovered_loss_with_open_risk(
+fn uncovered_loss_remains_with_open_risk(
     pnl: i128,
     capital: u128,
-    active_bitmap: V16ActiveBitmap,
-    leg_slot_index: usize,
-    close_q: u128,
-    leg_abs_q: u128,
-) -> V16Result<bool> {
+    remaining_active_bitmap: V16ActiveBitmap,
+) -> bool {
     let uncovered_loss_after_principal = liquidation_uncovered_loss_after_principal(pnl, capital);
-    let remaining_active_bitmap = liquidation_remaining_active_bitmap_after_close(
-        active_bitmap,
-        leg_slot_index,
-        close_q,
-        leg_abs_q,
-    )?;
-    Ok(uncovered_loss_after_principal != 0 && !active_bitmap_is_empty(remaining_active_bitmap))
+    uncovered_loss_after_principal != 0 && !active_bitmap_is_empty(remaining_active_bitmap)
+}
+
+#[inline]
+fn unattributed_loss_lock_after_pnl(
+    was_locked: bool,
+    active_bitmap: V16ActiveBitmap,
+    new_pnl: i128,
+) -> bool {
+    new_pnl < 0 && (was_locked || active_bitmap_count_ones(active_bitmap) > 1)
 }
 
 #[cfg(kani)]
@@ -345,14 +345,26 @@ pub fn kani_liquidation_close_would_leave_uncovered_loss_with_open_risk(
     close_q: u128,
     leg_abs_q: u128,
 ) -> V16Result<bool> {
-    liquidation_close_would_leave_uncovered_loss_with_open_risk(
-        pnl,
-        capital,
+    let remaining_active_bitmap = liquidation_remaining_active_bitmap_after_close(
         active_bitmap,
         leg_slot_index,
         close_q,
         leg_abs_q,
-    )
+    )?;
+    Ok(uncovered_loss_remains_with_open_risk(
+        pnl,
+        capital,
+        remaining_active_bitmap,
+    ))
+}
+
+#[cfg(kani)]
+pub fn kani_unattributed_loss_lock_after_pnl(
+    was_locked: bool,
+    active_bitmap: V16ActiveBitmap,
+    new_pnl: i128,
+) -> bool {
+    unattributed_loss_lock_after_pnl(was_locked, active_bitmap, new_pnl)
 }
 
 // FIX E3 (upstream #92 / b97e1746): liquidation size + fee are now fully
@@ -391,8 +403,11 @@ fn liquidation_leg_maintenance_requirement(
     let adverse_delta =
         V16Core::target_effective_lag_adverse_delta(side, effective_price, raw_target_price);
     let target_lag_penalty = liquidation_risk_notional_ceil(abs_q, adverse_delta)?;
-    let base = ((risk_notional * config.maintenance_margin_bps as u128) / MAX_MARGIN_BPS as u128)
-        .max(config.min_nonzero_mm_req);
+    let base = margin_requirement(
+        risk_notional,
+        config.maintenance_margin_bps,
+        config.min_nonzero_mm_req,
+    )?;
     base.checked_add(target_lag_penalty)
         .ok_or(V16Error::ArithmeticOverflow)
 }
@@ -767,6 +782,28 @@ pub fn active_bitmap_count_ones(bitmap: V16ActiveBitmap) -> u32 {
 struct V16Core;
 
 impl V16Core {
+    /// ceil(a * b / denominator) with a u128 fast path and a U256 fallback
+    /// (upstream 4c4dfb20 / ba7a84b7; zero denominator is InvalidConfig).
+    #[inline(always)]
+    fn mul_div_ceil_u128_or_wide(a: u128, b: u128, denominator: u128) -> V16Result<u128> {
+        if denominator == 0 {
+            return Err(V16Error::InvalidConfig);
+        }
+        if let Some(product) = a.checked_mul(b) {
+            let quotient = product / denominator;
+            return quotient
+                .checked_add(u128::from(product % denominator != 0))
+                .ok_or(V16Error::ArithmeticOverflow);
+        }
+        checked_mul_div_ceil_u256(
+            U256::from_u128(a),
+            U256::from_u128(b),
+            U256::from_u128(denominator),
+        )
+        .and_then(|value| value.try_into_u128())
+        .ok_or(V16Error::ArithmeticOverflow)
+    }
+
     /// Starts a new settlement cohort whenever a side's K/F target moves.
     /// The epoch makes repeated accrual and exact index reversal unambiguous.
     pub(crate) fn kernel_mark_kf_stale_cohorts(
@@ -887,6 +924,19 @@ impl V16Core {
         Ok((ledger, legacy_snapshot))
     }
 
+    /// A close snapshot becomes stale only when the originating asset has
+    /// advanced past the immutable close anchor while that asset's leg remains
+    /// attached. Unrelated assets may advance the market-wide slot without
+    /// changing this close's economics and therefore cannot trigger recovery.
+    /// (upstream 377de75c)
+    pub(crate) fn kernel_open_close_snapshot_is_stale(
+        originating_leg_active: bool,
+        originating_asset_slot: u64,
+        drift_reference_slot: u64,
+    ) -> bool {
+        originating_leg_active && originating_asset_slot > drift_reference_slot
+    }
+
     /// PRODUCTION KERNEL: canonicalize only an economically empty expired
     /// bucket. Retirement must not erase consumed principal, impaired backing,
     /// or provider earnings merely because the freshness period ended.
@@ -945,6 +995,23 @@ impl V16Core {
             BackingBucketStatusV16::Impaired
         };
         Ok((bucket, source))
+    }
+
+    /// PRODUCTION KERNEL: admit an authenticated clock observation into terminal
+    /// settlement. Resolved routes do not accrue markets, but expiry-sensitive
+    /// backing still requires a monotonic current slot. (upstream 44847fd5)
+    fn kernel_advance_resolved_slot(
+        mode: MarketModeV16,
+        current_slot: u64,
+        authenticated_slot: u64,
+    ) -> V16Result<u64> {
+        if mode != MarketModeV16::Resolved {
+            return Err(V16Error::LockActive);
+        }
+        if authenticated_slot < current_slot {
+            return Err(V16Error::Stale);
+        }
+        Ok(authenticated_slot)
     }
 
     /// PRODUCTION KERNEL: one step of the compact source-domain expiry scan.
@@ -2254,15 +2321,8 @@ impl V16Config {
     }
 
     fn maintenance_requirement_for_notional(&self, n: u128) -> V16Result<u128> {
-        let mm_prop = if let Some(product) = n.checked_mul(self.maintenance_margin_bps as u128) {
-            product / 10_000
-        } else {
-            U256::from_u128(n)
-                .checked_mul(U256::from_u128(self.maintenance_margin_bps as u128))
-                .and_then(|v| v.checked_div(U256::from_u128(10_000)))
-                .and_then(|v| v.try_into_u128())
-                .ok_or(V16Error::InvalidConfig)?
-        };
+        let mm_prop =
+            Self::checked_mul_div_ceil_to_u128(n, self.maintenance_margin_bps as u128, 10_000)?;
         Ok(core::cmp::max(mm_prop, self.min_nonzero_mm_req))
     }
 
@@ -2470,16 +2530,11 @@ impl V16Config {
             return Err(V16Error::InvalidConfig);
         }
 
-        let floor_region_max = U256::from_u128(
-            self.min_nonzero_mm_req
-                .checked_add(1)
-                .ok_or(V16Error::InvalidConfig)?,
-        )
-        .checked_mul(ten_thousand)
-        .and_then(|v| v.checked_sub(U256::ONE))
-        .and_then(|v| v.checked_div(U256::from_u128(self.maintenance_margin_bps as u128)))
-        .and_then(|v| v.try_into_u128())
-        .ok_or(V16Error::InvalidConfig)?;
+        let floor_region_max = U256::from_u128(self.min_nonzero_mm_req)
+            .checked_mul(ten_thousand)
+            .and_then(|v| v.checked_div(U256::from_u128(self.maintenance_margin_bps as u128)))
+            .and_then(|v| v.try_into_u128())
+            .ok_or(V16Error::InvalidConfig)?;
         let floor_region_end = core::cmp::min(floor_region_max, domain_max);
         if floor_region_end != 0
             && !self.solvency_envelope_holds_for_notional(
@@ -3132,9 +3187,16 @@ impl<'a> PortfolioV16ViewMut<'a> {
     fn compact_source_domains(&mut self) {
         let mut write = 0usize;
         let mut read = 0usize;
+        let mut ordered = true;
+        let mut previous_domain = None;
         while read < PORTFOLIO_SOURCE_DOMAIN_CAP {
             let source = self.header.source_domains[read];
             if source.is_occupied() {
+                let domain = source.domain.get();
+                if previous_domain.is_some_and(|previous| previous > domain) {
+                    ordered = false;
+                }
+                previous_domain = Some(domain);
                 if write != read {
                     self.header.source_domains[write] = source;
                     self.header.source_domains[read] = PortfolioSourceDomainV16Account::default();
@@ -3143,9 +3205,27 @@ impl<'a> PortfolioV16ViewMut<'a> {
             }
             read += 1;
         }
+        let occupied = write;
         while write < PORTFOLIO_SOURCE_DOMAIN_CAP {
             self.header.source_domains[write] = PortfolioSourceDomainV16Account::default();
             write += 1;
+        }
+        // upstream c0dec8ce: canonical allocation order (ascending domain index) so
+        // bounded one-domain-per-call continuations see one layout.
+        if !ordered {
+            let mut index = 1usize;
+            while index < occupied {
+                let source = self.header.source_domains[index];
+                let mut insert = index;
+                while insert != 0
+                    && self.header.source_domains[insert - 1].domain.get() > source.domain.get()
+                {
+                    self.header.source_domains[insert] = self.header.source_domains[insert - 1];
+                    insert -= 1;
+                }
+                self.header.source_domains[insert] = source;
+                index += 1;
+            }
         }
     }
 }
@@ -3163,6 +3243,10 @@ impl<'a> PortfolioV16View<'a> {
         let pnl = self.header.pnl.get();
         validate_non_min_i128(pnl)?;
         validate_fee_credits(self.header.fee_credits.get())?;
+        let liquidation_lock = decode_bool(self.header.liquidation_lock)?;
+        if liquidation_lock && pnl >= 0 {
+            return Err(V16Error::InvalidLeg);
+        }
         if self.header.reserved_pnl.get() > pnl.max(0) as u128 {
             return Err(V16Error::InvalidLeg);
         }
@@ -6412,6 +6496,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let pnl = account.header.pnl.get();
         validate_non_min_i128(pnl)?;
         validate_fee_credits(account.header.fee_credits.get())?;
+        let liquidation_lock = decode_bool(account.header.liquidation_lock)?;
+        if liquidation_lock && pnl >= 0 {
+            return Err(V16Error::InvalidLeg);
+        }
         if account.header.reserved_pnl.get() > pnl.max(0) as u128 {
             return Err(V16Error::InvalidLeg);
         }
@@ -9192,48 +9280,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         V16Core::prepare_insurance_lien_terminal_release_delta(reservation, source, amount)
     }
 
-    #[cfg(kani)]
-    pub fn kani_apply_insurance_lien_consume_domain_delta(
-        &mut self,
-        domain: usize,
-        amount: u128,
-    ) -> V16Result<()> {
-        self.domain_asset_side(domain)?;
-        if amount == 0 {
-            return Ok(());
-        }
-        let (reservation, source, next_domain_spent, next_insurance) =
-            V16Core::prepare_insurance_lien_consume_delta(
-                self.insurance_reservation_for_domain(domain)?,
-                self.source_credit_for_domain(domain)?,
-                self.domain_insurance_budget_spent(domain)?.1,
-                self.header.insurance.get(),
-                amount,
-            )?;
-        let spend_atoms = self
-            .header
-            .insurance
-            .get()
-            .checked_sub(next_insurance)
-            .ok_or(V16Error::CounterUnderflow)?;
-        let vault_before = self.header.vault.get();
-        let (source, next_risk_epoch) = V16Core::prepare_source_credit_domain_recompute_for_epoch(
-            source,
-            self.header.risk_epoch.get(),
-        )?;
-        TokenValueFlowProofV16::validate_insurance_to_close_insurance_spent(
-            spend_atoms,
-            vault_before,
-            self.header.vault.get(),
-        )?;
-        self.set_insurance_reservation_for_domain(domain, reservation)?;
-        self.set_source_credit_for_domain(domain, source)?;
-        self.header.insurance = V16PodU128::new(next_insurance);
-        self.set_domain_insurance_spent_core(domain, next_domain_spent)?;
-        self.header.risk_epoch = V16PodU64::new(next_risk_epoch);
-        Ok(())
-    }
-
     fn create_account_source_credit_lien_for_effective_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -9651,6 +9697,19 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account.validate_with_market(&self.as_view())
     }
 
+    fn sync_unattributed_loss_lock(
+        account: &mut PortfolioV16ViewMut<'_>,
+        new_pnl: i128,
+    ) -> V16Result<()> {
+        let was_locked = decode_bool(account.header.liquidation_lock)?;
+        account.header.liquidation_lock = encode_bool(unattributed_loss_lock_after_pnl(
+            was_locked,
+            account.header.active_bitmap.map(V16PodU64::get),
+            new_pnl,
+        ));
+        Ok(())
+    }
+
     fn set_account_pnl_inner(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -9766,6 +9825,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             _ => {}
         }
+        Self::sync_unattributed_loss_lock(account, new_pnl)?;
         account.header.pnl = V16PodI128::new(new_pnl);
         account.header.health_cert.valid = 0;
         Ok(())
@@ -10827,6 +10887,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             last_slot,
             self.header.current_slot.get(),
         )?;
+        // Carry the floored-away fractional accrual forward: when the rent quote
+        // floors to zero this interval, do NOT advance the fee cursor, so a later
+        // collection over a longer interval crosses >= 1 atom (no free lien). The
+        // lien_backing_num == 0 and last_slot == 0 cases were handled above, so a
+        // stuck cursor here only ever means real, still-accruing rent.
+        // (upstream f7ad3ee9)
+        if fee == 0 {
+            return Ok(0);
+        }
         account.header.source_domains[slot].source_lien_fee_last_slot =
             V16PodU64::new(self.header.current_slot.get());
         let mut bucket = self.backing_bucket_for_domain(domain)?;
@@ -11219,7 +11288,6 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             || effective_price == 0
             || effective_price > MAX_ORACLE_PRICE
             || funding_rate_e9.unsigned_abs() > config.max_abs_funding_e9_per_slot as u128
-            || now_slot < self.header.current_slot.get()
         {
             return Err(V16Error::InvalidConfig);
         }
@@ -11309,7 +11377,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             asset.slot_last,
         )?;
         self.set_asset_state(asset_index, asset)?;
-        self.header.current_slot = V16PodU64::new(now_slot);
+        // `now_slot` is the endpoint of this asset-local committed segment. Another asset can
+        // already have advanced the market's authenticated clock beyond that endpoint, so keep
+        // the global clock monotonic while allowing this lagging asset to catch up.
+        // (upstream b4b975f3)
+        self.header.current_slot = V16PodU64::new(self.header.current_slot.get().max(now_slot));
         // Hot paths are asset-local: scanning all markets here makes every
         // crank/trade depend on total dynamic asset count. `slot_last` and
         // `loss_stale_active` summarize only the touched asset; safety gates
@@ -11784,6 +11856,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     {
                         return Err(V16Error::Stale);
                     }
+                    asset.k_epoch_start_long = 0;
+                    asset.f_epoch_start_long_num = 0;
+                    asset.b_epoch_start_long_num = 0;
                     asset.mode_long = SideModeV16::Normal;
                 }
             },
@@ -11798,6 +11873,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     {
                         return Err(V16Error::Stale);
                     }
+                    asset.k_epoch_start_short = 0;
+                    asset.f_epoch_start_short_num = 0;
+                    asset.b_epoch_start_short_num = 0;
                     asset.mode_short = SideModeV16::Normal;
                 }
             },
@@ -12074,7 +12152,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         #[cfg(feature = "fork-facade")] instruction_threshold_bps_opt: Option<u128>,
     ) -> V16Result<HLockLaneV16> {
         if let Some(account) = account {
-            if decode_bool(account.header.stale_state)?
+            if decode_bool(account.header.liquidation_lock)?
+                || decode_bool(account.header.stale_state)?
                 || decode_bool(account.header.b_stale_state)?
                 || self.account_has_loss_stale_live_leg(account)?
             {
@@ -12530,6 +12609,19 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let leg = account.header.legs[leg_slot].try_to_runtime()?;
         if !leg.active || leg.b_stale || leg.stale {
             return Err(V16Error::InvalidLeg);
+        }
+        let remaining_active_bitmap =
+            active_bitmap_with_cleared(account.header.active_bitmap.map(V16PodU64::get), leg_slot)?;
+        // Account PnL is cross-margin and does not retain negative-loss provenance.
+        // Preserve that fact across the detach so later liquidation can reduce
+        // risk without charging the selected surviving asset domain.
+        if uncovered_loss_remains_with_open_risk(
+            account.header.pnl.get(),
+            account.header.capital.get(),
+            remaining_active_bitmap,
+        ) {
+            account.header.liquidation_lock = encode_bool(true);
+            account.header.health_cert.valid = 0;
         }
         if account
             .header
@@ -13078,8 +13170,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         let asset_index = ledger.asset_index as usize;
         if asset_index < self.header.config.max_market_slots.get() as usize
-            && Self::active_leg_slot_for_asset(account, asset_index)?.is_some()
-            && self.header.current_slot.get() > ledger.drift_reference_slot
+            && V16Core::kernel_open_close_snapshot_is_stale(
+                Self::active_leg_slot_for_asset(account, asset_index)?.is_some(),
+                self.asset_state(asset_index)?.slot_last,
+                ledger.drift_reference_slot,
+            )
         {
             if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved {
                 return Ok(());
@@ -13758,14 +13853,35 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )? {
             return Err(V16Error::LockActive);
         }
-        if liquidation_close_would_leave_uncovered_loss_with_open_risk(
-            account.header.pnl.get(),
-            account.header.capital.get(),
+        // A multi-asset deficit has no safe per-domain attribution in the
+        // account-global PnL scalar. Permissionless liquidation can still remove
+        // bounded risk, but it must not consume insurance or book B against the
+        // selected surviving asset.
+        if decode_bool(account.header.liquidation_lock)? {
+            self.reduce_position(account, request.asset_index, close_q)?;
+            self.certify_account_after_local_settlement_with_price_override(account, None)?;
+            self.validate_liquidation_progress_from_score(before_score, &account.as_view())?;
+            self.validate_shape_audit_scan()?;
+            self.validate_account_audit_scan(&account.as_view())?;
+            return Ok(LiquidationOutcomeV16 {
+                closed_q: close_q,
+                insurance_used: 0,
+                residual_booked: 0,
+                explicit_loss: 0,
+                fee_charged: 0,
+            });
+        }
+        let remaining_active_bitmap = liquidation_remaining_active_bitmap_after_close(
             account.header.active_bitmap.map(V16PodU64::get),
             leg_slot,
             close_q,
             leg.basis_pos_q.unsigned_abs(),
-        )? {
+        )?;
+        if uncovered_loss_remains_with_open_risk(
+            account.header.pnl.get(),
+            account.header.capital.get(),
+            remaining_active_bitmap,
+        ) {
             self.declare_permissionless_recovery(
                 PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
             )?;
@@ -13967,6 +14083,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     #[cfg(kani)]
+    pub fn kani_advance_resolved_slot(
+        mode: MarketModeV16,
+        current_slot: u64,
+        authenticated_slot: u64,
+    ) -> V16Result<u64> {
+        V16Core::kernel_advance_resolved_slot(mode, current_slot, authenticated_slot)
+    }
+
+    #[cfg(kani)]
     pub fn kani_lapsed_source_backing_scan_step(
         selected: Option<usize>,
         sparse_tail: bool,
@@ -13985,6 +14110,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             expiry_slot,
             current_slot,
         )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_create_resolved_payout_receipt_if_needed(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+    ) -> V16Result<()> {
+        self.create_resolved_payout_receipt_if_needed(account)
     }
 
     fn account_no_positive_credit_equity(account: &PortfolioV16View<'_>) -> V16Result<i128> {
@@ -14724,6 +14857,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     .ok_or(V16Error::CounterUnderflow)?,
             );
         }
+        Self::sync_unattributed_loss_lock(account, new_pnl)?;
         account.header.pnl = V16PodI128::new(new_pnl);
         Ok(())
     }
@@ -14763,19 +14897,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if account.header.pnl.get() >= 0 {
             return Ok(());
         }
-        Err(V16Error::RecoveryRequired)
-    }
-
-    fn resolved_unattributed_insolvent_negative_pnl_requires_recovery(
-        &self,
-        account: &PortfolioV16View<'_>,
-    ) -> V16Result<bool> {
-        Ok(
-            decode_market_mode(self.header.mode)? == MarketModeV16::Resolved
-                && account.header.pnl.get() < 0
-                && account.header.pnl.get().unsigned_abs() > account.header.capital.get()
-                && self.resolved_bankruptcy_attribution(account)?.is_none(),
-        )
+        // upstream 228d9b3f: resolved bad-debt wind-down is handled by the
+        // resolved close itself (hlock set, PnL zeroed) rather than a terminal
+        // RecoveryRequired state with no permissionless crank.
+        self.header.bankruptcy_hlock_active = 1;
+        self.set_account_pnl(account, 0)?;
+        account.header.health_cert.valid = 0;
+        Ok(())
     }
 
     fn settle_resolved_bankruptcy_negative_pnl(
@@ -15818,6 +15946,20 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.validate_shape()
     }
 
+    /// Advances only the clock used by resolved settlement. The wrapper must
+    /// authenticate `authenticated_slot` (for Solana, from the Clock sysvar).
+    /// No price, funding, value, claim, or lifecycle field is changed.
+    /// (upstream 44847fd5)
+    pub fn advance_resolved_slot_not_atomic(&mut self, authenticated_slot: u64) -> V16Result<()> {
+        let next = V16Core::kernel_advance_resolved_slot(
+            decode_market_mode(self.header.mode)?,
+            self.header.current_slot.get(),
+            authenticated_slot,
+        )?;
+        self.header.current_slot = V16PodU64::new(next);
+        Ok(())
+    }
+
     // A resolved-payout receipt that has been paid its full entitlement at the TERMINAL
     // payout rate (no unreceipted bound remains, so the rate can no longer rise) holds
     // only unrecoverable insolvency bad debt: the haircut shortfall (face - paid) is not
@@ -16008,7 +16150,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(payout)
     }
 
-    pub fn refine_resolved_unreceipted_bound_not_atomic(
+    // upstream 2cbca3eb (av#89 for av#88): internal only. The only legitimate
+    // decrement is derived from actual source-backed claim realization; a public
+    // caller could inflate the resolved payout rate and strand later claimants.
+    fn refine_resolved_unreceipted_bound_not_atomic(
         &mut self,
         decrease_num: u128,
     ) -> V16Result<()> {
@@ -16056,21 +16201,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             self.validate_shape()?;
             return Ok(ResolvedCloseOutcomeV16::ProgressOnly);
         }
-        if self
-            .resolved_unattributed_insolvent_negative_pnl_requires_recovery(&account.as_view())?
-        {
-            return Err(V16Error::RecoveryRequired);
-        }
         self.sync_account_fee_to_slot_not_atomic(
             account,
             self.header.resolved_slot.get(),
             fee_rate_per_slot,
         )?;
-        if self
-            .resolved_unattributed_insolvent_negative_pnl_requires_recovery(&account.as_view())?
-        {
-            return Err(V16Error::RecoveryRequired);
-        }
         self.settle_negative_pnl_from_principal_not_atomic(account)?;
         if account.header.pnl.get() < 0 {
             self.settle_resolved_bankruptcy_negative_pnl(account)?;
@@ -17148,6 +17283,8 @@ pub struct PortfolioAccountV16Account {
     pub stale_state: u8,
     pub b_stale_state: u8,
     pub rebalance_lock: u8,
+    // Set while negative PnL has crossed more than one active asset and therefore
+    // cannot be safely charged to any one asset's insurance/B domain.
     pub liquidation_lock: u8,
     pub close_progress: CloseProgressLedgerV16Account,
     pub resolved_payout_receipt: ResolvedPayoutReceiptV16Account,
@@ -17415,10 +17552,7 @@ fn margin_requirement(notional: u128, bps: u64, floor: u128) -> V16Result<u128> 
     if notional == 0 {
         return Ok(0);
     }
-    if let Some(product) = notional.checked_mul(bps as u128) {
-        return Ok((product / MAX_MARGIN_BPS as u128).max(floor));
-    }
-    let raw = wide_mul_div_floor_u128(notional, bps as u128, MAX_MARGIN_BPS as u128);
+    let raw = V16Core::mul_div_ceil_u128_or_wide(notional, bps as u128, MAX_MARGIN_BPS as u128)?;
     Ok(raw.max(floor))
 }
 
@@ -17565,6 +17699,21 @@ pub fn kani_liquidation_fee_from_raw_fee(
         liquidation_fee_cap,
         closes_full_position,
     )
+}
+
+/// Per-side trade fee atoms, mirroring the production derivation in
+/// `execute_trade_*` exactly (ceil fee notional -> ceil bps). Proof shim for the
+/// no-free-OI lower bound: a nonzero fill at nonzero price with nonzero fee must
+/// charge >= 1 atom. See `proof_v16_nonzero_trade_charges_positive_fee_per_side`.
+/// (upstream 63891280)
+#[cfg(any(kani, feature = "fuzz"))]
+pub fn kani_trade_fee_atoms_per_side(
+    size_q: u128,
+    exec_price: u64,
+    fee_bps: u64,
+) -> V16Result<u128> {
+    let fee_notional = trade_fee_notional_ceil(size_q, exec_price)?;
+    checked_fee_bps(fee_notional, fee_bps)
 }
 
 fn checked_i128_mul(a: i128, b: i128) -> V16Result<i128> {
@@ -18488,5 +18637,223 @@ mod bankruptcy_hlock_clear_predicate_tests {
             market.header.bankruptcy_hlock_active, 0,
             "hlock must clear on a market that only has an ordinary open position"
         );
+    }
+}
+
+// ============================================================================
+// Close-drift scope unit tests (upstream 377de75c "Scope close drift to
+// originating asset"). `ensure_open_close_snapshot_current_or_recovery` is
+// crate-private, so its negative control lives here with access to it.
+// ============================================================================
+#[cfg(test)]
+mod close_drift_scope_tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn two_asset_market_fixture() -> (MarketGroupV16HeaderAccount, Vec<Market<u64>>) {
+        let market_group_id = [23u8; 32];
+        let cfg = V16Config::public_user_fund_with_market_slots(2, 2, 0, 10);
+        let mut header =
+            MarketGroupV16HeaderAccount::new_dynamic(market_group_id, cfg, 2, 0).unwrap();
+        let mut markets = vec![
+            Market::new(0u64, EngineAssetSlotV16Account::default()),
+            Market::new(1u64, EngineAssetSlotV16Account::default()),
+        ];
+        header
+            .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, 100, 1)
+            .unwrap();
+        header
+            .activate_empty_asset_slot_not_atomic(1, &mut markets[1].engine, 100, 2)
+            .unwrap();
+        (header, markets)
+    }
+
+    fn account_with_leg_on_asset_zero(
+        market_group_id: [u8; 32],
+        asset: AssetStateV16,
+    ) -> PortfolioAccountV16Account {
+        let provenance = ProvenanceHeaderV16Account::from_runtime(&ProvenanceHeaderV16::new(
+            market_group_id,
+            [32u8; 32],
+            [33u8; 32],
+        ));
+        let mut account = PortfolioAccountV16Account::default();
+        account.init_empty_in_place(provenance).unwrap();
+        account.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+            active: true,
+            asset_index: 0,
+            market_id: asset.market_id,
+            side: SideV16::Long,
+            basis_pos_q: POS_SCALE as i128,
+            a_basis: ADL_ONE,
+            k_snap: asset.k_long,
+            f_snap: asset.f_long_num,
+            kf_epoch_snap: 0,
+            epoch_snap: asset.epoch_long,
+            loss_weight: POS_SCALE,
+            b_snap: asset.b_long_num,
+            b_rem: 0,
+            b_epoch_snap: asset.epoch_long,
+            b_stale: false,
+            stale: false,
+        });
+        account.active_bitmap[0] = V16PodU64::new(1);
+        account
+    }
+
+    fn open_ledger_on_asset_zero(
+        market_id: u64,
+        drift_reference_slot: u64,
+    ) -> CloseProgressLedgerV16 {
+        CloseProgressLedgerV16 {
+            active: true,
+            finalized: false,
+            canceled: false,
+            close_id: 7,
+            asset_index: 0,
+            market_id,
+            domain_side: SideV16::Short,
+            gross_loss_at_close_start: 5,
+            drift_reference_slot,
+            max_close_slot: 0,
+            residual_remaining: 5,
+            ..CloseProgressLedgerV16::EMPTY
+        }
+    }
+
+    /// Only the ORIGINATING asset advancing past the close anchor (with the leg
+    /// still attached) makes the snapshot stale. An unrelated asset moving the
+    /// market-wide clock must not trigger recovery.
+    #[test]
+    fn unrelated_asset_accrual_does_not_stale_an_open_close() {
+        let (mut header, mut markets) = two_asset_market_fixture();
+        let asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+        assert_eq!(
+            asset0.slot_last, 1,
+            "asset 0 anchored at its activation slot"
+        );
+        // Asset 1 advanced the market-wide clock well past the close anchor.
+        header.current_slot = V16PodU64::new(9);
+        header.slot_last = V16PodU64::new(9);
+        let market_group_id = header.market_group_id;
+        let mut account_header = account_with_leg_on_asset_zero(market_group_id, asset0);
+        let ledger = open_ledger_on_asset_zero(asset0.market_id, 1);
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let account = PortfolioV16ViewMut::new(&mut account_header);
+        let result =
+            market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
+        assert_eq!(
+            result,
+            Ok(()),
+            "an unrelated asset advancing the global clock must not declare recovery"
+        );
+        assert_eq!(market.header.mode, 0, "market stays Live");
+    }
+
+    /// The originating asset advancing past the anchor while the leg is attached
+    /// is stale on both sides of the port.
+    #[test]
+    fn originating_asset_accrual_stales_an_open_close() {
+        let (mut header, mut markets) = two_asset_market_fixture();
+        let mut asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+        asset0.slot_last = 9;
+        markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+        header.current_slot = V16PodU64::new(9);
+        header.slot_last = V16PodU64::new(9);
+        let market_group_id = header.market_group_id;
+        let mut account_header = account_with_leg_on_asset_zero(market_group_id, asset0);
+        let ledger = open_ledger_on_asset_zero(asset0.market_id, 1);
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let account = PortfolioV16ViewMut::new(&mut account_header);
+        let result =
+            market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
+        assert_eq!(result, Err(V16Error::RecoveryRequired));
+        assert_eq!(market.header.mode, 2, "recovery declared");
+    }
+
+    /// A detached originating leg never stales the close, whatever the clocks say.
+    #[test]
+    fn detached_originating_leg_never_stales_an_open_close() {
+        let (mut header, mut markets) = two_asset_market_fixture();
+        let mut asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
+        asset0.slot_last = 9;
+        markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+        header.current_slot = V16PodU64::new(9);
+        header.slot_last = V16PodU64::new(9);
+        let market_group_id = header.market_group_id;
+        let mut account_header = account_with_leg_on_asset_zero(market_group_id, asset0);
+        account_header.legs[0] = PortfolioLegV16Account::default();
+        account_header.active_bitmap[0] = V16PodU64::new(0);
+        let ledger = open_ledger_on_asset_zero(asset0.market_id, 1);
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let account = PortfolioV16ViewMut::new(&mut account_header);
+        assert_eq!(
+            market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger),
+            Ok(())
+        );
+        assert_eq!(market.header.mode, 0);
+    }
+}
+
+#[cfg(test)]
+mod margin_rounding_tests {
+    // upstream ba7a84b7 "Round margin requirements conservatively" (2026-08-23):
+    // mm_req = max(ceil(X * bps / 10_000), min). Under the former floor, splitting
+    // one notional across two portfolios lowered the aggregate requirement
+    // (2 x 1_311 = 2_622 < 2_623), i.e. fractional-atom collateral credit.
+    use super::margin_requirement;
+    use proptest::prelude::*;
+
+    #[test]
+    fn margin_requirement_partition_regression() {
+        let aggregate = margin_requirement(52_470, 500, 1).unwrap();
+        let partitioned = margin_requirement(26_235, 500, 1)
+            .unwrap()
+            .checked_mul(2)
+            .unwrap();
+        assert_eq!(aggregate, 2_624);
+        assert_eq!(partitioned, aggregate);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn margin_requirement_is_exact_ceiled_with_min(
+            notional in 0u128..=u128::MAX / 20_000,
+            bps in 0u64..=10_000u64,
+            min_req in 0u128..=1_000_000u128,
+        ) {
+            let req = margin_requirement(notional, bps, min_req).unwrap();
+            if notional == 0 {
+                prop_assert_eq!(req, 0);
+            } else {
+                let product = notional * bps as u128;
+                let expected = (product / 10_000 + u128::from(product % 10_000 != 0)).max(min_req);
+                prop_assert_eq!(req, expected);
+            }
+        }
+
+        #[test]
+        fn margin_requirement_is_conservative_under_partition(
+            first in 0u128..=u128::MAX / 40_000,
+            second in 0u128..=u128::MAX / 40_000,
+            bps in 0u64..=10_000u64,
+            min_req in 0u128..=1_000_000u128,
+        ) {
+            let aggregate = margin_requirement(first + second, bps, min_req).unwrap();
+            let partitioned = margin_requirement(first, bps, min_req)
+                .unwrap()
+                .checked_add(margin_requirement(second, bps, min_req).unwrap())
+                .unwrap();
+            prop_assert!(
+                partitioned >= aggregate,
+                "partitioned requirement {} fell below aggregate {}", partitioned, aggregate
+            );
+        }
     }
 }
