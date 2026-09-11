@@ -13089,6 +13089,10 @@ fn proof_v16_persisted_risk_gate_is_complete_for_all_lifecycles_and_side_modes()
 // notional guarantees >= 1 atom per side. This is exactly the LOWER BOUND the
 // conservation/application fee proofs are blind to. Mutation-checked: swapping the
 // shim to trade_notional_floor makes this FAIL on the sub-atom counterexample.
+// FORK NOTE: this fork charges the trade fee to the taker only (the maker pays only as the
+// N1 fallback, when the taker's charge resolves to 0), so there is no fee on each side.
+// Here the theorem bounds the per-fill fee quote that charge_trade_fee_taker_only_not_atomic
+// applies, rather than a fee on each side.
 #[kani::proof]
 #[kani::unwind(40)]
 #[kani::solver(cadical)]
