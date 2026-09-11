@@ -1,9 +1,10 @@
 use percolator::{
-    v16_domain_count_for_market_slots, AssetLifecycleV16, AssetStateV16Account,
-    BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, CloseProgressLedgerV16,
-    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HealthCertV16, HealthCertV16Account,
-    LiquidationRequestV16, Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut,
-    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
+    active_bitmap_is_empty, v16_domain_count_for_market_slots, AssetLifecycleV16,
+    AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
+    CloseProgressLedgerV16, CloseProgressLedgerV16Account, EngineAssetSlotV16Account,
+    HealthCertV16, HealthCertV16Account, LiquidationRequestV16, Market,
+    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
+    PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, RebalanceRequestV16, ResolvedCloseOutcomeV16,
@@ -4742,4 +4743,216 @@ fn v16_post_snapshot_backing_expiry_credits_resolved_payout_ledger() {
     assert_eq!(ledger.current_payout_rate_den, claim_num);
     assert_eq!(ledger.terminal_claim_bound_unreceipted_num, claim_num);
     assert_eq!(market.header.vault.get(), vault_before);
+}
+
+// ---------------------------------------------------------------------------
+// upstream 6d8e0a48 "Fix unattributed cross-margin insurance drain" (2026-08-26)
+// + 9b737fdc "Prove unattributed loss lock lifecycle".
+//
+// Account PnL is one cross-margin scalar. Once a negative PnL has spanned more
+// than one active asset, no single asset's insurance / B domain can be charged
+// for it. The engine marks the account (`liquidation_lock`) at the detach that
+// leaves an uncovered loss with open risk, keeps the mark while the deficit is
+// negative, and liquidates such an account REDUCE-ONLY: no insurance, no
+// bankruptcy residual booked against the surviving asset.
+//
+// Fork adaptation: upstream's test tail resolves the market and closes the
+// account through the 228d9b3f wind-down (PnL zeroed). Our engine returns
+// RecoveryRequired for unattributed negative PnL in Resolved mode (sync row 156,
+// maintainer decision pending), so the "repaid clears the lock" arm is exercised
+// through principal settlement after a deposit instead.
+// ---------------------------------------------------------------------------
+
+fn unattributed_deficit_fixture() -> (
+    MarketGroupV16HeaderAccount,
+    Vec<Market<u64>>,
+    PortfolioAccountV16Account,
+    PortfolioAccountV16Account,
+) {
+    let (mut header, markets) = market_fixture(2, 100);
+    header.config.maintenance_margin_bps = V16PodU64::new(1_000);
+    header.config.initial_margin_bps = V16PodU64::new(1_000);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(500);
+    header.config.max_accrual_dt_slots = V16PodU64::new(1);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(1);
+    let long_header = account_fixture(2, 65);
+    let short_header = account_fixture(2, 66);
+    (header, markets, long_header, short_header)
+}
+
+/// Opens 10 units long/short on both assets (long 2_000 capital, short 250),
+/// ramps asset 0 from 105 to 150 (short loses 500 on asset 0), then closes the
+/// asset-0 leg by a risk-reducing trade. Returns with the short at pnl -250,
+/// capital 0, one open leg on asset 1, and `liquidation_lock == 1`.
+fn open_unattributed_deficit(
+    market: &mut MarketGroupV16ViewMut<'_, u64>,
+    long: &mut PortfolioV16ViewMut<'_>,
+    short: &mut PortfolioV16ViewMut<'_>,
+) {
+    const SIZE_Q: u128 = 10 * POS_SCALE;
+    market.deposit_not_atomic(long, 2_000).unwrap();
+    market.deposit_not_atomic(short, 250).unwrap();
+    for asset_index in 0..2 {
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                long,
+                short,
+                TradeRequestV16 {
+                    asset_index,
+                    size_q: signed_q(SIZE_Q),
+                    exec_price: 100,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+    }
+    for (offset, price) in (105u64..=150).step_by(5).enumerate() {
+        let slot = 2 + offset as u64;
+        market
+            .set_asset_raw_oracle_target_not_atomic(0, price)
+            .unwrap();
+        market
+            .accrue_asset_to_not_atomic(0, slot, price, 0, true)
+            .unwrap();
+    }
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            long,
+            short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: -signed_q(SIZE_Q),
+                exec_price: 150,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .expect("the first risk-reducing close must remain available");
+    assert_eq!(short.header.pnl.get(), -250);
+    assert_eq!(short.header.capital.get(), 0);
+    assert_eq!(
+        short
+            .header
+            .close_progress
+            .try_to_runtime()
+            .unwrap()
+            .residual_remaining,
+        0
+    );
+}
+
+#[test]
+fn v16_trade_does_not_charge_prior_multi_asset_deficit_or_force_market_recovery() {
+    const SIZE_Q: u128 = 10 * POS_SCALE;
+    let (mut header, mut markets, mut long_header, mut short_header) =
+        unattributed_deficit_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    open_unattributed_deficit(&mut market, &mut long, &mut short);
+    assert_eq!(
+        short.header.liquidation_lock, 1,
+        "detaching one leg from an uncovered multi-asset deficit must retain its unattributed-loss marker"
+    );
+
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 1,
+                size_q: -signed_q(SIZE_Q),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .expect("the final risk-reducing close must remain available");
+    assert!(active_bitmap_is_empty(
+        short.header.active_bitmap.map(V16PodU64::get)
+    ));
+    // sticky: the last leg detaching does not clear an unattributed deficit
+    assert_eq!(short.header.liquidation_lock, 1);
+    let ledger = short.header.close_progress.try_to_runtime().unwrap();
+    assert_eq!(ledger.residual_remaining, 0);
+    // no asset domain was charged and no market-wide recovery was declared
+    assert_eq!(market.header.mode, 0);
+    assert_eq!(market.header.insurance.get(), 0);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+
+    // repaying the deficit through principal clears the lock (exact, not sticky
+    // past zero): deposit covers the -250 and the next refresh settles it.
+    market.deposit_not_atomic(&mut short, 250).unwrap();
+    let now_slot = market.header.current_slot.get() + 1;
+    market
+        .sync_account_fee_to_slot_not_atomic(&mut short, now_slot, 0)
+        .unwrap();
+    assert_eq!(short.header.pnl.get(), 0);
+    assert_eq!(short.header.capital.get(), 0);
+    assert_eq!(short.header.liquidation_lock, 0);
+    market.validate_shape().unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_liquidation_of_unattributed_deficit_reduces_risk_without_charging_the_surviving_domain() {
+    let (mut header, mut markets, mut long_header, mut short_header) =
+        unattributed_deficit_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    open_unattributed_deficit(&mut market, &mut long, &mut short);
+
+    let insurance_before = market.header.insurance.get();
+    let asset1_before = markets_snapshot(&market, 1);
+    let outcome = market
+        .liquidate_account_not_atomic(&mut short, LiquidationRequestV16 { asset_index: 1 })
+        .expect("a locked account still liquidates, reduce-only");
+    // NEGATIVE CONTROL for 6d8e0a48: without the lock this liquidation charges the
+    // asset-0 loss to asset 1 (residual booked / fee charged against the surviving
+    // domain). With it, only risk is removed.
+    assert!(outcome.closed_q > 0);
+    assert_eq!(outcome.insurance_used, 0);
+    assert_eq!(outcome.residual_booked, 0);
+    assert_eq!(outcome.explicit_loss, 0);
+    assert_eq!(outcome.fee_charged, 0);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+    assert_eq!(market.header.mode, 0, "no market recovery declared");
+    assert_eq!(short.header.liquidation_lock, 1);
+    assert_eq!(short.header.pnl.get(), -250);
+    let asset1_after = markets_snapshot(&market, 1);
+    assert_eq!(
+        asset1_after.close_ledger_side_1_touched, false,
+        "no close ledger was begun against the surviving asset"
+    );
+    assert!(
+        asset1_after.oi_eff_short_q < asset1_before.oi_eff_short_q,
+        "risk on the surviving asset was reduced"
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+struct AssetSnapshot {
+    oi_eff_short_q: u128,
+    close_ledger_side_1_touched: bool,
+}
+
+fn markets_snapshot(market: &MarketGroupV16ViewMut<'_, u64>, asset_index: usize) -> AssetSnapshot {
+    let asset = market.markets[asset_index]
+        .engine
+        .asset
+        .try_to_runtime()
+        .unwrap();
+    AssetSnapshot {
+        oi_eff_short_q: asset.oi_eff_short_q,
+        close_ledger_side_1_touched: asset.social_loss_dust_long_num != 0
+            || asset.social_loss_dust_short_num != 0
+            || asset.b_long_num != 0
+            || asset.b_short_num != 0,
+    }
 }

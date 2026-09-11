@@ -17,12 +17,12 @@ use percolator::v16::{
     kani_position_delta_increases_risk, kani_prepare_asset_recovery_transition,
     kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
     kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
-    kani_validate_positive_pnl_source_attribution, AssetLifecycleV16, AssetStateV16,
-    AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
-    BatchTradeOutcomeV16, CloseProgressLedgerV16, CloseProgressLedgerV16Account,
-    EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16, HealthCertV16Account,
-    InsuranceCreditReservationV16, InsuranceCreditReservationV16Account, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
+    kani_unattributed_loss_lock_after_pnl, kani_validate_positive_pnl_source_attribution,
+    AssetLifecycleV16, AssetStateV16, AssetStateV16Account, BackingBucketStatusV16,
+    BackingBucketV16, BackingBucketV16Account, BatchTradeOutcomeV16, CloseProgressLedgerV16,
+    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16,
+    HealthCertV16Account, InsuranceCreditReservationV16, InsuranceCreditReservationV16Account,
+    Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
     PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
@@ -30,7 +30,7 @@ use percolator::v16::{
     ResolvedPayoutLedgerV16, ResolvedPayoutLedgerV16Account, ResolvedPayoutReceiptV16,
     ResolvedPayoutReceiptV16Account, SideModeV16, SideV16, SourceCreditStateV16,
     SourceCreditStateV16Account, StockReconciliationProofV16, TokenValueClassV16,
-    TokenValueFlowProofV16, V16Config, V16ConfigAccount, V16Error,
+    TokenValueFlowProofV16, V16ActiveBitmap, V16Config, V16ConfigAccount, V16Error,
     V16OptionalRecoveryReasonAccount, V16PodI128, V16PodU128, V16PodU32, V16PodU64,
     BACKING_FEE_RATE_DEN_E9, MAX_BACKING_FEE_RATE_E9_PER_SLOT, MAX_BACKING_FEE_UTIL_BPS,
     PORTFOLIO_SOURCE_DOMAIN_CAP, V16_EMPTY_ACTIVE_BITMAP, V16_MAX_PORTFOLIO_ASSETS_N,
@@ -14358,4 +14358,36 @@ fn proof_v16_backing_utilization_zero_fee_carries_accrual_forward() {
     assert_eq!(market.header.c_tot.get(), c_tot_before);
     assert_eq!(market.header.vault.get(), vault_before);
     assert_eq!(market.header.insurance.get(), insurance_before);
+}
+
+// upstream 9b737fdc "Prove unattributed loss lock lifecycle" (with 6d8e0a48 "Fix
+// unattributed cross-margin insurance drain"): the per-account liquidation_lock is
+// EXACT (set iff negative PnL is not attributable to one asset domain) and STICKY
+// (once locked, a leg detaching does not clear it) until the deficit is repaid.
+#[kani::proof]
+#[kani::unwind(8)]
+fn proof_v16_unattributed_loss_lock_is_exact_and_sticky_until_repaid() {
+    let was_locked: bool = kani::any();
+    let active_bitmap: V16ActiveBitmap = kani::any();
+    let new_pnl: i128 = kani::any();
+    let active_assets = active_bitmap_count_ones(active_bitmap);
+    let locked = kani_unattributed_loss_lock_after_pnl(was_locked, active_bitmap, new_pnl);
+
+    assert_eq!(locked, new_pnl < 0 && (was_locked || active_assets > 1));
+    assert!(!locked || new_pnl < 0);
+    assert!(new_pnl >= 0 || !was_locked || locked);
+    assert!(new_pnl >= 0 || active_assets <= 1 || locked);
+
+    kani::cover!(
+        new_pnl < 0 && !was_locked && active_assets > 1 && locked,
+        "multi-asset negative PnL becomes unattributed"
+    );
+    kani::cover!(
+        new_pnl < 0 && was_locked && active_assets <= 1 && locked,
+        "unattributed negative PnL remains locked after a leg detaches"
+    );
+    kani::cover!(
+        new_pnl >= 0 && was_locked && !locked,
+        "repaying the deficit clears the unattributed-loss lock"
+    );
 }
