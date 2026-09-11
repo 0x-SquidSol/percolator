@@ -157,7 +157,7 @@ price_funding_loss_N = ceil(N * loss_budget_num / (10_000 * FUNDING_DEN))
 worst_liq_notional_N = ceil(N * (10_000 + price_budget_bps) / 10_000)
 liq_fee_raw_N        = ceil(worst_liq_notional_N * cfg_liquidation_fee_bps / 10_000)
 liq_fee_N            = min(max(liq_fee_raw_N, cfg_min_liquidation_abs), cfg_liquidation_fee_cap)
-mm_req_N             = max(floor(N * cfg_maintenance_bps / 10_000), cfg_min_nonzero_mm_req)
+mm_req_N             = max(ceil(N * cfg_maintenance_bps / 10_000), cfg_min_nonzero_mm_req)
 require price_funding_loss_N + liq_fee_N <= mm_req_N
 ```
 
@@ -626,6 +626,10 @@ Activation requires:
 - certificates fail closed unless their schema explicitly excludes the new asset.
 
 DrainOnly blocks risk increase and new attaches. Retired requires zero OI, zero stored positions, no pending barriers, no obligations, no liens, all close ledgers finalized/canceled, and all prior-epoch stale accounts settled/migrated/recovered. A `ResetPending` side cannot reset again until all prior-epoch stale accounts are settled, migrated, or recovered.
+Successful side-reset finalization clears that side's prior-epoch K/F/B settlement baselines after
+proving there are no remaining stored or stale legs, pending obligations, or domain barriers that
+can reference them. These inert historical baselines cannot block an otherwise empty asset from
+entering DrainOnly or Retired.
 
 -------------------------------------------------------------------------------
 4. State
