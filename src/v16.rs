@@ -17365,6 +17365,260 @@ pub fn kani_terminal_slab_wait_continuation(
     V16Core::kernel_terminal_slab_wait_continuation(scan_start_asset_index, asset_index)
 }
 
+// upstream a2760ddb ("Prove terminal insurance retirement isolation") frames the
+// public retirement route with these field-wise equalities (upstream keeps them in
+// src/v16_kani_api.rs). Fork adaptations: the header also compares the fork A-6
+// stress-envelope fields, and the asset state has no kf_epoch_long/short (upstream's
+// K/F cohort layout is not merged here).
+#[cfg(kani)]
+pub fn kani_eq_v16_config_account(a: &V16ConfigAccount, b: &V16ConfigAccount) -> bool {
+    a.max_portfolio_assets.get() == b.max_portfolio_assets.get()
+        && a.max_market_slots.get() == b.max_market_slots.get()
+        && a.min_nonzero_mm_req.get() == b.min_nonzero_mm_req.get()
+        && a.min_nonzero_im_req.get() == b.min_nonzero_im_req.get()
+        && a.h_min.get() == b.h_min.get()
+        && a.h_max.get() == b.h_max.get()
+        && a.maintenance_margin_bps.get() == b.maintenance_margin_bps.get()
+        && a.initial_margin_bps.get() == b.initial_margin_bps.get()
+        && a.max_trading_fee_bps.get() == b.max_trading_fee_bps.get()
+        && a.liquidation_fee_bps.get() == b.liquidation_fee_bps.get()
+        && a.liquidation_fee_cap.get() == b.liquidation_fee_cap.get()
+        && a.min_liquidation_abs.get() == b.min_liquidation_abs.get()
+        && a.max_accrual_dt_slots.get() == b.max_accrual_dt_slots.get()
+        && a.max_abs_funding_e9_per_slot.get() == b.max_abs_funding_e9_per_slot.get()
+        && a.min_funding_lifetime_slots.get() == b.min_funding_lifetime_slots.get()
+        && a.max_price_move_bps_per_slot.get() == b.max_price_move_bps_per_slot.get()
+        && a.max_account_b_settlement_chunks.get() == b.max_account_b_settlement_chunks.get()
+        && a.max_bankrupt_close_chunks.get() == b.max_bankrupt_close_chunks.get()
+        && a.max_bankrupt_close_lifetime_slots.get() == b.max_bankrupt_close_lifetime_slots.get()
+        && a.asset_activation_cooldown_slots.get() == b.asset_activation_cooldown_slots.get()
+        && a.public_b_chunk_atoms.get() == b.public_b_chunk_atoms.get()
+        && a.max_recovery_fallback_deviation_bps.get()
+            == b.max_recovery_fallback_deviation_bps.get()
+        && a.backing_fee_base_rate_e9_per_slot.get() == b.backing_fee_base_rate_e9_per_slot.get()
+        && a.backing_fee_kink_util_bps.get() == b.backing_fee_kink_util_bps.get()
+        && a.backing_fee_slope_at_kink_e9_per_slot.get()
+            == b.backing_fee_slope_at_kink_e9_per_slot.get()
+        && a.backing_fee_slope_above_kink_e9_per_slot.get()
+            == b.backing_fee_slope_above_kink_e9_per_slot.get()
+        && a.backing_freshness_buckets == b.backing_freshness_buckets
+        && a.margin_mode_realizable_full_shared_cross_margin
+            == b.margin_mode_realizable_full_shared_cross_margin
+        && a.source_credit_lien_required == b.source_credit_lien_required
+        && a.insurance_credit_reservation_required == b.insurance_credit_reservation_required
+        && a.permissionless_recovery_enabled == b.permissionless_recovery_enabled
+        && a.recovery_fallback_price_enabled == b.recovery_fallback_price_enabled
+        && a.recovery_fallback_envelope_enabled == b.recovery_fallback_envelope_enabled
+        && a.credit_lien_revalidation_required == b.credit_lien_revalidation_required
+        && a.stale_certificate_penalty_enabled == b.stale_certificate_penalty_enabled
+        && a.full_refresh_required_for_favorable_actions
+            == b.full_refresh_required_for_favorable_actions
+        && a.public_liveness_profile_crank_forward == b.public_liveness_profile_crank_forward
+}
+
+#[cfg(kani)]
+pub fn kani_eq_v16_optional_recovery_reason_account(
+    a: &V16OptionalRecoveryReasonAccount,
+    b: &V16OptionalRecoveryReasonAccount,
+) -> bool {
+    a.present == b.present && a.value == b.value
+}
+
+#[cfg(kani)]
+pub fn kani_eq_resolved_payout_ledger_v16_account(
+    a: &ResolvedPayoutLedgerV16Account,
+    b: &ResolvedPayoutLedgerV16Account,
+) -> bool {
+    a.snapshot_residual.get() == b.snapshot_residual.get()
+        && a.terminal_claim_exact_receipts_num.get() == b.terminal_claim_exact_receipts_num.get()
+        && a.terminal_claim_bound_unreceipted_num.get()
+            == b.terminal_claim_bound_unreceipted_num.get()
+        && a.current_payout_rate_num.get() == b.current_payout_rate_num.get()
+        && a.current_payout_rate_den.get() == b.current_payout_rate_den.get()
+        && a.snapshot_slot.get() == b.snapshot_slot.get()
+        && a.payout_halted == b.payout_halted
+        && a.finalized == b.finalized
+}
+
+#[cfg(kani)]
+pub fn kani_eq_market_group_v16_header_account(
+    a: &MarketGroupV16HeaderAccount,
+    b: &MarketGroupV16HeaderAccount,
+) -> bool {
+    ({
+        let mut i = 0;
+        let mut ok = true;
+        while i < 32 {
+            ok = ok && a.market_group_id[i] == b.market_group_id[i];
+            i += 1;
+        }
+        ok
+    }) && kani_eq_v16_config_account(&a.config, &b.config)
+        && a.asset_slot_capacity.get() == b.asset_slot_capacity.get()
+        && a.vault.get() == b.vault.get()
+        && a.insurance.get() == b.insurance.get()
+        && a.c_tot.get() == b.c_tot.get()
+        && a.pnl_pos_tot.get() == b.pnl_pos_tot.get()
+        && a.pnl_pos_bound_tot_num.get() == b.pnl_pos_bound_tot_num.get()
+        && a.pnl_pos_bound_tot.get() == b.pnl_pos_bound_tot.get()
+        && a.pnl_matured_pos_tot.get() == b.pnl_matured_pos_tot.get()
+        && a.backing_provider_earnings_total.get() == b.backing_provider_earnings_total.get()
+        && a.source_claim_bound_total_num.get() == b.source_claim_bound_total_num.get()
+        && a.source_fresh_backing_total_num.get() == b.source_fresh_backing_total_num.get()
+        && a.source_insurance_credit_reserved_total_atoms.get()
+            == b.source_insurance_credit_reserved_total_atoms.get()
+        && a.insurance_domain_budget_remaining_total.get()
+            == b.insurance_domain_budget_remaining_total.get()
+        && a.resolved_payout_blocker_count.get() == b.resolved_payout_blocker_count.get()
+        && a.stress_consumption_bps_e9_since_envelope.get()
+            == b.stress_consumption_bps_e9_since_envelope.get()
+        && a.stress_envelope_start_slot.get() == b.stress_envelope_start_slot.get()
+        && a.stress_envelope_start_credit_epoch.get() == b.stress_envelope_start_credit_epoch.get()
+        && a.materialized_portfolio_count.get() == b.materialized_portfolio_count.get()
+        && a.stale_certificate_count.get() == b.stale_certificate_count.get()
+        && a.b_stale_account_count.get() == b.b_stale_account_count.get()
+        && a.negative_pnl_account_count.get() == b.negative_pnl_account_count.get()
+        && a.risk_epoch.get() == b.risk_epoch.get()
+        && a.asset_set_epoch.get() == b.asset_set_epoch.get()
+        && a.asset_activation_count.get() == b.asset_activation_count.get()
+        && a.last_asset_activation_slot.get() == b.last_asset_activation_slot.get()
+        && a.next_market_id.get() == b.next_market_id.get()
+        && a.oracle_epoch.get() == b.oracle_epoch.get()
+        && a.funding_epoch.get() == b.funding_epoch.get()
+        && a.slot_last.get() == b.slot_last.get()
+        && a.current_slot.get() == b.current_slot.get()
+        && a.bankruptcy_hlock_active == b.bankruptcy_hlock_active
+        && a.threshold_stress_active == b.threshold_stress_active
+        && a.loss_stale_active == b.loss_stale_active
+        && kani_eq_v16_optional_recovery_reason_account(&a.recovery_reason, &b.recovery_reason)
+        && a.mode == b.mode
+        && a.resolved_slot.get() == b.resolved_slot.get()
+        && a.payout_snapshot.get() == b.payout_snapshot.get()
+        && a.payout_snapshot_pnl_pos_tot.get() == b.payout_snapshot_pnl_pos_tot.get()
+        && a.payout_snapshot_captured == b.payout_snapshot_captured
+        && kani_eq_resolved_payout_ledger_v16_account(
+            &a.resolved_payout_ledger,
+            &b.resolved_payout_ledger,
+        )
+}
+
+#[cfg(kani)]
+pub fn kani_eq_asset_state_v16_account(a: &AssetStateV16Account, b: &AssetStateV16Account) -> bool {
+    a.market_id.get() == b.market_id.get()
+        && a.retired_slot.get() == b.retired_slot.get()
+        && a.lifecycle == b.lifecycle
+        && a.raw_oracle_target_price.get() == b.raw_oracle_target_price.get()
+        && a.effective_price.get() == b.effective_price.get()
+        && a.fund_px_last.get() == b.fund_px_last.get()
+        && a.slot_last.get() == b.slot_last.get()
+        && a.a_long.get() == b.a_long.get()
+        && a.a_short.get() == b.a_short.get()
+        && a.k_long.get() == b.k_long.get()
+        && a.k_short.get() == b.k_short.get()
+        && a.f_long_num.get() == b.f_long_num.get()
+        && a.f_short_num.get() == b.f_short_num.get()
+        && a.k_epoch_start_long.get() == b.k_epoch_start_long.get()
+        && a.k_epoch_start_short.get() == b.k_epoch_start_short.get()
+        && a.f_epoch_start_long_num.get() == b.f_epoch_start_long_num.get()
+        && a.f_epoch_start_short_num.get() == b.f_epoch_start_short_num.get()
+        && a.b_long_num.get() == b.b_long_num.get()
+        && a.b_short_num.get() == b.b_short_num.get()
+        && a.b_epoch_start_long_num.get() == b.b_epoch_start_long_num.get()
+        && a.b_epoch_start_short_num.get() == b.b_epoch_start_short_num.get()
+        && a.oi_eff_long_q.get() == b.oi_eff_long_q.get()
+        && a.oi_eff_short_q.get() == b.oi_eff_short_q.get()
+        && a.stored_pos_count_long.get() == b.stored_pos_count_long.get()
+        && a.stored_pos_count_short.get() == b.stored_pos_count_short.get()
+        && a.stale_account_count_long.get() == b.stale_account_count_long.get()
+        && a.stale_account_count_short.get() == b.stale_account_count_short.get()
+        && a.pending_obligation_count_long.get() == b.pending_obligation_count_long.get()
+        && a.pending_obligation_count_short.get() == b.pending_obligation_count_short.get()
+        && a.loss_weight_sum_long.get() == b.loss_weight_sum_long.get()
+        && a.loss_weight_sum_short.get() == b.loss_weight_sum_short.get()
+        && a.social_loss_remainder_long_num.get() == b.social_loss_remainder_long_num.get()
+        && a.social_loss_remainder_short_num.get() == b.social_loss_remainder_short_num.get()
+        && a.social_loss_dust_long_num.get() == b.social_loss_dust_long_num.get()
+        && a.social_loss_dust_short_num.get() == b.social_loss_dust_short_num.get()
+        && a.explicit_unallocated_loss_long.get() == b.explicit_unallocated_loss_long.get()
+        && a.explicit_unallocated_loss_short.get() == b.explicit_unallocated_loss_short.get()
+        && a.epoch_long.get() == b.epoch_long.get()
+        && a.epoch_short.get() == b.epoch_short.get()
+        && a.mode_long == b.mode_long
+        && a.mode_short == b.mode_short
+}
+
+#[cfg(kani)]
+pub fn kani_eq_source_credit_state_v16_account(
+    a: &SourceCreditStateV16Account,
+    b: &SourceCreditStateV16Account,
+) -> bool {
+    a.positive_claim_bound_num.get() == b.positive_claim_bound_num.get()
+        && a.exact_positive_claim_num.get() == b.exact_positive_claim_num.get()
+        && a.fresh_reserved_backing_num.get() == b.fresh_reserved_backing_num.get()
+        && a.spent_backing_num.get() == b.spent_backing_num.get()
+        && a.provider_receivable_num.get() == b.provider_receivable_num.get()
+        && a.valid_liened_backing_num.get() == b.valid_liened_backing_num.get()
+        && a.impaired_liened_backing_num.get() == b.impaired_liened_backing_num.get()
+        && a.insurance_credit_reserved_num.get() == b.insurance_credit_reserved_num.get()
+        && a.valid_liened_insurance_num.get() == b.valid_liened_insurance_num.get()
+        && a.impaired_liened_insurance_num.get() == b.impaired_liened_insurance_num.get()
+        && a.credit_rate_num.get() == b.credit_rate_num.get()
+        && a.credit_epoch.get() == b.credit_epoch.get()
+}
+
+#[cfg(kani)]
+pub fn kani_eq_backing_bucket_v16_account(
+    a: &BackingBucketV16Account,
+    b: &BackingBucketV16Account,
+) -> bool {
+    a.market_id.get() == b.market_id.get()
+        && a.fresh_unliened_backing_num.get() == b.fresh_unliened_backing_num.get()
+        && a.valid_liened_backing_num.get() == b.valid_liened_backing_num.get()
+        && a.consumed_liened_backing_num.get() == b.consumed_liened_backing_num.get()
+        && a.impaired_liened_backing_num.get() == b.impaired_liened_backing_num.get()
+        && a.utilization_fee_earnings.get() == b.utilization_fee_earnings.get()
+        && a.expiry_slot.get() == b.expiry_slot.get()
+        && a.status == b.status
+}
+
+#[cfg(kani)]
+pub fn kani_eq_insurance_credit_reservation_v16_account(
+    a: &InsuranceCreditReservationV16Account,
+    b: &InsuranceCreditReservationV16Account,
+) -> bool {
+    a.insurance_credit_reserved_num.get() == b.insurance_credit_reserved_num.get()
+        && a.valid_liened_insurance_num.get() == b.valid_liened_insurance_num.get()
+        && a.impaired_liened_insurance_num.get() == b.impaired_liened_insurance_num.get()
+        && a.consumed_insurance_num.get() == b.consumed_insurance_num.get()
+        && a.source_credit_epoch.get() == b.source_credit_epoch.get()
+}
+
+#[cfg(kani)]
+pub fn kani_eq_engine_asset_slot_v16_account(
+    a: &EngineAssetSlotV16Account,
+    b: &EngineAssetSlotV16Account,
+) -> bool {
+    kani_eq_asset_state_v16_account(&a.asset, &b.asset)
+        && a.insurance_domain_budget_long.get() == b.insurance_domain_budget_long.get()
+        && a.insurance_domain_budget_short.get() == b.insurance_domain_budget_short.get()
+        && a.insurance_domain_spent_long.get() == b.insurance_domain_spent_long.get()
+        && a.insurance_domain_spent_short.get() == b.insurance_domain_spent_short.get()
+        && a.pending_domain_loss_barrier_long.get() == b.pending_domain_loss_barrier_long.get()
+        && a.pending_domain_loss_barrier_short.get() == b.pending_domain_loss_barrier_short.get()
+        && kani_eq_source_credit_state_v16_account(&a.source_credit_long, &b.source_credit_long)
+        && kani_eq_source_credit_state_v16_account(&a.source_credit_short, &b.source_credit_short)
+        && kani_eq_backing_bucket_v16_account(&a.backing_long, &b.backing_long)
+        && kani_eq_backing_bucket_v16_account(&a.backing_short, &b.backing_short)
+        && kani_eq_insurance_credit_reservation_v16_account(
+            &a.insurance_reservation_long,
+            &b.insurance_reservation_long,
+        )
+        && kani_eq_insurance_credit_reservation_v16_account(
+            &a.insurance_reservation_short,
+            &b.insurance_reservation_short,
+        )
+}
+
 #[cfg(kani)]
 pub fn kani_trade_preexisting_oi_reduction_gate(
     oi_long_q: u128,
