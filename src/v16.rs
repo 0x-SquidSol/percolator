@@ -13501,6 +13501,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
+    #[cfg(kani)]
+    pub fn kani_create_resolved_payout_receipt_if_needed(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+    ) -> V16Result<()> {
+        self.create_resolved_payout_receipt_if_needed(account)
+    }
+
     fn account_no_positive_credit_equity(account: &PortfolioV16View<'_>) -> V16Result<i128> {
         validate_non_min_i128(account.header.pnl.get())?;
         validate_fee_credits(account.header.fee_credits.get())?;
@@ -15522,7 +15530,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(payout)
     }
 
-    pub fn refine_resolved_unreceipted_bound_not_atomic(
+    // upstream 2cbca3eb (av#89 for av#88): internal only. The only legitimate
+    // decrement is derived from actual source-backed claim realization; a public
+    // caller could inflate the resolved payout rate and strand later claimants.
+    fn refine_resolved_unreceipted_bound_not_atomic(
         &mut self,
         decrease_num: u128,
     ) -> V16Result<()> {
