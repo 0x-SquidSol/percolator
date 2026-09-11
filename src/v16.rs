@@ -16973,6 +16973,21 @@ pub fn kani_liquidation_fee_from_raw_fee(
     )
 }
 
+/// Per-side trade fee atoms, mirroring the production derivation in
+/// `execute_trade_*` exactly (ceil fee notional -> ceil bps). Proof shim for the
+/// no-free-OI lower bound: a nonzero fill at nonzero price with nonzero fee must
+/// charge >= 1 atom. See `proof_v16_nonzero_trade_charges_positive_fee_per_side`.
+/// (upstream 63891280)
+#[cfg(any(kani, feature = "fuzz"))]
+pub fn kani_trade_fee_atoms_per_side(
+    size_q: u128,
+    exec_price: u64,
+    fee_bps: u64,
+) -> V16Result<u128> {
+    let fee_notional = trade_fee_notional_ceil(size_q, exec_price)?;
+    checked_fee_bps(fee_notional, fee_bps)
+}
+
 fn checked_i128_mul(a: i128, b: i128) -> V16Result<i128> {
     let out = a.checked_mul(b).ok_or(V16Error::ArithmeticOverflow)?;
     validate_non_min_i128(out)?;
