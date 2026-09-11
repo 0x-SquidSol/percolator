@@ -53,16 +53,18 @@ pub use v16::*;
 #[cfg(not(kani))]
 pub use v16::{
     active_bitmap_count_ones, active_bitmap_empty, active_bitmap_get, active_bitmap_is_empty,
-    backing_domain_fee_split_for_lien_delta_num, v16_domain_count_for_market_slots,
-    v16_domain_pair_for_asset_index, AccrueAssetOutcomeV16, AssetLifecycleV16, AssetStateV16,
-    AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
-    BackingDomainFeeSplitV16, BatchTradeOutcomeV16, CloseProgressLedgerV16,
-    CloseProgressLedgerV16Account, DeadLegForfeitOutcomeV16, EngineAssetSlotV16Account,
-    HealthCertV16, HealthCertV16Account, InsuranceCreditReservationV16,
-    InsuranceCreditReservationV16Account, LiquidationOutcomeV16, LiquidationRequestV16, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16View, MarketGroupV16ViewMut, MarketModeV16,
-    MarketSlotV16View, MarketSlotV16ViewMut, PermissionlessCrankActionV16,
-    PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
+    auto_crank_plan_requires_caller_observation, backing_domain_fee_split_for_lien_delta_num,
+    canonical_accrual_price_step_v16, v16_domain_count_for_market_slots,
+    v16_domain_pair_for_asset_index, AccrualStepV16, AccrueAssetOutcomeV16, ActionableSummaryV16,
+    AssetLifecycleV16, AssetStateV16, AssetStateV16Account, AutoCrankObservationV16,
+    AutoCrankOutcomeV16, AutoCrankPlanV16, AutoCrankResultV16, AutoCrankWorkV16,
+    BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, BackingDomainFeeSplitV16,
+    BatchTradeOutcomeV16, CloseProgressLedgerV16, CloseProgressLedgerV16Account,
+    DeadLegForfeitOutcomeV16, EngineAssetSlotV16Account, HealthCertV16, HealthCertV16Account,
+    InsuranceCreditReservationV16, InsuranceCreditReservationV16Account, LiquidationOutcomeV16,
+    LiquidationRequestV16, Market, MarketGroupV16HeaderAccount, MarketGroupV16View,
+    MarketGroupV16ViewMut, MarketModeV16, MarketSlotV16View, MarketSlotV16ViewMut,
+    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, RebalanceOutcomeV16, RebalanceRequestV16,
@@ -71,13 +73,18 @@ pub use v16::{
     SourceCreditStateV16, SourceCreditStateV16Account, TradeRequestV16, V16ActiveBitmap, V16Config,
     V16ConfigAccount, V16Error, V16OptionalRecoveryReasonAccount, V16PodI128, V16PodU128,
     V16PodU16, V16PodU32, V16PodU64, V16Result, PORTFOLIO_SOURCE_DOMAIN_CAP, V16_ACCOUNT_VERSION,
-    V16_EMPTY_ACTIVE_BITMAP, V16_LAYOUT_DISCRIMINATOR, V16_MAX_PORTFOLIO_ASSETS_N,
+    V16_EMPTY_ACTIVE_BITMAP, V16_LAYOUT_DISCRIMINATOR, V16_MAX_ACCRUAL_PATH_STEPS,
+    V16_MAX_PORTFOLIO_ASSETS_N,
 };
 
 // kani_active_bitmap_set is gated #[cfg(any(kani, test, feature="fork-facade"))]
 // in v16.rs; re-export it under fork-facade so the wrapper tests can call it.
 #[cfg(all(not(kani), feature = "fork-facade"))]
 pub use v16::kani_active_bitmap_set;
+
+// ADL effective-quantity kernels for the fuzz targets (kani builds get them from the blanket re-export).
+#[cfg(all(not(kani), feature = "fuzz"))]
+pub use v16::{kani_adl_effective_quantity_ceil, kani_raw_basis_for_adl_effective_quantity};
 
 // v17 fork-facade re-exports — present only when the fork-facade feature is enabled (the wrapper
 // opts in on its engine dep). Keeps the production frozen surface minimal by default. Under kani the
