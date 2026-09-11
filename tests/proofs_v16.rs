@@ -7694,10 +7694,7 @@ fn proof_v16_two_resolved_receipts_are_order_independent_when_snapshot_funded() 
         vault >= ca + cb && ca > 0 && cb > 0,
         "funded vault: both receipts payable in full"
     );
-    kani::cover!(
-        a_claim != b_claim,
-        "asymmetric claim sizes"
-    );
+    kani::cover!(a_claim != b_claim, "asymmetric claim sizes");
 
     // (a) TOTAL extraction is order-independent under scarcity AND never exceeds
     //     the pool — the draining composition equals min(ca+cb, vault) either way.
@@ -9677,8 +9674,14 @@ fn proof_v16_insurance_lien_consume_spends_only_its_domain_budget() {
     assert_eq!(reservation.insurance_credit_reserved_num, 0);
     assert_eq!(source.valid_liened_insurance_num, 0);
     assert_eq!(source.insurance_credit_reserved_num, 0);
-    assert_eq!(market.markets[0].engine.insurance_domain_spent_long.get(), atoms_long);
-    assert_eq!(market.markets[0].engine.insurance_domain_budget_long.get(), atoms_long);
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_spent_long.get(),
+        atoms_long
+    );
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_budget_long.get(),
+        atoms_long
+    );
 
     // ... and the sibling Short domain (domain 1) is UNTOUCHED -- the named
     // isolation property: consuming one domain spends ONLY its own budget.
@@ -9710,7 +9713,6 @@ fn proof_v16_insurance_lien_consume_spends_only_its_domain_budget() {
     assert_eq!(market.header.vault.get(), vault_before);
     assert_eq!(market.header.c_tot.get(), c_tot_before);
 }
-
 
 #[kani::proof]
 #[kani::unwind(16)]
