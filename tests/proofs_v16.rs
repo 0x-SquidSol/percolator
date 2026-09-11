@@ -13714,6 +13714,409 @@ fn proof_v16_retirement_backing_normalization_never_erases_obligations() {
     }
 }
 
+fn post_snapshot_expiry_fixture(
+    backing: u128,
+    junior: u128,
+    claim: u128,
+    receipted_num: u128,
+) -> (MarketGroupV16HeaderAccount, [Market<u64>; 1]) {
+    let claim_num = claim * BOUND_SCALE;
+    let unreceipted_num = claim_num - receipted_num;
+    let backing_num = backing * BOUND_SCALE;
+    let (mut header, mut markets, _) = one_market_direct_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    // FORK: A-6's validate_shape pairing invariant (see the note in
+    // assert_expired_backing_yields_zero_realizable_support).
+    header.stress_envelope_start_slot = V16PodU64::new(u64::MAX);
+    header.stress_envelope_start_credit_epoch = V16PodU64::new(u64::MAX);
+    header.mode = 1; // Resolved
+    header.current_slot = V16PodU64::new(20);
+    header.vault = V16PodU128::new(junior + backing);
+    header.pnl_pos_tot = V16PodU128::new(claim);
+    header.pnl_matured_pos_tot = V16PodU128::new(claim);
+    header.pnl_pos_bound_tot = V16PodU128::new(claim);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(claim_num);
+    header.source_fresh_backing_total_num = V16PodU128::new(backing_num);
+    header.payout_snapshot_captured = 1;
+    header.payout_snapshot = V16PodU128::new(junior);
+    header.payout_snapshot_pnl_pos_tot = V16PodU128::new(claim);
+    header.resolved_payout_ledger =
+        ResolvedPayoutLedgerV16Account::from_runtime(&ResolvedPayoutLedgerV16 {
+            snapshot_residual: junior,
+            terminal_claim_exact_receipts_num: receipted_num,
+            terminal_claim_bound_unreceipted_num: unreceipted_num,
+            current_payout_rate_num: (junior * BOUND_SCALE).min(claim_num),
+            current_payout_rate_den: claim_num,
+            snapshot_slot: 10,
+            payout_halted: false,
+            finalized: false,
+        });
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id,
+        fresh_unliened_backing_num: backing_num,
+        expiry_slot: 5,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            fresh_reserved_backing_num: backing_num,
+            credit_rate_num: CREDIT_RATE_SCALE,
+            ..SourceCreditStateV16::EMPTY
+        });
+    (header, markets)
+}
+// Expiry-liveness primitive (wrapper finding 2026-06-10): the resolved-close
+// realize step must not strand a source-backed winner whose backing has lapsed
+// (bucket still Fresh but expiry_slot <= current_slot — nothing processes
+// expiry in production). Querying realizable support against a past-expiry
+// bucket returns Stale. The primitive that avoids the deadlock: expiring the
+// lapsed bucket forfeits its principal (fresh_reserved -> 0), drops the domain
+// credit rate to zero, and makes realizable support exactly zero — so the
+// realize step falls through to the junior receipt path instead of reverting.
+// The full close_resolved path is Kani-intractable; the two bounded route
+// bindings below pin this primitive for under-backed and fully-backed claims.
+//
+// FORK NOTE: this fork binds the helper ONCE, fully backed, from
+// proof_v16_fully_backed_expiry_yields_zero_realizable_support (backing 3 against
+// claim 3). Upstream e35f0f6d's second binding lives in its concrete rewrite of
+// proof_v16_expired_backing_yields_zero_realizable_support_after_expiry, which this
+// fork does not adopt: it keeps that proof's earlier SYMBOLIC form (backing and
+// claim each 1..=6, see PR #174), which covers the under-backed case instead. So the
+// pre-snapshot "terminal accounting stays uninitialized" asserts below run only for
+// the fully-backed binding here.
+fn assert_expired_backing_yields_zero_realizable_support(backing: u128) {
+    // BOUNDED BINDING (flagged): a symbolic backing value blows the solver
+    // budget (the realizable-support query's per-domain U256 credit math on
+    // top of the expire + audit-scan path). The symbolic surface is covered
+    // by proof_v16_counterparty_backing_expiry_reclassifies_principal_and_
+    // impairs_lien and backing_double_claim_fuzz::terminal_close_with_expired_
+    // backing_does_not_strand. Separate concrete routes avoid a Cartesian U256
+    // branch while still mutation-binding both economically distinct cases.
+    let claim = 3u128;
+    let backing_num = backing * BOUND_SCALE;
+    let claim_num = claim * BOUND_SCALE;
+    let expiry_slot = 5u64;
+    let current_slot = 20u64; // strictly past expiry
+
+    let (mut header, mut markets, mut account_header) = one_market_direct_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    // FORK: A-6's validate_shape pairing invariant requires both envelope
+    // sentinels to be u64::MAX in the no-envelope-open state; the shared
+    // fixture builds from Default (zeroes), which upstream's validate_shape
+    // does not check. Same state clear_stress_envelope_v16 leaves behind.
+    header.stress_envelope_start_slot = V16PodU64::new(u64::MAX);
+    header.stress_envelope_start_credit_epoch = V16PodU64::new(u64::MAX);
+    header.current_slot = V16PodU64::new(current_slot);
+    header.slot_last = V16PodU64::new(current_slot);
+    header.vault = V16PodU128::new(backing);
+    header.pnl_pos_tot = V16PodU128::new(claim);
+    header.pnl_matured_pos_tot = V16PodU128::new(claim);
+    header.pnl_pos_bound_tot = V16PodU128::new(claim);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(claim_num);
+    header.source_claim_bound_total_num = V16PodU128::new(claim_num);
+    header.source_fresh_backing_total_num = V16PodU128::new(backing_num);
+    // A lapsed bucket: still Fresh, but expiry_slot is in the past.
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id,
+        fresh_unliened_backing_num: backing_num,
+        expiry_slot,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            positive_claim_bound_num: claim_num,
+            exact_positive_claim_num: claim_num,
+            fresh_reserved_backing_num: backing_num,
+            credit_rate_num: (backing_num * CREDIT_RATE_SCALE / claim_num).min(CREDIT_RATE_SCALE),
+            ..SourceCreditStateV16::EMPTY
+        });
+    account_header.pnl = V16PodI128::new(claim as i128);
+    account_header.source_domains[0].domain = V16PodU32::new(0);
+    account_header.source_domains[0].source_claim_market_id = V16PodU64::new(market_id);
+    account_header.source_domains[0].source_claim_bound_num = V16PodU128::new(claim_num);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    // ASSERT (was assume — an all-or-nothing switch that made the whole proof
+    // vacuously true whenever the fixture failed validation): the constructed
+    // fixture is a well-formed engine state for both backing ratios.
+    assert_eq!(market.validate_shape(), Ok(()));
+
+    // Before expiry, the freshness validator rejects the lapsed bucket — this
+    // is the Stale that would strand the close if the realize step queried it.
+    assert_eq!(
+        market.kani_validate_source_domain_ledger_current(0),
+        Err(V16Error::Stale)
+    );
+
+    // Expire the lapsed bucket (the realize step's deadlock-avoidance move).
+    market
+        .expire_source_backing_bucket_not_atomic(0, current_slot)
+        .unwrap();
+
+    let source = market.markets[0]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+    let bucket = market.markets[0]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+
+    // The principal is forfeited (bucket emptied, status Expired) ...
+    assert_eq!(bucket.status, BackingBucketStatusV16::Expired);
+    assert_eq!(bucket.fresh_unliened_backing_num, 0);
+    assert_eq!(source.fresh_reserved_backing_num, 0);
+    assert_eq!(market.header.payout_snapshot_captured, 0);
+    assert_eq!(market.header.payout_snapshot.get(), 0);
+    assert_eq!(
+        market
+            .header
+            .resolved_payout_ledger
+            .try_to_runtime()
+            .unwrap(),
+        ResolvedPayoutLedgerV16::EMPTY,
+        "pre-snapshot expiry must leave terminal accounting uninitialized"
+    );
+    // ... the credit rate collapses to zero (no backing underwrites the claim) ...
+    assert_eq!(source.credit_rate_num, 0);
+    // ... the bucket is now current (no Stale) so the close can proceed ...
+    assert_eq!(market.kani_validate_source_domain_ledger_current(0), Ok(()));
+    // ... and realizable support is exactly zero -> realize falls through to the
+    // junior receipt path (forfeited principal is now junior residual).
+    assert_eq!(
+        market
+            .kani_account_unliened_source_realizable_support(
+                &PortfolioV16View::new(&account_header),
+                claim
+            )
+            .unwrap(),
+        0
+    );
+}
+
+fn assert_post_snapshot_expiry_route(
+    backing: u128,
+    junior: u128,
+    claim: u128,
+    receipted_num: u128,
+) {
+    let claim_num = claim * BOUND_SCALE;
+    let unreceipted_num = claim_num - receipted_num;
+    let (mut header, mut markets) =
+        post_snapshot_expiry_fixture(backing, junior, claim, receipted_num);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    assert_eq!(market.kani_residual(), junior);
+    let vault_before = market.header.vault.get();
+    let c_tot_before = market.header.c_tot.get();
+    let insurance_before = market.header.insurance.get();
+
+    market
+        .expire_source_backing_bucket_not_atomic(0, 20)
+        .unwrap();
+
+    let bucket = market.markets[0]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+    let source = market.markets[0]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+    let ledger = market
+        .header
+        .resolved_payout_ledger
+        .try_to_runtime()
+        .unwrap();
+    assert_eq!(bucket.status, BackingBucketStatusV16::Expired);
+    assert_eq!(bucket.fresh_unliened_backing_num, 0);
+    assert_eq!(source.fresh_reserved_backing_num, 0);
+    assert_eq!(market.header.source_fresh_backing_total_num.get(), 0);
+    assert_eq!(market.kani_residual(), junior + backing);
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.c_tot.get(), c_tot_before);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+    assert_eq!(market.header.payout_snapshot.get(), junior + backing);
+    assert_eq!(ledger.snapshot_residual, junior + backing);
+    assert_eq!(ledger.terminal_claim_exact_receipts_num, receipted_num);
+    assert_eq!(ledger.terminal_claim_bound_unreceipted_num, unreceipted_num);
+    assert_eq!(
+        ledger.terminal_claim_exact_receipts_num + ledger.terminal_claim_bound_unreceipted_num,
+        claim_num
+    );
+    assert_eq!(ledger.current_payout_rate_den, claim_num);
+    assert_eq!(
+        ledger.current_payout_rate_num,
+        ((junior + backing) * BOUND_SCALE).min(claim_num)
+    );
+}
+
+// Replaying expiry after the bucket has left Fresh must fail before every
+// market mutation, regardless of whether terminal snapshots exist. This is the
+// no-double-credit half of the post-snapshot value theorem.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_backing_expiry_kernel_rejects_every_ineligible_bucket() {
+    let status_raw: u8 = kani::any();
+    let now_raw: u16 = kani::any();
+    let expiry_raw: u16 = kani::any();
+    kani::assume(status_raw <= 3);
+    let status = match status_raw {
+        0 => BackingBucketStatusV16::Empty,
+        1 => BackingBucketStatusV16::Fresh,
+        2 => BackingBucketStatusV16::Expired,
+        _ => BackingBucketStatusV16::Impaired,
+    };
+    let now_slot = now_raw as u64;
+    let expiry_slot = expiry_raw as u64;
+    if status == BackingBucketStatusV16::Fresh {
+        kani::assume(now_slot < expiry_slot);
+    }
+    let bucket = BackingBucketV16 {
+        market_id: 1,
+        expiry_slot,
+        status,
+        ..BackingBucketV16::EMPTY
+    };
+    let result = MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_expiry_delta(
+        bucket,
+        SourceCreditStateV16::EMPTY,
+        now_slot,
+    );
+
+    kani::cover!(status == BackingBucketStatusV16::Empty, "Empty is rejected");
+    kani::cover!(
+        status == BackingBucketStatusV16::Fresh,
+        "not-yet-expired Fresh is rejected"
+    );
+    kani::cover!(
+        status == BackingBucketStatusV16::Expired,
+        "Expired replay is rejected"
+    );
+    kani::cover!(
+        status == BackingBucketStatusV16::Impaired,
+        "Impaired replay is rejected"
+    );
+    assert_eq!(result, Err(V16Error::Stale));
+}
+
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_fully_backed_expiry_yields_zero_realizable_support() {
+    assert_expired_backing_yields_zero_realizable_support(3);
+}
+
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::solver(cadical)]
+fn proof_v16_public_backing_expiry_replay_is_inert() {
+    let (mut header, mut markets, _) = one_market_direct_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    header.payout_snapshot_captured = 1;
+    header.payout_snapshot = V16PodU128::new(3);
+    header.resolved_payout_ledger =
+        ResolvedPayoutLedgerV16Account::from_runtime(&ResolvedPayoutLedgerV16 {
+            snapshot_residual: 3,
+            terminal_claim_exact_receipts_num: BOUND_SCALE,
+            terminal_claim_bound_unreceipted_num: BOUND_SCALE,
+            current_payout_rate_num: 2 * BOUND_SCALE,
+            current_payout_rate_den: 2 * BOUND_SCALE,
+            snapshot_slot: 1,
+            payout_halted: false,
+            finalized: false,
+        });
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id,
+        status: BackingBucketStatusV16::Expired,
+        ..BackingBucketV16::EMPTY
+    });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let bucket_before = market.markets[0]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+    let source_before = market.markets[0]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+    let ledger_before = market
+        .header
+        .resolved_payout_ledger
+        .try_to_runtime()
+        .unwrap();
+    let fresh_total_before = market.header.source_fresh_backing_total_num.get();
+    let risk_epoch_before = market.header.risk_epoch.get();
+    let legacy_snapshot_before = market.header.payout_snapshot.get();
+    let vault_before = market.header.vault.get();
+    let c_tot_before = market.header.c_tot.get();
+    let insurance_before = market.header.insurance.get();
+    let result = market.expire_source_backing_bucket_not_atomic(0, 20);
+
+    assert_eq!(result, Err(V16Error::Stale));
+    assert_eq!(
+        market.markets[0]
+            .engine
+            .backing_long
+            .try_to_runtime()
+            .unwrap(),
+        bucket_before
+    );
+    assert_eq!(
+        market.markets[0]
+            .engine
+            .source_credit_long
+            .try_to_runtime()
+            .unwrap(),
+        source_before
+    );
+    assert_eq!(
+        market
+            .header
+            .resolved_payout_ledger
+            .try_to_runtime()
+            .unwrap(),
+        ledger_before
+    );
+    assert_eq!(
+        market.header.source_fresh_backing_total_num.get(),
+        fresh_total_before
+    );
+    assert_eq!(market.header.risk_epoch.get(), risk_epoch_before);
+    assert_eq!(market.header.payout_snapshot.get(), legacy_snapshot_before);
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.c_tot.get(), c_tot_before);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+}
+
+// These two bounded bindings execute the production zero-copy route for both
+// payout-rate branches. General value conservation and arbitrary claim
+// partitions are proved by the full-width theorem above; these fail if the
+// public caller bypasses that kernel or miscomputes released residual.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_public_post_snapshot_expiry_improves_haircut_and_frames_receipts() {
+    assert_post_snapshot_expiry_route(1, 1, 4, BOUND_SCALE);
+}
+
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_public_post_snapshot_expiry_restores_full_rate() {
+    assert_post_snapshot_expiry_route(3, 1, 3, 0);
+}
+
 // upstream 63891280 "Prove the no-free-OI fee lower bound": a risk-increasing fill
 // with nonzero size, nonzero price, and nonzero fee_bps must charge a STRICTLY
 // POSITIVE fee per side. The pre-fix code derived the fee from trade_notional_floor,
