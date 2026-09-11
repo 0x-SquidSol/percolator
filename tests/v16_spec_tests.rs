@@ -4815,7 +4815,7 @@ fn v16_terminal_unbudgeted_insurance_retirement_is_claim_free_and_exact() {
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
 
     assert_eq!(
-        market.retire_terminal_unbudgeted_insurance_not_atomic(),
+        market.retire_terminal_unbudgeted_insurance_not_atomic(0),
         Err(V16Error::LockActive),
         "live insurance cannot be retired"
     );
@@ -4824,14 +4824,14 @@ fn v16_terminal_unbudgeted_insurance_retirement_is_claim_free_and_exact() {
         .credit_domain_insurance_budget_not_atomic(0, 1)
         .unwrap();
     assert_eq!(
-        market.retire_terminal_unbudgeted_insurance_not_atomic(),
+        market.retire_terminal_unbudgeted_insurance_not_atomic(0),
         Err(V16Error::LockActive),
         "a remaining domain claim protects the whole terminal pool"
     );
     market.withdraw_domain_insurance_not_atomic(0, 1).unwrap();
 
     assert_eq!(
-        market.retire_terminal_unbudgeted_insurance_not_atomic(),
+        market.retire_terminal_unbudgeted_insurance_not_atomic(0),
         Ok(9)
     );
     assert_eq!(market.header.vault.get(), 0);
@@ -4848,7 +4848,7 @@ fn v16_terminal_retirement_includes_claim_free_protocol_surplus() {
     market.resolve_market_not_atomic(1).unwrap();
 
     assert_eq!(
-        market.retire_terminal_unbudgeted_insurance_not_atomic(),
+        market.retire_terminal_unbudgeted_insurance_not_atomic(0),
         Ok(10)
     );
     assert_eq!(market.header.vault.get(), 0);
@@ -4866,7 +4866,7 @@ fn v16_terminal_slab_progress_expires_one_domain_before_retiring_residual() {
     market.resolve_market_not_atomic(1).unwrap();
 
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(5, 0),
+        market.advance_terminal_slab_not_atomic(5, 0, 0),
         Ok(TerminalSlabOutcomeV16::BackingExpired { domain: 0 })
     );
     assert_eq!(market.header.current_slot.get(), 5);
@@ -4884,7 +4884,7 @@ fn v16_terminal_slab_progress_expires_one_domain_before_retiring_residual() {
     );
 
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(5, 0),
+        market.advance_terminal_slab_not_atomic(5, 0, 0),
         Ok(TerminalSlabOutcomeV16::ReadyToClose { retired: 10 })
     );
     assert_eq!(market.header.vault.get(), 0);
@@ -4921,7 +4921,7 @@ fn v16_terminal_slab_progress_restores_insurance_before_retiring_surplus() {
     market.resolve_market_not_atomic(3).unwrap();
 
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(3, 0),
+        market.advance_terminal_slab_not_atomic(3, 0, 0),
         Ok(TerminalSlabOutcomeV16::InsuranceRecredited {
             asset_index: ASSET,
             amount: SPENT,
@@ -4941,7 +4941,7 @@ fn v16_terminal_slab_progress_restores_insurance_before_retiring_surplus() {
         0
     );
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(3, 0),
+        market.advance_terminal_slab_not_atomic(3, 0, 0),
         Err(V16Error::LockActive),
         "restored domain insurance must be withdrawn before final retirement"
     );
@@ -4952,7 +4952,7 @@ fn v16_terminal_slab_progress_restores_insurance_before_retiring_surplus() {
     assert_eq!(market.header.vault.get(), RESIDUAL - SPENT);
     assert_eq!(market.header.insurance.get(), 0);
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(3, 0),
+        market.advance_terminal_slab_not_atomic(3, 0, 0),
         Ok(TerminalSlabOutcomeV16::ReadyToClose {
             retired: RESIDUAL - SPENT,
         })
@@ -4992,7 +4992,7 @@ fn v16_terminal_slab_chunk_cursor_finds_last_asset_recredit_before_retirement() 
     market.resolve_market_not_atomic(SLOT).unwrap();
 
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(SLOT, 0),
+        market.advance_terminal_slab_not_atomic(SLOT, 0, 0),
         Ok(TerminalSlabOutcomeV16::ScanProgress {
             next_asset_index: percolator::TERMINAL_SLAB_SCAN_ASSETS_PER_CALL,
         })
@@ -5006,6 +5006,7 @@ fn v16_terminal_slab_chunk_cursor_finds_last_asset_recredit_before_retirement() 
         market.advance_terminal_slab_not_atomic(
             SLOT + 1,
             percolator::TERMINAL_SLAB_SCAN_ASSETS_PER_CALL,
+            0,
         ),
         Ok(TerminalSlabOutcomeV16::InsuranceRecredited {
             asset_index: ASSET,
@@ -5035,24 +5036,113 @@ fn v16_terminal_slab_cursor_stops_at_unexpired_backing_across_slots() {
     market.resolve_market_not_atomic(SLOT).unwrap();
 
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(SLOT, 0),
+        market.advance_terminal_slab_not_atomic(SLOT, 0, 0),
         Ok(TerminalSlabOutcomeV16::ScanProgress {
             next_asset_index: BLOCKING_ASSET,
         }),
         "the scan may advance up to, but never past, a still-live bucket"
     );
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(SLOT + 1, BLOCKING_ASSET),
+        market.advance_terminal_slab_not_atomic(SLOT + 1, BLOCKING_ASSET, 0),
         Err(V16Error::LockActive),
         "a parked cursor cannot report a successful no-op before expiry"
     );
     assert_eq!(
-        market.advance_terminal_slab_not_atomic(EXPIRY, BLOCKING_ASSET),
+        market.advance_terminal_slab_not_atomic(EXPIRY, BLOCKING_ASSET, 0),
         Ok(TerminalSlabOutcomeV16::BackingExpired {
             domain: BLOCKING_ASSET * 2,
         }),
         "authenticated time makes the parked bucket actionable without restarting the prefix"
     );
     assert_eq!(market.header.source_fresh_backing_total_num.get(), 0);
+    assert_eq!(market.validate_shape(), Ok(()));
+}
+
+// Fork protocol-fee RESERVE amendment: unwithdrawn protocol fees sit inside
+// header.insurance and the wrapper passes the protocol's claim as
+// additional_reserved. Terminal retirement must refuse to burn it and leave the
+// market untouched; once the fee leaves through the surplus-withdraw path the
+// same market retires to empty with a zero reserve.
+#[test]
+fn v16_terminal_retirement_refuses_unwithdrawn_protocol_fee_reserve() {
+    const INSURANCE: u128 = 10;
+    const PROTOCOL_FEE: u128 = 4;
+
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.vault = V16PodU128::new(INSURANCE);
+    header.insurance = V16PodU128::new(INSURANCE);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market.resolve_market_not_atomic(1).unwrap();
+    let header_before = *market.header;
+    let markets_before = market.markets.to_vec();
+
+    assert_eq!(
+        market.retire_terminal_unbudgeted_insurance_not_atomic(PROTOCOL_FEE),
+        Err(V16Error::LockActive),
+        "terminal retirement must not burn an unwithdrawn protocol fee"
+    );
+    assert_eq!(
+        *market.header, header_before,
+        "a refused retirement must leave the header untouched"
+    );
+    assert_eq!(market.markets, &markets_before[..]);
+    assert_eq!(
+        (market.header.vault.get(), market.header.insurance.get()),
+        (INSURANCE, INSURANCE)
+    );
+
+    market
+        .withdraw_insurance_surplus_not_atomic(PROTOCOL_FEE)
+        .unwrap();
+    assert_eq!(market.header.vault.get(), INSURANCE - PROTOCOL_FEE);
+    assert_eq!(market.header.insurance.get(), INSURANCE - PROTOCOL_FEE);
+
+    assert_eq!(
+        market.retire_terminal_unbudgeted_insurance_not_atomic(0),
+        Ok(INSURANCE - PROTOCOL_FEE)
+    );
+    assert_eq!(market.header.vault.get(), 0);
+    assert_eq!(market.header.insurance.get(), 0);
+    assert_eq!(market.validate_shape(), Ok(()));
+}
+
+// The bounded close slab reaches the same retirement through ReadyToClose and
+// must refuse it identically while the protocol fee is still reserved.
+#[test]
+fn v16_terminal_slab_close_refuses_unwithdrawn_protocol_fee_reserve() {
+    const INSURANCE: u128 = 10;
+    const PROTOCOL_FEE: u128 = 4;
+
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.vault = V16PodU128::new(INSURANCE);
+    header.insurance = V16PodU128::new(INSURANCE);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market.resolve_market_not_atomic(1).unwrap();
+    let slot = market.header.current_slot.get();
+    let header_before = *market.header;
+    let markets_before = market.markets.to_vec();
+
+    assert_eq!(
+        market.advance_terminal_slab_not_atomic(slot, 0, PROTOCOL_FEE),
+        Err(V16Error::LockActive),
+        "the close slab must not reach ReadyToClose over an unwithdrawn protocol fee"
+    );
+    assert_eq!(
+        *market.header, header_before,
+        "a refused close step must leave the header untouched"
+    );
+    assert_eq!(market.markets, &markets_before[..]);
+
+    market
+        .withdraw_insurance_surplus_not_atomic(PROTOCOL_FEE)
+        .unwrap();
+    assert_eq!(
+        market.advance_terminal_slab_not_atomic(slot, 0, 0),
+        Ok(TerminalSlabOutcomeV16::ReadyToClose {
+            retired: INSURANCE - PROTOCOL_FEE,
+        })
+    );
+    assert_eq!(market.header.vault.get(), 0);
+    assert_eq!(market.header.insurance.get(), 0);
     assert_eq!(market.validate_shape(), Ok(()));
 }

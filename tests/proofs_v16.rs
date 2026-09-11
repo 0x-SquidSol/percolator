@@ -13566,11 +13566,15 @@ fn proof_v16_terminal_unbudgeted_insurance_retirement_is_exact_and_claim_safe() 
     let budget_remaining: u128 = kani::any();
     let source_reserved: u128 = kani::any();
 
+    // Fork protocol-fee RESERVE amendment: a zero reserve checks upstream's
+    // semantics exactly; the nonzero case is
+    // proof_v16_terminal_retirement_fails_closed_on_protocol_fee_reserve.
     let result = MarketGroupV16ViewMut::<u64>::kani_retire_terminal_unbudgeted_insurance_delta(
         vault,
         insurance,
         budget_remaining,
         source_reserved,
+        0,
     );
     let expected_ok = insurance <= vault && budget_remaining == 0 && source_reserved == 0;
     kani::cover!(
@@ -13595,6 +13599,55 @@ fn proof_v16_terminal_unbudgeted_insurance_retirement_is_exact_and_claim_safe() 
         assert_eq!(next_vault, 0);
         assert_eq!(next_insurance, 0);
         assert_eq!(vault - next_vault, retired);
+    }
+}
+
+// Fork protocol-fee RESERVE amendment: terminal retirement never burns a
+// caller-declared protocol-fee claim. Any nonzero reserve fails closed with
+// LockActive whatever the other inputs; a zero reserve is exactly upstream's
+// delta.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_retirement_fails_closed_on_protocol_fee_reserve() {
+    let vault: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let budget_remaining: u128 = kani::any();
+    let source_reserved: u128 = kani::any();
+    let additional_reserved: u128 = kani::any();
+
+    let result = MarketGroupV16ViewMut::<u64>::kani_retire_terminal_unbudgeted_insurance_delta(
+        vault,
+        insurance,
+        budget_remaining,
+        source_reserved,
+        additional_reserved,
+    );
+    let unreserved = MarketGroupV16ViewMut::<u64>::kani_retire_terminal_unbudgeted_insurance_delta(
+        vault,
+        insurance,
+        budget_remaining,
+        source_reserved,
+        0,
+    );
+
+    kani::cover!(
+        additional_reserved > 0 && unreserved.is_ok(),
+        "a protocol-fee reserve blocks a retirement the unreserved delta performs"
+    );
+    kani::cover!(
+        additional_reserved > 0 && additional_reserved <= insurance && insurance == vault,
+        "a reserve inside a fully insured terminal vault is protected"
+    );
+    kani::cover!(
+        additional_reserved == 0 && unreserved.is_ok() && vault > 0,
+        "a zero reserve retires a nonzero vault exactly as upstream"
+    );
+
+    if additional_reserved != 0 {
+        assert_eq!(result, Err(V16Error::LockActive));
+    } else {
+        assert_eq!(result, unreserved);
     }
 }
 
@@ -13628,7 +13681,7 @@ fn assert_terminal_insurance_retirement_rejected_without_mutation(
     let slot_before = markets[0].engine;
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
     assert_eq!(market.validate_shape(), Ok(()));
-    let result = market.retire_terminal_unbudgeted_insurance_not_atomic();
+    let result = market.retire_terminal_unbudgeted_insurance_not_atomic(0);
 
     assert_eq!(result, Err(V16Error::LockActive));
     assert!(kani_eq_market_group_v16_header_account(
@@ -13658,7 +13711,7 @@ fn proof_v16_public_terminal_insurance_retirement_is_exact_and_fully_framed() {
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
 
     assert_eq!(market.validate_shape(), Ok(()));
-    let result = market.retire_terminal_unbudgeted_insurance_not_atomic();
+    let result = market.retire_terminal_unbudgeted_insurance_not_atomic(0);
 
     kani::cover!(
         insurance == 0,

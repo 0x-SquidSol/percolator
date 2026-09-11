@@ -6815,19 +6815,40 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     // insurance is claim-free protocol surplus at this boundary; the wrapper
     // pairs the complete accounting transition with an SPL-token burn.
     // (upstream a87c9a5b / 545e0224)
+    /// `additional_reserved` (protocol-fee RESERVE amendment,
+    /// ~/v17/DECISIONS-LEDGER.md) is a caller-supplied claim that still sits
+    /// inside `insurance`. In this fork unwithdrawn protocol fees are an
+    /// unbudgeted slice of `header.insurance`; the engine has no concept of
+    /// who owns it (that ledger lives in the wrapper's `WrapperConfigV16`,
+    /// `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`). Upstream
+    /// has no such claim and retires the entire vault, which would burn an
+    /// unwithdrawn protocol fee. A retirement whose postcondition is an empty
+    /// vault cannot leave a floor behind, so any nonzero `additional_reserved`
+    /// fails closed with `LockActive`: the caller withdraws the fee first
+    /// (`withdraw_insurance_surplus_not_atomic`) and then retires with `0`.
+    /// Pass `0` to recover upstream behavior exactly; the `(vault, 0, 0)`
+    /// postcondition is unchanged.
     fn retire_terminal_unbudgeted_insurance_delta(
         vault: u128,
         insurance: u128,
         budget_remaining: u128,
         source_reserved_atoms: u128,
+        additional_reserved: u128,
     ) -> V16Result<(u128, u128, u128)> {
-        if insurance > vault || budget_remaining != 0 || source_reserved_atoms != 0 {
+        if insurance > vault
+            || budget_remaining != 0
+            || source_reserved_atoms != 0
+            || additional_reserved != 0
+        {
             return Err(V16Error::LockActive);
         }
         Ok((vault, 0, 0))
     }
 
-    fn retire_terminal_unbudgeted_insurance_core_not_atomic(&mut self) -> V16Result<u128> {
+    fn retire_terminal_unbudgeted_insurance_core_not_atomic(
+        &mut self,
+        additional_reserved: u128,
+    ) -> V16Result<u128> {
         let vault_before = self.header.vault.get();
         let insurance_before = self.header.insurance.get();
         let (retired, next_vault, next_insurance) =
@@ -6838,6 +6859,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 self.header
                     .source_insurance_credit_reserved_total_atoms
                     .get(),
+                additional_reserved,
             )?;
         self.header.vault = V16PodU128::new(next_vault);
         self.header.insurance = V16PodU128::new(next_insurance);
@@ -6863,7 +6885,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// from an otherwise empty resolved market. No recoverable insurance
     /// overlap, domain budget, source reservation, portfolio, PnL, backing
     /// claim, or payout receipt may remain. (upstream a87c9a5b / 545e0224)
-    pub fn retire_terminal_unbudgeted_insurance_not_atomic(&mut self) -> V16Result<u128> {
+    ///
+    /// `additional_reserved` -- see `retire_terminal_unbudgeted_insurance_delta`
+    /// doc -- lets the caller (wrapper) declare the protocol's
+    /// accrued-but-unwithdrawn fee claim that still sits inside `insurance`.
+    /// Any nonzero value fails closed with `LockActive` before any mutation;
+    /// withdraw the fee, then retire with `0`. Pass `0` for upstream behavior.
+    pub fn retire_terminal_unbudgeted_insurance_not_atomic(
+        &mut self,
+        additional_reserved: u128,
+    ) -> V16Result<u128> {
         self.validate_shape()?;
         self.require_terminal_claim_free_state()?;
         if self.header.backing_provider_earnings_total.get() != 0
@@ -6874,7 +6905,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if self.first_terminal_claim_free_recredit_asset()?.is_some() {
             return Err(V16Error::LockActive);
         }
-        let retired = self.retire_terminal_unbudgeted_insurance_core_not_atomic()?;
+        let retired =
+            self.retire_terminal_unbudgeted_insurance_core_not_atomic(additional_reserved)?;
         self.validate_shape()?;
         Ok(retired)
     }
@@ -7040,10 +7072,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// slot changes without requiring every continuation to land in one slot. The wrapper owns the
     /// continuation state and closes external custody only for `ReadyToClose`.
     /// (upstream 545e0224 / af7b4d2a / 6f3c5c12)
+    ///
+    /// `additional_reserved` -- see `retire_terminal_unbudgeted_insurance_delta`
+    /// doc -- is consulted only by the final `ReadyToClose` retirement. Expiry
+    /// and recredit steps never lower `insurance` or `vault`, so a nonzero
+    /// reserve still lets the scan progress and fails closed with `LockActive`
+    /// exactly where retirement would burn the protocol's fee. Pass `0` for
+    /// upstream behavior.
     pub fn advance_terminal_slab_not_atomic(
         &mut self,
         authenticated_slot: u64,
         scan_start_asset_index: usize,
+        additional_reserved: u128,
     ) -> V16Result<TerminalSlabOutcomeV16> {
         self.validate_shape()?;
         self.require_terminal_claim_free_state()?;
@@ -7131,7 +7171,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         {
             return Err(V16Error::LockActive);
         }
-        let retired = self.retire_terminal_unbudgeted_insurance_core_not_atomic()?;
+        let retired =
+            self.retire_terminal_unbudgeted_insurance_core_not_atomic(additional_reserved)?;
         self.validate_shape()?;
         Ok(TerminalSlabOutcomeV16::ReadyToClose { retired })
     }
@@ -13929,12 +13970,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         insurance: u128,
         budget_remaining: u128,
         source_reserved_atoms: u128,
+        additional_reserved: u128,
     ) -> V16Result<(u128, u128, u128)> {
         Self::retire_terminal_unbudgeted_insurance_delta(
             vault,
             insurance,
             budget_remaining,
             source_reserved_atoms,
+            additional_reserved,
         )
     }
 
