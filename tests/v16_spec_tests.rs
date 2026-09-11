@@ -6141,6 +6141,86 @@ fn v16_auto_crank_migrates_exhausted_residue_behind_a_current_certificate() {
     account.validate_with_market(&market.as_view()).unwrap();
 }
 
+// Fork control for upstream 9ffc4749's selector hunk: liquidation eligibility
+// reads MATCHED effective OI. This account's short leg sits on a side that still
+// holds effective OI, but the long side is an exhausted residue (zero effective
+// OI while a stored position remains), so a close has nothing to match against.
+// A side-local reading dispatches a liquidation that cannot progress; the matched
+// reading classifies no liquidation work, so the crank is a clean NoAction.
+#[test]
+fn v16_auto_crank_does_not_liquidate_against_unmatched_effective_oi() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 23);
+    header.current_slot = V16PodU64::new(10);
+    header.slot_last = V16PodU64::new(10);
+
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.slot_last = 10;
+    asset.oi_eff_long_q = 0;
+    asset.oi_eff_short_q = POS_SCALE;
+    asset.loss_weight_sum_long = POS_SCALE;
+    asset.loss_weight_sum_short = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    asset.stored_pos_count_short = 1;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    header.resolved_payout_blocker_count = V16PodU64::new(2);
+
+    account_header.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: 0,
+        market_id: asset.market_id,
+        side: SideV16::Short,
+        basis_pos_q: -(POS_SCALE as i128),
+        a_basis: ADL_ONE,
+        k_snap: asset.k_short,
+        f_snap: asset.f_short_num,
+        kf_epoch_snap: 0,
+        epoch_snap: asset.epoch_short,
+        loss_weight: POS_SCALE,
+        b_snap: asset.b_short_num,
+        b_rem: 0,
+        b_epoch_snap: asset.epoch_short,
+        b_stale: false,
+        stale: false,
+    });
+    account_header.active_bitmap[0] = V16PodU64::new(1);
+    account_header.health_cert = HealthCertV16Account::from_runtime(&HealthCertV16 {
+        certified_equity: 0,
+        certified_initial_req: 2,
+        certified_maintenance_req: 2,
+        certified_liq_deficit: 2,
+        certified_worst_case_loss: 200,
+        cert_oracle_epoch: header.oracle_epoch.get(),
+        cert_funding_epoch: header.funding_epoch.get(),
+        cert_risk_epoch: header.risk_epoch.get(),
+        cert_asset_set_epoch: header.asset_set_epoch.get(),
+        active_bitmap_at_cert: [1],
+        valid: true,
+    });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    let summary = market.build_actionable_summary(&account.as_view()).unwrap();
+    assert!(
+        !summary.liquidatable,
+        "a leg with no opposite effective OI has nothing to liquidate against: {summary:?}"
+    );
+    let result = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: 10,
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("the crank must not dispatch a liquidation that cannot progress");
+    assert_eq!(result.selected, AutoCrankPlanV16::NoAction);
+    assert!(account.header.legs[0].try_to_runtime().unwrap().active);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
 #[test]
 fn v16_auto_crank_drives_stale_underwater_account_to_derisked_fixed_point() {
     let (mut header, mut markets) = market_fixture(2, 100);
