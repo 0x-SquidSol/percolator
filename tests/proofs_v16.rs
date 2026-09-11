@@ -13108,8 +13108,7 @@ fn proof_v16_nonzero_trade_charges_positive_fee_per_side() {
         (size_q.saturating_mul(exec_price as u128)) < percolator::POS_SCALE,
         "sub-atom notional (the floored-to-zero regime) is reachable"
     );
-    let fee =
-        percolator::v16::kani_trade_fee_atoms_per_side(size_q, exec_price, fee_bps).unwrap();
+    let fee = percolator::v16::kani_trade_fee_atoms_per_side(size_q, exec_price, fee_bps).unwrap();
     assert!(
         fee >= 1,
         "nonzero fill at nonzero price with nonzero fee must charge >= 1 atom per side (no free OI)"
