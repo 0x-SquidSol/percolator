@@ -13684,3 +13684,94 @@ fn proof_v16_nonzero_trade_charges_positive_fee_per_side() {
         "nonzero fill at nonzero price with nonzero fee must charge >= 1 atom per side (no free OI)"
     );
 }
+
+// upstream f7ad3ee9 "Fix backing-utilization fee carry-forward (no free lien)":
+// LoF (no free lien) — backing-utilization fee carry-forward. The lien-rent quote
+// floors to 0 for a small lien over a short interval. The buggy collect advanced
+// the fee cursor (source_lien_fee_last_slot) to current_slot UNCONDITIONALLY,
+// before the charged==0 return, so the floored-away fractional accrual was
+// discarded every call — a frequently-refreshed small lien paid zero rent forever
+// (slow-drip LoF to providers/insurance). Same blind spot as the sub-atom trade
+// fee: the existing quote proof BLESSES the floor-to-zero and asserts no lower
+// bound. The fix carries the accrual forward by NOT advancing the cursor when the
+// fee is zero. This proof drives the real collect path with a deliberately
+// floor-to-zero rent (base_rate=1, lien=1 atom, dt=1) and asserts the cursor is
+// preserved with no value moved. It FAILS on the pre-fix unconditional advance.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_backing_utilization_zero_fee_carries_accrual_forward() {
+    let capital_raw: u8 = kani::any();
+    let earnings_raw: u8 = kani::any();
+    kani::assume(capital_raw > 0); // account CAN pay; the only reason fee is 0 is the floor
+    let lien_atoms = 1u128;
+    let lien_num = lien_atoms * BOUND_SCALE;
+    let last_slot = 3u64;
+    let current_slot = last_slot + 1; // dt = 1
+    let capital = capital_raw as u128;
+    let earnings_before = earnings_raw as u128;
+    let (mut header, mut markets, mut account_header) = one_market_direct_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    // base_rate=1, slopes=0  =>  rate = 1  =>  fee = floor(lien_num * 1 * 1 / (DEN_E9*BOUND_SCALE)) = 0
+    header.config.backing_fee_base_rate_e9_per_slot = V16PodU64::new(1);
+    header.config.backing_fee_slope_at_kink_e9_per_slot = V16PodU64::new(0);
+    header.config.backing_fee_slope_above_kink_e9_per_slot = V16PodU64::new(0);
+    header.current_slot = V16PodU64::new(current_slot);
+    header.slot_last = V16PodU64::new(current_slot);
+    header.vault = V16PodU128::new(capital + earnings_before + lien_atoms);
+    header.c_tot = V16PodU128::new(capital);
+    header.backing_provider_earnings_total = V16PodU128::new(earnings_before);
+    header.source_fresh_backing_total_num = V16PodU128::new(lien_num);
+    account_header.capital = V16PodU128::new(capital);
+    account_header.pnl = V16PodI128::new(0);
+    account_header.health_cert.valid = 1;
+    account_header.source_domains[0] = PortfolioSourceDomainV16Account {
+        domain: V16PodU32::new(0),
+        source_claim_market_id: V16PodU64::new(market_id),
+        source_lien_counterparty_backing_num: V16PodU128::new(lien_num),
+        source_lien_fee_last_slot: V16PodU64::new(last_slot),
+        ..PortfolioSourceDomainV16Account::default()
+    };
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            fresh_reserved_backing_num: lien_num,
+            valid_liened_backing_num: lien_num,
+            credit_rate_num: CREDIT_RATE_SCALE,
+            ..SourceCreditStateV16::EMPTY
+        });
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id,
+        valid_liened_backing_num: lien_num,
+        utilization_fee_earnings: earnings_before,
+        expiry_slot: current_slot + 1,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let vault_before = market.header.vault.get();
+    let c_tot_before = market.header.c_tot.get();
+    let insurance_before = market.header.insurance.get();
+    let mut account = PortfolioV16ViewMut {
+        header: &mut account_header,
+    };
+    let charged = market
+        .kani_collect_account_backing_utilization_fee_for_domain_not_atomic(&mut account, 0)
+        .unwrap();
+
+    // The rent floored to zero this interval...
+    assert_eq!(charged, 0, "sub-atom rent must floor to zero this interval");
+    // ...so the cursor MUST NOT advance (carry the accrual forward; no free lien).
+    assert_eq!(
+        account.header.source_domains[0]
+            .source_lien_fee_last_slot
+            .get(),
+        last_slot,
+        "zero-fee collection must preserve the fee cursor (carry accrual forward)"
+    );
+    // No value moved.
+    assert_eq!(account.header.capital.get(), capital);
+    assert_eq!(market.header.c_tot.get(), c_tot_before);
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+}
