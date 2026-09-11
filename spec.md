@@ -811,6 +811,25 @@ or mode_s == ResetPending and epoch_snap_i + 1 == epoch_s
 
 `begin_full_drain_reset(side)` requires `OI_eff_side == 0` and then snapshots `K_side`/`F_side_num` to epoch-start fields, zeros live `K_side`/`F_side_num`, increments `epoch_side`, sets `A_side = ADL_ONE`, sets `stale_account_count_side = stored_pos_count_side`, clears phantom dust for that side, and enters `ResetPending`.
 
+When a side reset or leg clear combines two valid sub-atom social-loss carries,
+the sum is normalized modulo `SOCIAL_LOSS_DEN`. Crossing the denominator adds
+one to the side-local `explicit_unallocated_loss` audit counter; that counter
+saturates and never creates payout capacity. Remainder, dust, and explicit-loss
+audit fields remain durable while the asset has any live economic obligation.
+An otherwise empty asset may clear only those inert fields inside the single
+retirement transition so historical rounding cannot permanently block terminal
+progress; callers do not need a preparatory cleanup transition.
+After every source claim, provider receivable, backing amount, lien, and insurance
+reservation is zero, cumulative `spent_backing_num` is likewise audit-only and is
+cleared atomically with retirement. A nonzero provider receivable or consumed backing
+remains a hard retirement blocker.
+After every position, effective-OI atom, pending obligation, and social-loss weight is
+also zero, historical K/F indices and their prior-epoch baselines have no remaining
+claimant and are audit-only. Retirement clears them atomically. Restart performs the
+same terminal normalization, including spent-only domain budgets and source/social
+audit, before assigning the fresh market generation; any live obligation or nonzero
+remaining insurance budget rejects the complete restart transition.
+
 `finalize_side_reset(side)` requires `ResetPending`, zero OI, zero stale count, and zero stored position count, then sets mode to `Normal`.
 
 Before any OI-increasing operation rejects on `ResetPending`, it MUST call `maybe_finalize_ready_reset_sides_before_oi_increase`.
