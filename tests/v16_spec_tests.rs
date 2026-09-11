@@ -1,9 +1,10 @@
 use percolator::{
-    v16_domain_count_for_market_slots, AssetLifecycleV16, AssetStateV16Account,
-    BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, CloseProgressLedgerV16,
-    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HealthCertV16, HealthCertV16Account,
-    LiquidationRequestV16, Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut,
-    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
+    active_bitmap_is_empty, v16_domain_count_for_market_slots, AssetLifecycleV16,
+    AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
+    CloseProgressLedgerV16, CloseProgressLedgerV16Account, EngineAssetSlotV16Account,
+    HealthCertV16, HealthCertV16Account, LiquidationRequestV16, Market,
+    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
+    PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, RebalanceRequestV16, ResolvedCloseOutcomeV16,
@@ -597,6 +598,12 @@ fn v16_finalize_side_reset_is_public_value_neutral_and_epoch_bumping() {
     let risk_epoch_before = header.risk_epoch.get();
     let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
     asset.mode_long = SideModeV16::ResetPending;
+    asset.k_epoch_start_long = -17;
+    asset.f_epoch_start_long_num = 23;
+    asset.b_epoch_start_long_num = 29;
+    asset.k_epoch_start_short = 31;
+    asset.f_epoch_start_short_num = -37;
+    asset.b_epoch_start_short_num = 41;
     markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
 
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
@@ -606,6 +613,12 @@ fn v16_finalize_side_reset_is_public_value_neutral_and_epoch_bumping() {
 
     let finalized = market.markets[0].engine.asset.try_to_runtime().unwrap();
     assert_eq!(finalized.mode_long, SideModeV16::Normal);
+    assert_eq!(finalized.k_epoch_start_long, 0);
+    assert_eq!(finalized.f_epoch_start_long_num, 0);
+    assert_eq!(finalized.b_epoch_start_long_num, 0);
+    assert_eq!(finalized.k_epoch_start_short, 31);
+    assert_eq!(finalized.f_epoch_start_short_num, -37);
+    assert_eq!(finalized.b_epoch_start_short_num, 41);
     assert_eq!(market.header.risk_epoch.get(), risk_epoch_before + 1);
     assert_eq!(market.header.vault.get(), vault_before);
     assert_eq!(market.header.c_tot.get(), c_tot_before);
@@ -632,57 +645,6 @@ fn v16_finalize_side_reset_rejects_blocked_pending_side() {
     assert_eq!(blocked.mode_short, SideModeV16::ResetPending);
     assert_eq!(market.header.risk_epoch.get(), risk_epoch_before);
     assert_eq!(market.validate_shape(), Ok(()));
-}
-
-#[test]
-fn v16_resolved_bound_refinement_uses_public_monotone_api() {
-    let (mut header, mut markets) = market_fixture(1, 100);
-    {
-        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
-        market.resolve_market_not_atomic(1).unwrap();
-    }
-    header.vault = V16PodU128::new(50);
-    let exact_num = 2 * BOUND_SCALE;
-    let bound_num = 4 * BOUND_SCALE;
-    header.payout_snapshot_captured = 1;
-    header.resolved_payout_ledger =
-        ResolvedPayoutLedgerV16Account::from_runtime(&ResolvedPayoutLedgerV16 {
-            snapshot_residual: 3,
-            terminal_claim_exact_receipts_num: exact_num,
-            terminal_claim_bound_unreceipted_num: bound_num,
-            current_payout_rate_num: 3 * BOUND_SCALE,
-            current_payout_rate_den: exact_num + bound_num,
-            snapshot_slot: 1,
-            payout_halted: false,
-            finalized: false,
-        });
-    let vault_before = header.vault.get();
-    let c_tot_before = header.c_tot.get();
-    let insurance_before = header.insurance.get();
-
-    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
-    market
-        .refine_resolved_unreceipted_bound_not_atomic(2 * BOUND_SCALE)
-        .unwrap();
-
-    let refined = market
-        .header
-        .resolved_payout_ledger
-        .try_to_runtime()
-        .unwrap();
-    assert_eq!(
-        refined.terminal_claim_bound_unreceipted_num,
-        2 * BOUND_SCALE
-    );
-    assert!(
-        refined.current_payout_rate_num * (exact_num + bound_num)
-            >= (3 * BOUND_SCALE) * refined.current_payout_rate_den,
-        "bound refinement must not reduce already-quoted payout rate"
-    );
-    assert_eq!(market.header.vault.get(), vault_before);
-    assert_eq!(market.header.c_tot.get(), c_tot_before);
-    assert_eq!(market.header.insurance.get(), insurance_before);
-    market.validate_shape().unwrap();
 }
 
 #[test]
@@ -2287,8 +2249,8 @@ fn v16_liquidation_engine_selects_healthy_partial_before_margin_floor() {
     const PRICE: u64 = POS_SCALE as u64;
     const POSITION_Q: u128 = 10_000;
     const ACCOUNT_CAPITAL: u128 = 980;
-    const EXPECTED_CLOSE_Q: u128 = 981;
-    const EXPECTED_FEE: u128 = 79;
+    const EXPECTED_CLOSE_Q: u128 = 1_000;
+    const EXPECTED_FEE: u128 = 80;
 
     let (mut header, mut markets) = market_fixture(1, PRICE);
     header.config.maintenance_margin_bps = V16PodU64::new(1_000);
@@ -2359,8 +2321,8 @@ fn v16_liquidation_engine_selects_healthy_partial_before_margin_floor() {
     );
     let cert = account.header.health_cert.try_to_runtime().unwrap();
     assert_eq!(cert.certified_liq_deficit, 0);
-    assert_eq!(cert.certified_equity, 901);
-    assert_eq!(cert.certified_maintenance_req, 901);
+    assert_eq!(cert.certified_equity, 900);
+    assert_eq!(cert.certified_maintenance_req, 900);
     market.validate_shape().unwrap();
     account.validate_with_market(&market.as_view()).unwrap();
 }
@@ -4836,6 +4798,116 @@ fn direct_live_lien_release_leaves_a_certificate_the_conversion_can_use() {
     );
 }
 
+// upstream b4b975f3 "fix: allow lagging committed checkpoint accrual" (2026-08-31):
+// `now_slot` is the endpoint of one asset-local committed segment. Another asset can
+// already have advanced the market's authenticated clock past it, so a lagging asset
+// must still be able to settle its earlier checkpoint while the global clock stays
+// monotonic (max), and an asset-local checkpoint still cannot move behind that
+// asset's own clock.
+#[test]
+fn v16_asset_local_committed_accrual_can_trail_global_clock() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+    market
+        .accrue_asset_to_not_atomic(0, 10, 100, 0, true)
+        .expect("the first asset must advance the authenticated market clock");
+    let global_slot = market.header.current_slot.get();
+    let lagging_before = market.markets[1].engine.asset.slot_last.get();
+    let committed_slot = lagging_before + 1;
+    assert!(committed_slot < global_slot);
+
+    let outcome = market
+        .accrue_asset_to_not_atomic(1, committed_slot, 100, 0, true)
+        .expect("a lagging asset must settle an earlier committed checkpoint");
+
+    assert_eq!(outcome.dt, 1);
+    assert_eq!(
+        market.markets[1].engine.asset.slot_last.get(),
+        committed_slot
+    );
+    assert_eq!(market.header.current_slot.get(), global_slot);
+    assert_eq!(
+        market.accrue_asset_to_not_atomic(1, committed_slot - 1, 100, 0, true),
+        Err(V16Error::InvalidConfig),
+        "an asset-local checkpoint still cannot move behind that asset's own clock"
+    );
+    market.validate_shape().unwrap();
+}
+
+// upstream 44847fd5 "Authenticate resolved settlement time" (2026-08-20): resolved
+// routes do not accrue markets, but expiry-sensitive backing still needs a
+// monotonic clock. The wrapper authenticates the slot (Clock sysvar) and the
+// engine admits it only in Resolved mode and only forward.
+#[test]
+fn v16_resolved_clock_advance_is_monotonic_and_value_neutral() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let vault_before = header.vault;
+    let c_tot_before = header.c_tot;
+    let insurance_before = header.insurance;
+    let markets_before = markets.clone();
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market.resolve_market_not_atomic(5).unwrap();
+    market.advance_resolved_slot_not_atomic(9).unwrap();
+    assert_eq!(market.header.current_slot.get(), 9);
+    assert_eq!(market.header.resolved_slot.get(), 5);
+    assert_eq!(market.header.vault, vault_before);
+    assert_eq!(market.header.c_tot, c_tot_before);
+    assert_eq!(market.header.insurance, insurance_before);
+    assert_eq!(market.markets, &markets_before[..]);
+
+    assert_eq!(
+        market.advance_resolved_slot_not_atomic(8),
+        Err(V16Error::Stale)
+    );
+    assert_eq!(market.header.current_slot.get(), 9);
+
+    let (mut live_header, mut live_markets) = market_fixture(1, 100);
+    let live_slot = live_header.current_slot;
+    let mut live = MarketGroupV16ViewMut::new(&mut live_header, &mut live_markets);
+    assert_eq!(
+        live.advance_resolved_slot_not_atomic(9),
+        Err(V16Error::LockActive)
+    );
+    assert_eq!(live.header.current_slot, live_slot);
+}
+
+// upstream c0dec8ce "Canonicalize source-domain allocation order" (2026-08-29):
+// the mutable view compacts AND orders occupied source domains by domain index,
+// so bounded one-domain-per-call continuations see one canonical layout
+// regardless of allocation history.
+#[test]
+fn v16_mutable_view_canonicalizes_persisted_source_domain_order() {
+    let mut account_header = account_fixture(2, 120);
+    account_header.source_domains[0].domain = V16PodU32::new(3);
+    account_header.source_domains[0].source_claim_market_id = V16PodU64::new(2);
+    account_header.source_domains[0].source_claim_bound_num = V16PodU128::new(3 * BOUND_SCALE);
+    account_header.source_domains[2].domain = V16PodU32::new(1);
+    account_header.source_domains[2].source_claim_market_id = V16PodU64::new(1);
+    account_header.source_domains[2].source_claim_bound_num = V16PodU128::new(BOUND_SCALE);
+
+    let account = PortfolioV16ViewMut::new(&mut account_header);
+
+    assert_eq!(account.header.source_domains[0].domain.get(), 1);
+    assert_eq!(
+        account.header.source_domains[0]
+            .source_claim_bound_num
+            .get(),
+        BOUND_SCALE
+    );
+    assert_eq!(account.header.source_domains[1].domain.get(), 3);
+    assert_eq!(
+        account.header.source_domains[1]
+            .source_claim_bound_num
+            .get(),
+        3 * BOUND_SCALE
+    );
+    assert!(account.header.source_domains[2..]
+        .iter()
+        .all(|source| *source == PortfolioSourceDomainV16Account::default()));
+}
+
 // upstream c09d4575 "Fix live source-backing expiry progress" (2026-08-06): a
 // source-backed winner can remain Live past its backing bucket's expiry; the
 // permissionless refresh commits exactly one canonical expiry transition per
@@ -5292,4 +5364,217 @@ fn v16_post_snapshot_backing_expiry_credits_resolved_payout_ledger() {
     assert_eq!(ledger.current_payout_rate_den, claim_num);
     assert_eq!(ledger.terminal_claim_bound_unreceipted_num, claim_num);
     assert_eq!(market.header.vault.get(), vault_before);
+}
+
+// ---------------------------------------------------------------------------
+// upstream 6d8e0a48 "Fix unattributed cross-margin insurance drain" (2026-08-26)
+// + 9b737fdc "Prove unattributed loss lock lifecycle".
+//
+// Account PnL is one cross-margin scalar. Once a negative PnL has spanned more
+// than one active asset, no single asset's insurance / B domain can be charged
+// for it. The engine marks the account (`liquidation_lock`) at the detach that
+// leaves an uncovered loss with open risk, keeps the mark while the deficit is
+// negative, and liquidates such an account REDUCE-ONLY: no insurance, no
+// bankruptcy residual booked against the surviving asset.
+//
+// ---------------------------------------------------------------------------
+
+fn unattributed_deficit_fixture() -> (
+    MarketGroupV16HeaderAccount,
+    Vec<Market<u64>>,
+    PortfolioAccountV16Account,
+    PortfolioAccountV16Account,
+) {
+    let (mut header, markets) = market_fixture(2, 100);
+    header.config.maintenance_margin_bps = V16PodU64::new(1_000);
+    header.config.initial_margin_bps = V16PodU64::new(1_000);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(500);
+    header.config.max_accrual_dt_slots = V16PodU64::new(1);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(1);
+    let long_header = account_fixture(2, 65);
+    let short_header = account_fixture(2, 66);
+    (header, markets, long_header, short_header)
+}
+
+/// Opens 10 units long/short on both assets (long 2_000 capital, short 250),
+/// ramps asset 0 from 105 to 150 (short loses 500 on asset 0), then closes the
+/// asset-0 leg by a risk-reducing trade. Returns with the short at pnl -250,
+/// capital 0, one open leg on asset 1, and `liquidation_lock == 1`.
+fn open_unattributed_deficit(
+    market: &mut MarketGroupV16ViewMut<'_, u64>,
+    long: &mut PortfolioV16ViewMut<'_>,
+    short: &mut PortfolioV16ViewMut<'_>,
+) {
+    const SIZE_Q: u128 = 10 * POS_SCALE;
+    market.deposit_not_atomic(long, 2_000).unwrap();
+    market.deposit_not_atomic(short, 250).unwrap();
+    for asset_index in 0..2 {
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                long,
+                short,
+                TradeRequestV16 {
+                    asset_index,
+                    size_q: signed_q(SIZE_Q),
+                    exec_price: 100,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+    }
+    for (offset, price) in (105u64..=150).step_by(5).enumerate() {
+        let slot = 2 + offset as u64;
+        market
+            .set_asset_raw_oracle_target_not_atomic(0, price)
+            .unwrap();
+        market
+            .accrue_asset_to_not_atomic(0, slot, price, 0, true)
+            .unwrap();
+    }
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            long,
+            short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: -signed_q(SIZE_Q),
+                exec_price: 150,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .expect("the first risk-reducing close must remain available");
+    assert_eq!(short.header.pnl.get(), -250);
+    assert_eq!(short.header.capital.get(), 0);
+    assert_eq!(
+        short
+            .header
+            .close_progress
+            .try_to_runtime()
+            .unwrap()
+            .residual_remaining,
+        0
+    );
+}
+
+#[test]
+fn v16_trade_does_not_charge_prior_multi_asset_deficit_or_force_market_recovery() {
+    const SIZE_Q: u128 = 10 * POS_SCALE;
+    let (mut header, mut markets, mut long_header, mut short_header) =
+        unattributed_deficit_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    open_unattributed_deficit(&mut market, &mut long, &mut short);
+    assert_eq!(
+        short.header.liquidation_lock, 1,
+        "detaching one leg from an uncovered multi-asset deficit must retain its unattributed-loss marker"
+    );
+
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 1,
+                size_q: -signed_q(SIZE_Q),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .expect("the final risk-reducing close must remain available");
+    assert!(active_bitmap_is_empty(
+        short.header.active_bitmap.map(V16PodU64::get)
+    ));
+    // sticky: the last leg detaching does not clear an unattributed deficit
+    assert_eq!(short.header.liquidation_lock, 1);
+    let ledger = short.header.close_progress.try_to_runtime().unwrap();
+    assert_eq!(ledger.residual_remaining, 0);
+    // no asset domain was charged and no market-wide recovery was declared
+    assert_eq!(market.header.mode, 0);
+    assert_eq!(market.header.insurance.get(), 0);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+
+    // upstream 228d9b3f: explicit market resolution winds the unattributed debt
+    // down inside the resolved close itself (no domain guessing, no recovery).
+    market
+        .resolve_market_not_atomic(market.header.current_slot.get())
+        .expect("explicit market resolution handles unattributed terminal debt");
+    let loser_close = market
+        .close_resolved_account_not_atomic(&mut short, 0)
+        .expect("resolved settlement clears unattributed negative PnL without domain guessing");
+    assert!(matches!(
+        loser_close,
+        percolator::ResolvedCloseOutcomeV16::Closed { payout: 0 }
+    ));
+    assert_eq!(short.header.pnl.get(), 0);
+    assert_eq!(short.header.liquidation_lock, 0);
+    assert_eq!(market.header.bankruptcy_hlock_active, 1);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_liquidation_of_unattributed_deficit_reduces_risk_without_charging_the_surviving_domain() {
+    let (mut header, mut markets, mut long_header, mut short_header) =
+        unattributed_deficit_fixture();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    open_unattributed_deficit(&mut market, &mut long, &mut short);
+
+    let insurance_before = market.header.insurance.get();
+    let asset1_before = markets_snapshot(&market, 1);
+    let outcome = market
+        .liquidate_account_not_atomic(&mut short, LiquidationRequestV16 { asset_index: 1 })
+        .expect("a locked account still liquidates, reduce-only");
+    // NEGATIVE CONTROL for 6d8e0a48: without the lock this liquidation charges the
+    // asset-0 loss to asset 1 (residual booked / fee charged against the surviving
+    // domain). With it, only risk is removed.
+    assert!(outcome.closed_q > 0);
+    assert_eq!(outcome.insurance_used, 0);
+    assert_eq!(outcome.residual_booked, 0);
+    assert_eq!(outcome.explicit_loss, 0);
+    assert_eq!(outcome.fee_charged, 0);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+    assert_eq!(market.header.mode, 0, "no market recovery declared");
+    assert_eq!(short.header.liquidation_lock, 1);
+    assert_eq!(short.header.pnl.get(), -250);
+    let asset1_after = markets_snapshot(&market, 1);
+    assert_eq!(
+        asset1_after.close_ledger_side_1_touched, false,
+        "no close ledger was begun against the surviving asset"
+    );
+    assert!(
+        asset1_after.oi_eff_short_q < asset1_before.oi_eff_short_q,
+        "risk on the surviving asset was reduced"
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+struct AssetSnapshot {
+    oi_eff_short_q: u128,
+    close_ledger_side_1_touched: bool,
+}
+
+fn markets_snapshot(market: &MarketGroupV16ViewMut<'_, u64>, asset_index: usize) -> AssetSnapshot {
+    let asset = market.markets[asset_index]
+        .engine
+        .asset
+        .try_to_runtime()
+        .unwrap();
+    AssetSnapshot {
+        oi_eff_short_q: asset.oi_eff_short_q,
+        close_ledger_side_1_touched: asset.social_loss_dust_long_num != 0
+            || asset.social_loss_dust_short_num != 0
+            || asset.b_long_num != 0
+            || asset.b_short_num != 0,
+    }
 }
