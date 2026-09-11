@@ -20763,9 +20763,8 @@ pub fn kani_terminal_slab_wait_continuation(
 
 // upstream a2760ddb ("Prove terminal insurance retirement isolation") frames the
 // public retirement route with these field-wise equalities (upstream keeps them in
-// src/v16_kani_api.rs). Fork adaptations: the header also compares the fork A-6
-// stress-envelope fields, and the asset state has no kf_epoch_long/short (upstream's
-// K/F cohort layout is not merged here).
+// src/v16_kani_api.rs). Fork adaptation: the header also compares the fork A-6
+// stress-envelope fields.
 #[cfg(kani)]
 pub fn kani_eq_v16_config_account(a: &V16ConfigAccount, b: &V16ConfigAccount) -> bool {
     a.max_portfolio_assets.get() == b.max_portfolio_assets.get()
@@ -20913,6 +20912,8 @@ pub fn kani_eq_asset_state_v16_account(a: &AssetStateV16Account, b: &AssetStateV
         && a.k_short.get() == b.k_short.get()
         && a.f_long_num.get() == b.f_long_num.get()
         && a.f_short_num.get() == b.f_short_num.get()
+        && a.kf_epoch_long.get() == b.kf_epoch_long.get()
+        && a.kf_epoch_short.get() == b.kf_epoch_short.get()
         && a.k_epoch_start_long.get() == b.k_epoch_start_long.get()
         && a.k_epoch_start_short.get() == b.k_epoch_start_short.get()
         && a.f_epoch_start_long_num.get() == b.f_epoch_start_long_num.get()
