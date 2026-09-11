@@ -11,7 +11,8 @@ use percolator::v16::{
     kani_available_backing_num_for_source_credit_state,
     kani_backing_utilization_fee_quote_atoms_for_lien,
     kani_backing_utilization_rate_e9_for_source_state, kani_commit_declared_liquidation_recovery,
-    kani_decode_account_kf_settlement_plan_key, kani_expected_source_credit_rate_num_for_state,
+    kani_decode_account_kf_settlement_plan_key, kani_eq_engine_asset_slot_v16_account,
+    kani_eq_market_group_v16_header_account, kani_expected_source_credit_rate_num_for_state,
     kani_first_actionable_slot, kani_health_cert_after_capital_debit,
     kani_health_requirements_from_base_and_target_lag,
     kani_insert_account_kf_settlement_plan_entry, kani_kernel_cert_is_current,
@@ -27,15 +28,17 @@ use percolator::v16::{
     kani_source_claim_domain_first_burn_partition,
     kani_source_credit_state_realizable_support_for_face,
     kani_source_lien_fee_after_backing_release, kani_target_effective_lag_adverse_delta,
-    kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
-    kani_unattributed_loss_lock_after_pnl, kani_validate_positive_pnl_source_attribution,
-    AccrualStepV16, ActionableSummaryV16, AssetLifecycleV16, AssetStateV16, AssetStateV16Account,
-    AutoCrankPlanV16, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
-    BatchTradeOutcomeV16, CloseProgressLedgerV16, CloseProgressLedgerV16Account,
-    EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16, HealthCertV16Account,
-    InsuranceCreditReservationV16, InsuranceCreditReservationV16Account, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
-    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
+    kani_terminal_claim_free_overlap_recredit, kani_terminal_slab_asset_step,
+    kani_terminal_slab_wait_continuation, kani_trade_preexisting_oi_reduction_gate,
+    kani_trade_preflight_risk_gate, kani_unattributed_loss_lock_after_pnl,
+    kani_validate_positive_pnl_source_attribution, AccrualStepV16, ActionableSummaryV16,
+    AssetLifecycleV16, AssetStateV16, AssetStateV16Account, AutoCrankPlanV16,
+    BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, BatchTradeOutcomeV16,
+    CloseProgressLedgerV16, CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16,
+    HealthCertV16, HealthCertV16Account, InsuranceCreditReservationV16,
+    InsuranceCreditReservationV16Account, Market, MarketGroupV16HeaderAccount,
+    MarketGroupV16ViewMut, MarketModeV16, PermissionlessCrankActionV16,
+    PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16,
@@ -17278,4 +17281,578 @@ fn proof_v16_unattributed_loss_lock_is_exact_and_sticky_until_repaid() {
         new_pnl >= 0 && was_locked && !locked,
         "repaying the deficit clears the unattributed-loss lock"
     );
+}
+
+// upstream a87c9a5b / 76a86f48 / 6f3c5c12: terminal retirement and claim-free recredit proofs.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_unbudgeted_insurance_retirement_is_exact_and_claim_safe() {
+    let vault: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let budget_remaining: u128 = kani::any();
+    let source_reserved: u128 = kani::any();
+
+    // Fork protocol-fee RESERVE amendment: a zero reserve checks upstream's
+    // semantics exactly; the nonzero case is
+    // proof_v16_terminal_retirement_fails_closed_on_protocol_fee_reserve.
+    let result = MarketGroupV16ViewMut::<u64>::kani_retire_terminal_unbudgeted_insurance_delta(
+        vault,
+        insurance,
+        budget_remaining,
+        source_reserved,
+        0,
+    );
+    let expected_ok = insurance <= vault && budget_remaining == 0 && source_reserved == 0;
+    kani::cover!(
+        expected_ok && insurance > 0,
+        "terminal retirement covers a nonzero unbudgeted insurance burn"
+    );
+    kani::cover!(
+        expected_ok && vault > insurance,
+        "terminal retirement covers claim-free protocol surplus"
+    );
+    kani::cover!(
+        vault == insurance && budget_remaining > 0,
+        "terminal retirement covers a protected domain budget"
+    );
+    kani::cover!(
+        vault == insurance && source_reserved > 0,
+        "terminal retirement covers a protected source reservation"
+    );
+    assert_eq!(result.is_ok(), expected_ok);
+    if let Ok((retired, next_vault, next_insurance)) = result {
+        assert_eq!(retired, vault);
+        assert_eq!(next_vault, 0);
+        assert_eq!(next_insurance, 0);
+        assert_eq!(vault - next_vault, retired);
+    }
+}
+
+// Fork protocol-fee RESERVE amendment: terminal retirement never burns a
+// caller-declared protocol-fee claim. Any nonzero reserve fails closed with
+// LockActive whatever the other inputs; a zero reserve is exactly upstream's
+// delta.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_retirement_fails_closed_on_protocol_fee_reserve() {
+    let vault: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let budget_remaining: u128 = kani::any();
+    let source_reserved: u128 = kani::any();
+    let additional_reserved: u128 = kani::any();
+
+    let result = MarketGroupV16ViewMut::<u64>::kani_retire_terminal_unbudgeted_insurance_delta(
+        vault,
+        insurance,
+        budget_remaining,
+        source_reserved,
+        additional_reserved,
+    );
+    let unreserved = MarketGroupV16ViewMut::<u64>::kani_retire_terminal_unbudgeted_insurance_delta(
+        vault,
+        insurance,
+        budget_remaining,
+        source_reserved,
+        0,
+    );
+
+    kani::cover!(
+        additional_reserved > 0 && unreserved.is_ok(),
+        "a protocol-fee reserve blocks a retirement the unreserved delta performs"
+    );
+    kani::cover!(
+        additional_reserved > 0 && additional_reserved <= insurance && insurance == vault,
+        "a reserve inside a fully insured terminal vault is protected"
+    );
+    kani::cover!(
+        additional_reserved == 0 && unreserved.is_ok() && vault > 0,
+        "a zero reserve retires a nonzero vault exactly as upstream"
+    );
+
+    if additional_reserved != 0 {
+        assert_eq!(result, Err(V16Error::LockActive));
+    } else {
+        assert_eq!(result, unreserved);
+    }
+}
+
+// upstream a2760ddb "Prove terminal insurance retirement isolation" (2026-07-22):
+// the public retirement route is exact and fully framed when insurance is the only
+// vault stock, and rejects without mutation for every funded claim class, live
+// reservation class and readiness counter.
+fn terminal_insurance_retirement_fixture(
+    insurance: u128,
+) -> (MarketGroupV16HeaderAccount, [Market<u64>; 1]) {
+    let (mut header, markets, _) = one_market_direct_view_fixture();
+    // Fork adaptation (A-6 stress envelope; cf. #142): the fork's validate_shape
+    // requires the closed-envelope sentinels to be u64::MAX and this zeroed fixture
+    // header leaves them 0, so without these two lines every harness below fails
+    // its shape-validity precondition before reaching retirement. Upstream has no
+    // such fields; the fixture state is otherwise upstream's.
+    header.stress_envelope_start_slot = V16PodU64::new(u64::MAX);
+    header.stress_envelope_start_credit_epoch = V16PodU64::new(u64::MAX);
+    header.mode = 1; // Resolved
+    header.resolved_slot = V16PodU64::new(header.current_slot.get());
+    header.vault = V16PodU128::new(insurance);
+    header.insurance = V16PodU128::new(insurance);
+    (header, markets)
+}
+
+fn assert_terminal_insurance_retirement_rejected_without_mutation(
+    mut header: MarketGroupV16HeaderAccount,
+    mut markets: [Market<u64>; 1],
+) {
+    let header_before = header;
+    let slot_before = markets[0].engine;
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    assert_eq!(market.validate_shape(), Ok(()));
+    let result = market.retire_terminal_unbudgeted_insurance_not_atomic(0);
+
+    assert_eq!(result, Err(V16Error::LockActive));
+    assert!(kani_eq_market_group_v16_header_account(
+        &header_before,
+        market.header
+    ));
+    assert!(kani_eq_engine_asset_slot_v16_account(
+        &slot_before,
+        &market.markets[0].engine
+    ));
+}
+
+// Production-route theorem: when insurance is the only remaining vault stock,
+// retirement removes it exactly and frames every unrelated market field.
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_terminal_insurance_retirement_is_exact_and_fully_framed() {
+    let insurance_raw: u64 = kani::any();
+    let insurance = insurance_raw as u128;
+    kani::assume(insurance <= MAX_VAULT_TVL);
+    let (mut header, mut markets) = terminal_insurance_retirement_fixture(insurance);
+    let slot_before = markets[0].engine;
+    let mut expected_header = header;
+    expected_header.vault = V16PodU128::new(0);
+    expected_header.insurance = V16PodU128::new(0);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+    assert_eq!(market.validate_shape(), Ok(()));
+    let result = market.retire_terminal_unbudgeted_insurance_not_atomic(0);
+
+    kani::cover!(
+        insurance == 0,
+        "terminal retirement covers the zero identity"
+    );
+    kani::cover!(
+        insurance > 0,
+        "terminal retirement covers a nonzero full-width insurance balance"
+    );
+    assert_eq!(result, Ok(insurance));
+    assert!(kani_eq_market_group_v16_header_account(
+        &expected_header,
+        market.header
+    ));
+    assert!(kani_eq_engine_asset_slot_v16_account(
+        &slot_before,
+        &market.markets[0].engine
+    ));
+    assert_eq!(market.validate_shape(), Ok(()));
+}
+
+// A terminal burn must not consume any funded senior stock or erase a junior
+// source claim. Each class is a shape-valid persisted state, not malformed
+// input rejected by validation. The bindings are split because a symbolic
+// selector across all four U256 validation shapes exceeds the solver budget.
+fn assert_terminal_insurance_retirement_rejects_funded_claim_class(blocker: u8, amount: u128) {
+    assert!(blocker < 4);
+    let insurance = 9u128;
+    let (mut header, mut markets) = terminal_insurance_retirement_fixture(insurance);
+    let market_id = markets[0].engine.asset.market_id.get();
+
+    match blocker {
+        0 => {
+            header.vault = V16PodU128::new(insurance + amount);
+            header.c_tot = V16PodU128::new(amount);
+        }
+        1 => {
+            let claim_num = amount * BOUND_SCALE;
+            header.pnl_pos_tot = V16PodU128::new(amount);
+            header.pnl_pos_bound_tot_num = V16PodU128::new(claim_num);
+            header.pnl_pos_bound_tot = V16PodU128::new(amount);
+            header.pnl_matured_pos_tot = V16PodU128::new(amount);
+            header.source_claim_bound_total_num = V16PodU128::new(claim_num);
+            markets[0].engine.source_credit_long =
+                SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+                    positive_claim_bound_num: claim_num,
+                    exact_positive_claim_num: claim_num,
+                    credit_rate_num: 0,
+                    ..SourceCreditStateV16::EMPTY
+                });
+        }
+        2 => {
+            header.vault = V16PodU128::new(insurance + amount);
+            header.backing_provider_earnings_total = V16PodU128::new(amount);
+            markets[0].engine.backing_long =
+                BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+                    market_id,
+                    utilization_fee_earnings: amount,
+                    status: BackingBucketStatusV16::Expired,
+                    ..BackingBucketV16::EMPTY
+                });
+        }
+        _ => {
+            let backing_num = amount * BOUND_SCALE;
+            header.vault = V16PodU128::new(insurance + amount);
+            header.source_fresh_backing_total_num = V16PodU128::new(backing_num);
+            markets[0].engine.backing_long =
+                BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+                    market_id,
+                    fresh_unliened_backing_num: backing_num,
+                    expiry_slot: 10,
+                    status: BackingBucketStatusV16::Fresh,
+                    ..BackingBucketV16::EMPTY
+                });
+            markets[0].engine.source_credit_long =
+                SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+                    fresh_reserved_backing_num: backing_num,
+                    ..SourceCreditStateV16::EMPTY
+                });
+        }
+    }
+
+    assert_terminal_insurance_retirement_rejected_without_mutation(header, markets);
+}
+
+fn symbolic_terminal_claim_amount() -> u128 {
+    let amount_raw: u8 = kani::any();
+    kani::assume((1..=64).contains(&amount_raw));
+    amount_raw as u128
+}
+
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_terminal_insurance_retirement_rejects_account_capital() {
+    let amount = symbolic_terminal_claim_amount();
+    kani::cover!(amount == 1, "capital blocker covers the minimum atom");
+    kani::cover!(amount == 64, "capital blocker covers the range ceiling");
+    assert_terminal_insurance_retirement_rejects_funded_claim_class(0, amount);
+}
+
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_terminal_insurance_retirement_rejects_positive_source_claim() {
+    let amount = symbolic_terminal_claim_amount();
+    kani::cover!(amount == 1, "source-claim blocker covers the minimum atom");
+    kani::cover!(
+        amount == 64,
+        "source-claim blocker covers the range ceiling"
+    );
+    assert_terminal_insurance_retirement_rejects_funded_claim_class(1, amount);
+}
+
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_terminal_insurance_retirement_rejects_provider_earnings() {
+    let amount = symbolic_terminal_claim_amount();
+    kani::cover!(amount == 1, "earnings blocker covers the minimum atom");
+    kani::cover!(amount == 64, "earnings blocker covers the range ceiling");
+    assert_terminal_insurance_retirement_rejects_funded_claim_class(2, amount);
+}
+
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_terminal_insurance_retirement_rejects_backing_principal() {
+    let amount = symbolic_terminal_claim_amount();
+    kani::cover!(amount == 1, "backing blocker covers the minimum atom");
+    kani::cover!(amount == 64, "backing blocker covers the range ceiling");
+    assert_terminal_insurance_retirement_rejects_funded_claim_class(3, amount);
+}
+
+// Domain budgets, source reservations, close barriers, and materialized
+// portfolios are independently sufficient to block terminal retirement.
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_terminal_insurance_retirement_rejects_every_live_reservation_class() {
+    let blocker: u8 = kani::any();
+    let amount_raw: u8 = kani::any();
+    kani::assume(blocker < 4);
+    kani::assume((1..=8).contains(&amount_raw));
+    let amount = amount_raw as u128;
+    let insurance = amount + 1;
+    let (mut header, mut markets) = terminal_insurance_retirement_fixture(insurance);
+
+    match blocker {
+        0 => {
+            header.insurance_domain_budget_remaining_total = V16PodU128::new(amount);
+            markets[0].engine.insurance_domain_budget_long = V16PodU128::new(amount);
+        }
+        1 => {
+            let reservation_num = amount * BOUND_SCALE;
+            header.insurance_domain_budget_remaining_total = V16PodU128::new(amount);
+            header.source_insurance_credit_reserved_total_atoms = V16PodU128::new(amount);
+            markets[0].engine.insurance_domain_budget_long = V16PodU128::new(amount);
+            markets[0].engine.source_credit_long =
+                SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+                    insurance_credit_reserved_num: reservation_num,
+                    ..SourceCreditStateV16::EMPTY
+                });
+            markets[0].engine.insurance_reservation_long =
+                InsuranceCreditReservationV16Account::from_runtime(
+                    &InsuranceCreditReservationV16 {
+                        insurance_credit_reserved_num: reservation_num,
+                        ..InsuranceCreditReservationV16::EMPTY
+                    },
+                );
+        }
+        2 => {
+            header.resolved_payout_blocker_count = V16PodU64::new(1);
+            markets[0].engine.pending_domain_loss_barrier_long = V16PodU64::new(1);
+        }
+        _ => header.materialized_portfolio_count = V16PodU64::new(amount as u64),
+    }
+
+    kani::cover!(
+        blocker == 0,
+        "retirement preserves domain insurance budgets"
+    );
+    kani::cover!(
+        blocker == 1,
+        "retirement preserves source insurance reservations"
+    );
+    kani::cover!(blocker == 2, "retirement preserves pending domain closes");
+    kani::cover!(blocker == 3, "retirement preserves materialized portfolios");
+    assert_terminal_insurance_retirement_rejected_without_mutation(header, markets);
+}
+
+// Readiness counters are O(1) claims that other portfolio accounts still need
+// settlement. A caller cannot retire the vault before any one reaches zero.
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_terminal_insurance_retirement_requires_resolved_ready_accounts() {
+    let blocker: u8 = kani::any();
+    kani::assume(blocker < 4);
+    let (mut header, markets) = terminal_insurance_retirement_fixture(7);
+
+    match blocker {
+        0 => header.mode = 0, // Live
+        1 => header.stale_certificate_count = V16PodU64::new(1),
+        2 => header.b_stale_account_count = V16PodU64::new(1),
+        _ => header.negative_pnl_account_count = V16PodU64::new(1),
+    }
+
+    kani::cover!(blocker == 0, "live markets cannot retire insurance");
+    kani::cover!(blocker == 1, "stale accounts block retirement");
+    kani::cover!(blocker == 2, "B-stale accounts block retirement");
+    kani::cover!(blocker == 3, "negative-PnL accounts block retirement");
+    assert_terminal_insurance_retirement_rejected_without_mutation(header, markets);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_claim_free_overlap_recredit_is_exactly_bounded() {
+    let receivable_raw: u16 = kani::any();
+    let spent_raw: u16 = kani::any();
+    let residual_raw: u16 = kani::any();
+    let receivable = receivable_raw as u128;
+    let spent = spent_raw as u128;
+    let residual = residual_raw as u128;
+
+    let recredit = kani_terminal_claim_free_overlap_recredit(receivable, spent, residual);
+
+    kani::cover!(
+        receivable > 8 && spent > receivable && residual > receivable,
+        "terminal overlap recredit covers provider-receivable cap"
+    );
+    kani::cover!(
+        spent > 8 && receivable > spent && residual > spent,
+        "resolved overlap recredit covers paired-insurance-spend cap"
+    );
+    kani::cover!(
+        residual > 8 && receivable > residual && spent > residual,
+        "resolved overlap recredit covers claim-free-residual cap"
+    );
+
+    assert_eq!(recredit, receivable.min(spent).min(residual));
+    assert!(recredit <= receivable);
+    assert!(recredit <= spent);
+    assert!(recredit <= residual);
+
+    let insurance_before: u128 = kani::any();
+    kani::assume(insurance_before <= u128::MAX - residual);
+    let insurance_after = insurance_before + recredit;
+    let spent_after = spent - recredit;
+    let residual_after = residual - recredit;
+    assert_eq!(
+        insurance_after + residual_after,
+        insurance_before + residual
+    );
+    assert_eq!(spent_after + recredit, spent);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_slab_asset_step_is_total_and_priority_ordered() {
+    let long_selector: u8 = kani::any();
+    let short_selector: u8 = kani::any();
+    let long_status = match long_selector & 3 {
+        0 => BackingBucketStatusV16::Empty,
+        1 => BackingBucketStatusV16::Fresh,
+        2 => BackingBucketStatusV16::Expired,
+        _ => BackingBucketStatusV16::Impaired,
+    };
+    let short_status = match short_selector & 3 {
+        0 => BackingBucketStatusV16::Empty,
+        1 => BackingBucketStatusV16::Fresh,
+        2 => BackingBucketStatusV16::Expired,
+        _ => BackingBucketStatusV16::Impaired,
+    };
+    let long_expiry_slot: u64 = kani::any();
+    let short_expiry_slot: u64 = kani::any();
+    let authenticated_slot: u64 = kani::any();
+    let recreditable: bool = kani::any();
+
+    let actual = kani_terminal_slab_asset_step(
+        long_status,
+        long_expiry_slot,
+        short_status,
+        short_expiry_slot,
+        authenticated_slot,
+        recreditable,
+    );
+    let long_lapsed =
+        long_status == BackingBucketStatusV16::Fresh && long_expiry_slot <= authenticated_slot;
+    let short_lapsed =
+        short_status == BackingBucketStatusV16::Fresh && short_expiry_slot <= authenticated_slot;
+    let has_live_backing = (long_status == BackingBucketStatusV16::Fresh
+        && long_expiry_slot > authenticated_slot)
+        || (short_status == BackingBucketStatusV16::Fresh
+            && short_expiry_slot > authenticated_slot);
+    let expected = if long_lapsed {
+        0
+    } else if short_lapsed {
+        1
+    } else if recreditable {
+        2
+    } else if has_live_backing {
+        3
+    } else {
+        4
+    };
+
+    kani::cover!(actual == 0, "terminal scan selects lapsed long backing");
+    kani::cover!(actual == 1, "terminal scan selects lapsed short backing");
+    kani::cover!(actual == 2, "terminal scan selects insurance recredit");
+    kani::cover!(actual == 3, "terminal scan stops at live backing");
+    kani::cover!(actual == 4, "terminal scan advances over an inert asset");
+    assert_eq!(actual, expected);
+    if actual == 3 {
+        assert!(has_live_backing);
+        assert!(!long_lapsed && !short_lapsed && !recreditable);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_slab_wait_is_error_or_strict_cursor_progress() {
+    let scan_start_raw: u16 = kani::any();
+    let asset_raw: u16 = kani::any();
+    let scan_start = scan_start_raw as usize;
+    let asset = asset_raw as usize;
+    let result = kani_terminal_slab_wait_continuation(scan_start, asset);
+
+    kani::cover!(
+        asset == scan_start,
+        "a parked cursor rejects a successful no-op"
+    );
+    kani::cover!(
+        asset > scan_start,
+        "a discovered blocker advances the cursor to itself"
+    );
+    assert_eq!(result.is_ok(), asset > scan_start);
+    if let Ok(next_asset) = result {
+        assert_eq!(next_asset, asset);
+        assert!(next_asset > scan_start);
+    } else {
+        assert!(asset <= scan_start);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(32)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_claim_free_overlap_recredit_updates_only_paired_insurance_domain() {
+    let budget_raw: u8 = kani::any();
+    let spent_raw: u8 = kani::any();
+    let receivable_raw: u8 = kani::any();
+    let residual_raw: u8 = kani::any();
+    kani::assume(spent_raw <= budget_raw);
+
+    let budget = budget_raw as u128;
+    let spent = spent_raw as u128;
+    let receivable = receivable_raw as u128;
+    let residual_before = residual_raw as u128;
+    let insurance_before = budget - spent;
+    let expected = receivable.min(spent).min(residual_before);
+
+    let (mut header, mut markets, _) = one_market_view_fixture();
+    header.insurance = V16PodU128::new(insurance_before);
+    header.vault = V16PodU128::new(insurance_before + residual_before);
+    header.insurance_domain_budget_remaining_total = V16PodU128::new(insurance_before);
+    markets[0].engine.insurance_domain_budget_short = V16PodU128::new(budget);
+    markets[0].engine.insurance_domain_spent_short = V16PodU128::new(spent);
+    let receivable_num = receivable * BOUND_SCALE;
+    let mut source = markets[0]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+    source.spent_backing_num = receivable_num;
+    source.provider_receivable_num = receivable_num;
+    markets[0].engine.source_credit_long = SourceCreditStateV16Account::from_runtime(&source);
+    let mut bucket = markets[0].engine.backing_long.try_to_runtime().unwrap();
+    bucket.consumed_liened_backing_num = receivable_num;
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&bucket);
+    let long_spent_before = markets[0].engine.insurance_domain_spent_long;
+    let vault_before = header.vault;
+    let mut residual_remaining = residual_before;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let result = market
+        .kani_recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+            0,
+            &mut residual_remaining,
+        )
+        .unwrap();
+
+    kani::cover!(
+        expected > 2 && expected < receivable,
+        "transition covers a nontrivial paired-domain partial recredit"
+    );
+    assert_eq!(result, expected);
+    assert_eq!(market.header.vault, vault_before);
+    assert_eq!(market.header.insurance.get(), insurance_before + expected);
+    assert_eq!(
+        market.header.insurance_domain_budget_remaining_total.get(),
+        insurance_before + expected
+    );
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_spent_short.get(),
+        spent - expected
+    );
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_spent_long,
+        long_spent_before
+    );
+    assert_eq!(residual_remaining, residual_before - expected);
+    assert_eq!(market.kani_residual(), residual_before - expected);
 }

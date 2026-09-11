@@ -814,6 +814,59 @@ impl V16Core {
         .ok_or(V16Error::ArithmeticOverflow)
     }
 
+    /// Claim-free terminal overlap recredit: the paired-domain insurance spend
+    /// that is also backed by an outstanding provider receivable and by
+    /// claim-free residual. (upstream 76a86f48)
+    fn terminal_claim_free_overlap_recredit(
+        provider_receivable_atoms: u128,
+        paired_domain_insurance_spent: u128,
+        claim_free_residual_remaining: u128,
+    ) -> u128 {
+        provider_receivable_atoms
+            .min(paired_domain_insurance_spent)
+            .min(claim_free_residual_remaining)
+    }
+
+    /// One asset step of the bounded terminal slab scan, priority ordered:
+    /// expire a lapsed long, then short, bucket; recredit; wait on live
+    /// backing; else continue. (upstream 6f3c5c12 / 545e0224)
+    fn kernel_terminal_slab_asset_step(
+        long_status: BackingBucketStatusV16,
+        long_expiry_slot: u64,
+        short_status: BackingBucketStatusV16,
+        short_expiry_slot: u64,
+        authenticated_slot: u64,
+        recreditable: bool,
+    ) -> TerminalSlabAssetStepV16 {
+        let long_fresh = long_status == BackingBucketStatusV16::Fresh;
+        let short_fresh = short_status == BackingBucketStatusV16::Fresh;
+        if long_fresh && long_expiry_slot <= authenticated_slot {
+            TerminalSlabAssetStepV16::Expire(0)
+        } else if short_fresh && short_expiry_slot <= authenticated_slot {
+            TerminalSlabAssetStepV16::Expire(1)
+        } else if recreditable {
+            TerminalSlabAssetStepV16::Recredit
+        } else if (long_fresh && long_expiry_slot > authenticated_slot)
+            || (short_fresh && short_expiry_slot > authenticated_slot)
+        {
+            TerminalSlabAssetStepV16::Wait
+        } else {
+            TerminalSlabAssetStepV16::Continue
+        }
+    }
+
+    /// A parked cursor may only report strict progress. (upstream 6f3c5c12)
+    fn kernel_terminal_slab_wait_continuation(
+        scan_start_asset_index: usize,
+        asset_index: usize,
+    ) -> V16Result<usize> {
+        if asset_index <= scan_start_asset_index {
+            Err(V16Error::LockActive)
+        } else {
+            Ok(asset_index)
+        }
+    }
+
     /// Starts a new settlement cohort whenever a side's K/F target moves.
     /// The epoch makes repeated accrual and exact index reversal unambiguous.
     pub(crate) fn kernel_mark_kf_stale_cohorts(
@@ -5613,6 +5666,17 @@ impl TokenValueFlowProofV16 {
         Ok(proof)
     }
 
+    fn unallocated_protocol_surplus_to_insurance(
+        amount: u128,
+        vault_before: u128,
+        vault_after: u128,
+    ) -> V16Result<Self> {
+        let mut proof = Self::empty(vault_before, vault_after);
+        proof.debit(TokenValueClassV16::UnallocatedProtocolSurplus, amount)?;
+        proof.credit(TokenValueClassV16::InsuranceCapital, amount)?;
+        Ok(proof)
+    }
+
     pub fn account_capital_to_realized_loss(
         amount: u128,
         vault_before: u128,
@@ -8457,6 +8521,373 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.vault = V16PodU128::new(next_vault);
         self.validate_source_domain_ledger(domain)?;
         self.validate_shape()
+    }
+
+    // Contract layer: terminal retirement removes only value that has no
+    // remaining domain or source-credit claimant. Any vault value above
+    // insurance is claim-free protocol surplus at this boundary; the wrapper
+    // pairs the complete accounting transition with an SPL-token burn.
+    // (upstream a87c9a5b / 545e0224)
+    /// `additional_reserved` (protocol-fee RESERVE amendment,
+    /// ~/v17/DECISIONS-LEDGER.md) is a caller-supplied claim that still sits
+    /// inside `insurance`. In this fork unwithdrawn protocol fees are an
+    /// unbudgeted slice of `header.insurance`; the engine has no concept of
+    /// who owns it (that ledger lives in the wrapper's `WrapperConfigV16`,
+    /// `protocol_fee_accrued_atoms - protocol_fee_withdrawn_atoms`). Upstream
+    /// has no such claim and retires the entire vault, which would burn an
+    /// unwithdrawn protocol fee. A retirement whose postcondition is an empty
+    /// vault cannot leave a floor behind, so any nonzero `additional_reserved`
+    /// fails closed with `LockActive`: the caller withdraws the fee first
+    /// (`withdraw_insurance_surplus_not_atomic`) and then retires with `0`.
+    /// Pass `0` to recover upstream behavior exactly; the `(vault, 0, 0)`
+    /// postcondition is unchanged.
+    fn retire_terminal_unbudgeted_insurance_delta(
+        vault: u128,
+        insurance: u128,
+        budget_remaining: u128,
+        source_reserved_atoms: u128,
+        additional_reserved: u128,
+    ) -> V16Result<(u128, u128, u128)> {
+        if insurance > vault
+            || budget_remaining != 0
+            || source_reserved_atoms != 0
+            || additional_reserved != 0
+        {
+            return Err(V16Error::LockActive);
+        }
+        Ok((vault, 0, 0))
+    }
+
+    fn retire_terminal_unbudgeted_insurance_core_not_atomic(
+        &mut self,
+        additional_reserved: u128,
+    ) -> V16Result<u128> {
+        let vault_before = self.header.vault.get();
+        let insurance_before = self.header.insurance.get();
+        let (retired, next_vault, next_insurance) =
+            Self::retire_terminal_unbudgeted_insurance_delta(
+                vault_before,
+                insurance_before,
+                self.header.insurance_domain_budget_remaining_total.get(),
+                self.header
+                    .source_insurance_credit_reserved_total_atoms
+                    .get(),
+                additional_reserved,
+            )?;
+        self.header.vault = V16PodU128::new(next_vault);
+        self.header.insurance = V16PodU128::new(next_insurance);
+        let protocol_surplus = vault_before
+            .checked_sub(insurance_before)
+            .ok_or(V16Error::CounterUnderflow)?;
+        TokenValueFlowProofV16::unallocated_protocol_surplus_to_insurance(
+            protocol_surplus,
+            vault_before,
+            vault_before,
+        )?
+        .validate()?;
+        TokenValueFlowProofV16::insurance_capital_to_external_out(
+            retired,
+            vault_before,
+            next_vault,
+        )?
+        .validate()?;
+        Ok(retired)
+    }
+
+    /// Retires the final unbudgeted insurance and claim-free protocol surplus
+    /// from an otherwise empty resolved market. No recoverable insurance
+    /// overlap, domain budget, source reservation, portfolio, PnL, backing
+    /// claim, or payout receipt may remain. (upstream a87c9a5b / 545e0224)
+    ///
+    /// `additional_reserved` -- see `retire_terminal_unbudgeted_insurance_delta`
+    /// doc -- lets the caller (wrapper) declare the protocol's
+    /// accrued-but-unwithdrawn fee claim that still sits inside `insurance`.
+    /// Any nonzero value fails closed with `LockActive` before any mutation;
+    /// withdraw the fee, then retire with `0`. Pass `0` for upstream behavior.
+    pub fn retire_terminal_unbudgeted_insurance_not_atomic(
+        &mut self,
+        additional_reserved: u128,
+    ) -> V16Result<u128> {
+        self.validate_shape()?;
+        self.require_terminal_claim_free_state()?;
+        if self.header.backing_provider_earnings_total.get() != 0
+            || self.header.source_fresh_backing_total_num.get() != 0
+        {
+            return Err(V16Error::LockActive);
+        }
+        if self.first_terminal_claim_free_recredit_asset()?.is_some() {
+            return Err(V16Error::LockActive);
+        }
+        let retired =
+            self.retire_terminal_unbudgeted_insurance_core_not_atomic(additional_reserved)?;
+        self.validate_shape()?;
+        Ok(retired)
+    }
+
+    fn recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+        &mut self,
+        source_domain: usize,
+        claim_free_residual_remaining: &mut u128,
+    ) -> V16Result<u128> {
+        let (asset_index, source_side) = self.domain_asset_side(source_domain)?;
+        let insurance_domain =
+            self.insurance_domain_index(asset_index, opposite_side(source_side))?;
+        let (_, insurance_spent) = self.domain_insurance_budget_spent(insurance_domain)?;
+        let provider_receivable_atoms = self
+            .source_credit_for_domain(source_domain)?
+            .provider_receivable_num
+            / BOUND_SCALE;
+        let recredit = V16Core::terminal_claim_free_overlap_recredit(
+            provider_receivable_atoms,
+            insurance_spent,
+            *claim_free_residual_remaining,
+        );
+        if recredit == 0 {
+            return Ok(0);
+        }
+
+        let vault_before = self.header.vault.get();
+        self.header.insurance = V16PodU128::new(
+            self.header
+                .insurance
+                .get()
+                .checked_add(recredit)
+                .ok_or(V16Error::ArithmeticOverflow)?,
+        );
+        self.set_domain_insurance_spent_core(
+            insurance_domain,
+            insurance_spent
+                .checked_sub(recredit)
+                .ok_or(V16Error::CounterUnderflow)?,
+        )?;
+        *claim_free_residual_remaining = claim_free_residual_remaining
+            .checked_sub(recredit)
+            .ok_or(V16Error::CounterUnderflow)?;
+        TokenValueFlowProofV16::unallocated_protocol_surplus_to_insurance(
+            recredit,
+            vault_before,
+            self.header.vault.get(),
+        )?
+        .validate()?;
+        Ok(recredit)
+    }
+
+    /// Shared gate of the three terminal public entries: Resolved and no
+    /// trader claim of any kind remains. (upstream 76a86f48 / 545e0224)
+    fn require_terminal_claim_free_state(&self) -> V16Result<()> {
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Resolved
+            || self.header.materialized_portfolio_count.get() != 0
+            || self.header.c_tot.get() != 0
+            || self.header.pnl_pos_tot.get() != 0
+            || self.header.pnl_matured_pos_tot.get() != 0
+            || self.header.pnl_pos_bound_tot.get() != 0
+            || self.header.pnl_pos_bound_tot_num.get() != 0
+            || self.header.source_claim_bound_total_num.get() != 0
+            || self.header.resolved_payout_blocker_count.get() != 0
+            || self.header.stale_certificate_count.get() != 0
+            || self.header.b_stale_account_count.get() != 0
+            || self.header.negative_pnl_account_count.get() != 0
+        {
+            return Err(V16Error::LockActive);
+        }
+        Ok(())
+    }
+
+    /// Read-only recredit amount for one persisted asset slot, so the bounded
+    /// scan does no view resolution. (upstream af7b4d2a)
+    fn terminal_claim_free_recredit_for_slot(
+        slot: &EngineAssetSlotV16Account,
+        claim_free_residual: u128,
+    ) -> V16Result<u128> {
+        let long_source_recredit = V16Core::terminal_claim_free_overlap_recredit(
+            slot.source_credit_long.provider_receivable_num.get() / BOUND_SCALE,
+            slot.insurance_domain_spent_short.get(),
+            claim_free_residual,
+        );
+        let residual_after_long = claim_free_residual
+            .checked_sub(long_source_recredit)
+            .ok_or(V16Error::CounterUnderflow)?;
+        let short_source_recredit = V16Core::terminal_claim_free_overlap_recredit(
+            slot.source_credit_short.provider_receivable_num.get() / BOUND_SCALE,
+            slot.insurance_domain_spent_long.get(),
+            residual_after_long,
+        );
+        long_source_recredit
+            .checked_add(short_source_recredit)
+            .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    fn first_terminal_claim_free_recredit_asset(&self) -> V16Result<Option<usize>> {
+        let residual = self.residual();
+        if residual == 0 {
+            return Ok(None);
+        }
+        let configured_assets = self.header.config.max_market_slots.get() as usize;
+        for asset_index in 0..configured_assets {
+            if Self::terminal_claim_free_recredit_for_slot(
+                self.markets[asset_index].engine_slot(),
+                residual,
+            )? != 0
+            {
+                return Ok(Some(asset_index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Restores one asset's claim-free terminal residual that is also backed by
+    /// both an outstanding counterparty-provider receivable and historical
+    /// insurance spend on the paired side. The final materialized-portfolio gate
+    /// makes the residual unowned by traders before any reclassification occurs.
+    ///
+    /// This operation is intentionally asset-local: wrapper callers can make
+    /// bounded progress even when the market account contains thousands of
+    /// configured slots. (upstream 76a86f48 [BLOCKER LoF])
+    fn recredit_terminal_claim_free_residual_for_asset_core_not_atomic(
+        &mut self,
+        asset_index: usize,
+    ) -> V16Result<u128> {
+        let mut claim_free_residual_remaining = self.residual();
+        let mut recredited_total = 0u128;
+        for side in [SideV16::Long, SideV16::Short] {
+            if claim_free_residual_remaining == 0 {
+                break;
+            }
+            let source_domain = self.insurance_domain_index(asset_index, side)?;
+            let recredited = self
+                .recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+                    source_domain,
+                    &mut claim_free_residual_remaining,
+                )?;
+            recredited_total = recredited_total
+                .checked_add(recredited)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+        }
+        Ok(recredited_total)
+    }
+
+    pub fn recredit_terminal_claim_free_residual_for_asset_not_atomic(
+        &mut self,
+        asset_index: usize,
+    ) -> V16Result<u128> {
+        self.validate_shape()?;
+        self.require_terminal_claim_free_state()?;
+        let recredited =
+            self.recredit_terminal_claim_free_residual_for_asset_core_not_atomic(asset_index)?;
+        self.validate_shape()?;
+        Ok(recredited)
+    }
+
+    /// Advances one bounded terminal cleanup step. A nonzero scan start must be the exact
+    /// `ScanProgress` continuation persisted by the wrapper. The scan never advances past a Fresh
+    /// backing bucket: it expires an elapsed bucket, advances up to a still-live bucket, or returns
+    /// `LockActive` when already parked on one. This makes the prefix stable across authenticated
+    /// slot changes without requiring every continuation to land in one slot. The wrapper owns the
+    /// continuation state and closes external custody only for `ReadyToClose`.
+    /// (upstream 545e0224 / af7b4d2a / 6f3c5c12)
+    ///
+    /// `additional_reserved` -- see `retire_terminal_unbudgeted_insurance_delta`
+    /// doc -- is consulted only by the final `ReadyToClose` retirement. Expiry
+    /// and recredit steps never lower `insurance` or `vault`, so a nonzero
+    /// reserve still lets the scan progress and fails closed with `LockActive`
+    /// exactly where retirement would burn the protocol's fee. Pass `0` for
+    /// upstream behavior.
+    pub fn advance_terminal_slab_not_atomic(
+        &mut self,
+        authenticated_slot: u64,
+        scan_start_asset_index: usize,
+        additional_reserved: u128,
+    ) -> V16Result<TerminalSlabOutcomeV16> {
+        self.validate_shape()?;
+        self.require_terminal_claim_free_state()?;
+        self.advance_resolved_slot_not_atomic(authenticated_slot)?;
+
+        let configured_assets = self.header.config.max_market_slots.get() as usize;
+        if scan_start_asset_index != 0 && scan_start_asset_index >= configured_assets {
+            return Err(V16Error::InvalidConfig);
+        }
+        let inspect_backing = self.header.source_fresh_backing_total_num.get() != 0;
+        let residual = self.residual();
+        let inspect_recredit = residual != 0;
+        if inspect_backing || inspect_recredit {
+            let scan_end = scan_start_asset_index
+                .checked_add(TERMINAL_SLAB_SCAN_ASSETS_PER_CALL)
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .min(configured_assets);
+            for asset_index in scan_start_asset_index..scan_end {
+                let step = {
+                    let slot = self.markets[asset_index].engine_slot();
+                    let long_status = decode_backing_bucket_status(slot.backing_long.status)?;
+                    let short_status = decode_backing_bucket_status(slot.backing_short.status)?;
+                    let recreditable = inspect_recredit
+                        && Self::terminal_claim_free_recredit_for_slot(slot, residual)? != 0;
+                    V16Core::kernel_terminal_slab_asset_step(
+                        if inspect_backing {
+                            long_status
+                        } else {
+                            BackingBucketStatusV16::Empty
+                        },
+                        slot.backing_long.expiry_slot.get(),
+                        if inspect_backing {
+                            short_status
+                        } else {
+                            BackingBucketStatusV16::Empty
+                        },
+                        slot.backing_short.expiry_slot.get(),
+                        authenticated_slot,
+                        recreditable,
+                    )
+                };
+                match step {
+                    TerminalSlabAssetStepV16::Expire(side_offset) => {
+                        let domain = asset_index
+                            .checked_mul(2)
+                            .and_then(|value| value.checked_add(side_offset))
+                            .ok_or(V16Error::ArithmeticOverflow)?;
+                        self.expire_source_backing_bucket_not_atomic(domain, authenticated_slot)?;
+                        self.validate_shape()?;
+                        return Ok(TerminalSlabOutcomeV16::BackingExpired { domain });
+                    }
+                    TerminalSlabAssetStepV16::Recredit => {
+                        let amount = self
+                            .recredit_terminal_claim_free_residual_for_asset_core_not_atomic(
+                                asset_index,
+                            )?;
+                        if amount == 0 {
+                            return Err(V16Error::InvalidConfig);
+                        }
+                        self.validate_shape()?;
+                        return Ok(TerminalSlabOutcomeV16::InsuranceRecredited {
+                            asset_index,
+                            amount,
+                        });
+                    }
+                    TerminalSlabAssetStepV16::Wait => {
+                        let next_asset_index = V16Core::kernel_terminal_slab_wait_continuation(
+                            scan_start_asset_index,
+                            asset_index,
+                        )?;
+                        return Ok(TerminalSlabOutcomeV16::ScanProgress { next_asset_index });
+                    }
+                    TerminalSlabAssetStepV16::Continue => {}
+                }
+            }
+            if scan_end != configured_assets {
+                return Ok(TerminalSlabOutcomeV16::ScanProgress {
+                    next_asset_index: scan_end,
+                });
+            }
+        }
+
+        if self.header.backing_provider_earnings_total.get() != 0
+            || self.header.source_fresh_backing_total_num.get() != 0
+        {
+            return Err(V16Error::LockActive);
+        }
+        let retired =
+            self.retire_terminal_unbudgeted_insurance_core_not_atomic(additional_reserved)?;
+        self.validate_shape()?;
+        Ok(TerminalSlabOutcomeV16::ReadyToClose { retired })
     }
 
     pub fn expire_source_backing_bucket_not_atomic(
@@ -16339,6 +16770,35 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     #[cfg(kani)]
+    pub fn kani_recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+        &mut self,
+        source_domain: usize,
+        claim_free_residual_remaining: &mut u128,
+    ) -> V16Result<u128> {
+        self.recredit_terminal_claim_free_overlap_for_source_domain_not_atomic(
+            source_domain,
+            claim_free_residual_remaining,
+        )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_retire_terminal_unbudgeted_insurance_delta(
+        vault: u128,
+        insurance: u128,
+        budget_remaining: u128,
+        source_reserved_atoms: u128,
+        additional_reserved: u128,
+    ) -> V16Result<(u128, u128, u128)> {
+        Self::retire_terminal_unbudgeted_insurance_delta(
+            vault,
+            insurance,
+            budget_remaining,
+            source_reserved_atoms,
+            additional_reserved,
+        )
+    }
+
+    #[cfg(kani)]
     pub fn kani_prepare_counterparty_backing_expiry_delta(
         bucket: BackingBucketV16,
         source: SourceCreditStateV16,
@@ -20034,6 +20494,28 @@ impl RiskScoreV16 {
     }
 }
 
+/// Outcome of one bounded terminal cleanup step (upstream 545e0224). The wrapper
+/// owns the `ScanProgress` continuation and closes external custody only for
+/// `ReadyToClose`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSlabOutcomeV16 {
+    ScanProgress { next_asset_index: usize },
+    BackingExpired { domain: usize },
+    InsuranceRecredited { asset_index: usize, amount: u128 },
+    ReadyToClose { retired: u128 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalSlabAssetStepV16 {
+    Expire(usize),
+    Recredit,
+    Wait,
+    Continue,
+}
+
+/// Assets inspected by one `advance_terminal_slab_not_atomic` call.
+pub const TERMINAL_SLAB_SCAN_ASSETS_PER_CALL: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionlessProgressOutcomeV16 {
     AccountCurrent,
@@ -20231,6 +20713,307 @@ pub fn kani_trade_preflight_risk_gate(
         target_effective_lag,
         touches_pending_domain_barrier,
     )
+}
+
+#[cfg(kani)]
+pub fn kani_terminal_claim_free_overlap_recredit(
+    provider_receivable_atoms: u128,
+    paired_domain_insurance_spent: u128,
+    claim_free_residual_remaining: u128,
+) -> u128 {
+    V16Core::terminal_claim_free_overlap_recredit(
+        provider_receivable_atoms,
+        paired_domain_insurance_spent,
+        claim_free_residual_remaining,
+    )
+}
+
+#[cfg(kani)]
+pub fn kani_terminal_slab_asset_step(
+    long_status: BackingBucketStatusV16,
+    long_expiry_slot: u64,
+    short_status: BackingBucketStatusV16,
+    short_expiry_slot: u64,
+    authenticated_slot: u64,
+    recreditable: bool,
+) -> u8 {
+    match V16Core::kernel_terminal_slab_asset_step(
+        long_status,
+        long_expiry_slot,
+        short_status,
+        short_expiry_slot,
+        authenticated_slot,
+        recreditable,
+    ) {
+        TerminalSlabAssetStepV16::Expire(0) => 0,
+        TerminalSlabAssetStepV16::Expire(_) => 1,
+        TerminalSlabAssetStepV16::Recredit => 2,
+        TerminalSlabAssetStepV16::Wait => 3,
+        TerminalSlabAssetStepV16::Continue => 4,
+    }
+}
+
+#[cfg(kani)]
+pub fn kani_terminal_slab_wait_continuation(
+    scan_start_asset_index: usize,
+    asset_index: usize,
+) -> V16Result<usize> {
+    V16Core::kernel_terminal_slab_wait_continuation(scan_start_asset_index, asset_index)
+}
+
+// upstream a2760ddb ("Prove terminal insurance retirement isolation") frames the
+// public retirement route with these field-wise equalities (upstream keeps them in
+// src/v16_kani_api.rs). Fork adaptation: the header also compares the fork A-6
+// stress-envelope fields.
+#[cfg(kani)]
+pub fn kani_eq_v16_config_account(a: &V16ConfigAccount, b: &V16ConfigAccount) -> bool {
+    a.max_portfolio_assets.get() == b.max_portfolio_assets.get()
+        && a.max_market_slots.get() == b.max_market_slots.get()
+        && a.min_nonzero_mm_req.get() == b.min_nonzero_mm_req.get()
+        && a.min_nonzero_im_req.get() == b.min_nonzero_im_req.get()
+        && a.h_min.get() == b.h_min.get()
+        && a.h_max.get() == b.h_max.get()
+        && a.maintenance_margin_bps.get() == b.maintenance_margin_bps.get()
+        && a.initial_margin_bps.get() == b.initial_margin_bps.get()
+        && a.max_trading_fee_bps.get() == b.max_trading_fee_bps.get()
+        && a.liquidation_fee_bps.get() == b.liquidation_fee_bps.get()
+        && a.liquidation_fee_cap.get() == b.liquidation_fee_cap.get()
+        && a.min_liquidation_abs.get() == b.min_liquidation_abs.get()
+        && a.max_accrual_dt_slots.get() == b.max_accrual_dt_slots.get()
+        && a.max_abs_funding_e9_per_slot.get() == b.max_abs_funding_e9_per_slot.get()
+        && a.min_funding_lifetime_slots.get() == b.min_funding_lifetime_slots.get()
+        && a.max_price_move_bps_per_slot.get() == b.max_price_move_bps_per_slot.get()
+        && a.max_account_b_settlement_chunks.get() == b.max_account_b_settlement_chunks.get()
+        && a.max_bankrupt_close_chunks.get() == b.max_bankrupt_close_chunks.get()
+        && a.max_bankrupt_close_lifetime_slots.get() == b.max_bankrupt_close_lifetime_slots.get()
+        && a.asset_activation_cooldown_slots.get() == b.asset_activation_cooldown_slots.get()
+        && a.public_b_chunk_atoms.get() == b.public_b_chunk_atoms.get()
+        && a.max_recovery_fallback_deviation_bps.get()
+            == b.max_recovery_fallback_deviation_bps.get()
+        && a.backing_fee_base_rate_e9_per_slot.get() == b.backing_fee_base_rate_e9_per_slot.get()
+        && a.backing_fee_kink_util_bps.get() == b.backing_fee_kink_util_bps.get()
+        && a.backing_fee_slope_at_kink_e9_per_slot.get()
+            == b.backing_fee_slope_at_kink_e9_per_slot.get()
+        && a.backing_fee_slope_above_kink_e9_per_slot.get()
+            == b.backing_fee_slope_above_kink_e9_per_slot.get()
+        && a.backing_freshness_buckets == b.backing_freshness_buckets
+        && a.margin_mode_realizable_full_shared_cross_margin
+            == b.margin_mode_realizable_full_shared_cross_margin
+        && a.source_credit_lien_required == b.source_credit_lien_required
+        && a.insurance_credit_reservation_required == b.insurance_credit_reservation_required
+        && a.permissionless_recovery_enabled == b.permissionless_recovery_enabled
+        && a.recovery_fallback_price_enabled == b.recovery_fallback_price_enabled
+        && a.recovery_fallback_envelope_enabled == b.recovery_fallback_envelope_enabled
+        && a.credit_lien_revalidation_required == b.credit_lien_revalidation_required
+        && a.stale_certificate_penalty_enabled == b.stale_certificate_penalty_enabled
+        && a.full_refresh_required_for_favorable_actions
+            == b.full_refresh_required_for_favorable_actions
+        && a.public_liveness_profile_crank_forward == b.public_liveness_profile_crank_forward
+}
+
+#[cfg(kani)]
+pub fn kani_eq_v16_optional_recovery_reason_account(
+    a: &V16OptionalRecoveryReasonAccount,
+    b: &V16OptionalRecoveryReasonAccount,
+) -> bool {
+    a.present == b.present && a.value == b.value
+}
+
+#[cfg(kani)]
+pub fn kani_eq_resolved_payout_ledger_v16_account(
+    a: &ResolvedPayoutLedgerV16Account,
+    b: &ResolvedPayoutLedgerV16Account,
+) -> bool {
+    a.snapshot_residual.get() == b.snapshot_residual.get()
+        && a.terminal_claim_exact_receipts_num.get() == b.terminal_claim_exact_receipts_num.get()
+        && a.terminal_claim_bound_unreceipted_num.get()
+            == b.terminal_claim_bound_unreceipted_num.get()
+        && a.current_payout_rate_num.get() == b.current_payout_rate_num.get()
+        && a.current_payout_rate_den.get() == b.current_payout_rate_den.get()
+        && a.snapshot_slot.get() == b.snapshot_slot.get()
+        && a.payout_halted == b.payout_halted
+        && a.finalized == b.finalized
+}
+
+#[cfg(kani)]
+pub fn kani_eq_market_group_v16_header_account(
+    a: &MarketGroupV16HeaderAccount,
+    b: &MarketGroupV16HeaderAccount,
+) -> bool {
+    ({
+        let mut i = 0;
+        let mut ok = true;
+        while i < 32 {
+            ok = ok && a.market_group_id[i] == b.market_group_id[i];
+            i += 1;
+        }
+        ok
+    }) && kani_eq_v16_config_account(&a.config, &b.config)
+        && a.asset_slot_capacity.get() == b.asset_slot_capacity.get()
+        && a.vault.get() == b.vault.get()
+        && a.insurance.get() == b.insurance.get()
+        && a.c_tot.get() == b.c_tot.get()
+        && a.pnl_pos_tot.get() == b.pnl_pos_tot.get()
+        && a.pnl_pos_bound_tot_num.get() == b.pnl_pos_bound_tot_num.get()
+        && a.pnl_pos_bound_tot.get() == b.pnl_pos_bound_tot.get()
+        && a.pnl_matured_pos_tot.get() == b.pnl_matured_pos_tot.get()
+        && a.backing_provider_earnings_total.get() == b.backing_provider_earnings_total.get()
+        && a.source_claim_bound_total_num.get() == b.source_claim_bound_total_num.get()
+        && a.source_fresh_backing_total_num.get() == b.source_fresh_backing_total_num.get()
+        && a.source_insurance_credit_reserved_total_atoms.get()
+            == b.source_insurance_credit_reserved_total_atoms.get()
+        && a.insurance_domain_budget_remaining_total.get()
+            == b.insurance_domain_budget_remaining_total.get()
+        && a.resolved_payout_blocker_count.get() == b.resolved_payout_blocker_count.get()
+        && a.stress_consumption_bps_e9_since_envelope.get()
+            == b.stress_consumption_bps_e9_since_envelope.get()
+        && a.stress_envelope_start_slot.get() == b.stress_envelope_start_slot.get()
+        && a.stress_envelope_start_credit_epoch.get() == b.stress_envelope_start_credit_epoch.get()
+        && a.materialized_portfolio_count.get() == b.materialized_portfolio_count.get()
+        && a.stale_certificate_count.get() == b.stale_certificate_count.get()
+        && a.b_stale_account_count.get() == b.b_stale_account_count.get()
+        && a.negative_pnl_account_count.get() == b.negative_pnl_account_count.get()
+        && a.risk_epoch.get() == b.risk_epoch.get()
+        && a.asset_set_epoch.get() == b.asset_set_epoch.get()
+        && a.asset_activation_count.get() == b.asset_activation_count.get()
+        && a.last_asset_activation_slot.get() == b.last_asset_activation_slot.get()
+        && a.next_market_id.get() == b.next_market_id.get()
+        && a.oracle_epoch.get() == b.oracle_epoch.get()
+        && a.funding_epoch.get() == b.funding_epoch.get()
+        && a.slot_last.get() == b.slot_last.get()
+        && a.current_slot.get() == b.current_slot.get()
+        && a.bankruptcy_hlock_active == b.bankruptcy_hlock_active
+        && a.threshold_stress_active == b.threshold_stress_active
+        && a.loss_stale_active == b.loss_stale_active
+        && kani_eq_v16_optional_recovery_reason_account(&a.recovery_reason, &b.recovery_reason)
+        && a.mode == b.mode
+        && a.resolved_slot.get() == b.resolved_slot.get()
+        && a.payout_snapshot.get() == b.payout_snapshot.get()
+        && a.payout_snapshot_pnl_pos_tot.get() == b.payout_snapshot_pnl_pos_tot.get()
+        && a.payout_snapshot_captured == b.payout_snapshot_captured
+        && kani_eq_resolved_payout_ledger_v16_account(
+            &a.resolved_payout_ledger,
+            &b.resolved_payout_ledger,
+        )
+}
+
+#[cfg(kani)]
+pub fn kani_eq_asset_state_v16_account(a: &AssetStateV16Account, b: &AssetStateV16Account) -> bool {
+    a.market_id.get() == b.market_id.get()
+        && a.retired_slot.get() == b.retired_slot.get()
+        && a.lifecycle == b.lifecycle
+        && a.raw_oracle_target_price.get() == b.raw_oracle_target_price.get()
+        && a.effective_price.get() == b.effective_price.get()
+        && a.fund_px_last.get() == b.fund_px_last.get()
+        && a.slot_last.get() == b.slot_last.get()
+        && a.a_long.get() == b.a_long.get()
+        && a.a_short.get() == b.a_short.get()
+        && a.k_long.get() == b.k_long.get()
+        && a.k_short.get() == b.k_short.get()
+        && a.f_long_num.get() == b.f_long_num.get()
+        && a.f_short_num.get() == b.f_short_num.get()
+        && a.kf_epoch_long.get() == b.kf_epoch_long.get()
+        && a.kf_epoch_short.get() == b.kf_epoch_short.get()
+        && a.k_epoch_start_long.get() == b.k_epoch_start_long.get()
+        && a.k_epoch_start_short.get() == b.k_epoch_start_short.get()
+        && a.f_epoch_start_long_num.get() == b.f_epoch_start_long_num.get()
+        && a.f_epoch_start_short_num.get() == b.f_epoch_start_short_num.get()
+        && a.b_long_num.get() == b.b_long_num.get()
+        && a.b_short_num.get() == b.b_short_num.get()
+        && a.b_epoch_start_long_num.get() == b.b_epoch_start_long_num.get()
+        && a.b_epoch_start_short_num.get() == b.b_epoch_start_short_num.get()
+        && a.oi_eff_long_q.get() == b.oi_eff_long_q.get()
+        && a.oi_eff_short_q.get() == b.oi_eff_short_q.get()
+        && a.stored_pos_count_long.get() == b.stored_pos_count_long.get()
+        && a.stored_pos_count_short.get() == b.stored_pos_count_short.get()
+        && a.stale_account_count_long.get() == b.stale_account_count_long.get()
+        && a.stale_account_count_short.get() == b.stale_account_count_short.get()
+        && a.pending_obligation_count_long.get() == b.pending_obligation_count_long.get()
+        && a.pending_obligation_count_short.get() == b.pending_obligation_count_short.get()
+        && a.loss_weight_sum_long.get() == b.loss_weight_sum_long.get()
+        && a.loss_weight_sum_short.get() == b.loss_weight_sum_short.get()
+        && a.social_loss_remainder_long_num.get() == b.social_loss_remainder_long_num.get()
+        && a.social_loss_remainder_short_num.get() == b.social_loss_remainder_short_num.get()
+        && a.social_loss_dust_long_num.get() == b.social_loss_dust_long_num.get()
+        && a.social_loss_dust_short_num.get() == b.social_loss_dust_short_num.get()
+        && a.explicit_unallocated_loss_long.get() == b.explicit_unallocated_loss_long.get()
+        && a.explicit_unallocated_loss_short.get() == b.explicit_unallocated_loss_short.get()
+        && a.epoch_long.get() == b.epoch_long.get()
+        && a.epoch_short.get() == b.epoch_short.get()
+        && a.mode_long == b.mode_long
+        && a.mode_short == b.mode_short
+}
+
+#[cfg(kani)]
+pub fn kani_eq_source_credit_state_v16_account(
+    a: &SourceCreditStateV16Account,
+    b: &SourceCreditStateV16Account,
+) -> bool {
+    a.positive_claim_bound_num.get() == b.positive_claim_bound_num.get()
+        && a.exact_positive_claim_num.get() == b.exact_positive_claim_num.get()
+        && a.fresh_reserved_backing_num.get() == b.fresh_reserved_backing_num.get()
+        && a.spent_backing_num.get() == b.spent_backing_num.get()
+        && a.provider_receivable_num.get() == b.provider_receivable_num.get()
+        && a.valid_liened_backing_num.get() == b.valid_liened_backing_num.get()
+        && a.impaired_liened_backing_num.get() == b.impaired_liened_backing_num.get()
+        && a.insurance_credit_reserved_num.get() == b.insurance_credit_reserved_num.get()
+        && a.valid_liened_insurance_num.get() == b.valid_liened_insurance_num.get()
+        && a.impaired_liened_insurance_num.get() == b.impaired_liened_insurance_num.get()
+        && a.credit_rate_num.get() == b.credit_rate_num.get()
+        && a.credit_epoch.get() == b.credit_epoch.get()
+}
+
+#[cfg(kani)]
+pub fn kani_eq_backing_bucket_v16_account(
+    a: &BackingBucketV16Account,
+    b: &BackingBucketV16Account,
+) -> bool {
+    a.market_id.get() == b.market_id.get()
+        && a.fresh_unliened_backing_num.get() == b.fresh_unliened_backing_num.get()
+        && a.valid_liened_backing_num.get() == b.valid_liened_backing_num.get()
+        && a.consumed_liened_backing_num.get() == b.consumed_liened_backing_num.get()
+        && a.impaired_liened_backing_num.get() == b.impaired_liened_backing_num.get()
+        && a.utilization_fee_earnings.get() == b.utilization_fee_earnings.get()
+        && a.expiry_slot.get() == b.expiry_slot.get()
+        && a.status == b.status
+}
+
+#[cfg(kani)]
+pub fn kani_eq_insurance_credit_reservation_v16_account(
+    a: &InsuranceCreditReservationV16Account,
+    b: &InsuranceCreditReservationV16Account,
+) -> bool {
+    a.insurance_credit_reserved_num.get() == b.insurance_credit_reserved_num.get()
+        && a.valid_liened_insurance_num.get() == b.valid_liened_insurance_num.get()
+        && a.impaired_liened_insurance_num.get() == b.impaired_liened_insurance_num.get()
+        && a.consumed_insurance_num.get() == b.consumed_insurance_num.get()
+        && a.source_credit_epoch.get() == b.source_credit_epoch.get()
+}
+
+#[cfg(kani)]
+pub fn kani_eq_engine_asset_slot_v16_account(
+    a: &EngineAssetSlotV16Account,
+    b: &EngineAssetSlotV16Account,
+) -> bool {
+    kani_eq_asset_state_v16_account(&a.asset, &b.asset)
+        && a.insurance_domain_budget_long.get() == b.insurance_domain_budget_long.get()
+        && a.insurance_domain_budget_short.get() == b.insurance_domain_budget_short.get()
+        && a.insurance_domain_spent_long.get() == b.insurance_domain_spent_long.get()
+        && a.insurance_domain_spent_short.get() == b.insurance_domain_spent_short.get()
+        && a.pending_domain_loss_barrier_long.get() == b.pending_domain_loss_barrier_long.get()
+        && a.pending_domain_loss_barrier_short.get() == b.pending_domain_loss_barrier_short.get()
+        && kani_eq_source_credit_state_v16_account(&a.source_credit_long, &b.source_credit_long)
+        && kani_eq_source_credit_state_v16_account(&a.source_credit_short, &b.source_credit_short)
+        && kani_eq_backing_bucket_v16_account(&a.backing_long, &b.backing_long)
+        && kani_eq_backing_bucket_v16_account(&a.backing_short, &b.backing_short)
+        && kani_eq_insurance_credit_reservation_v16_account(
+            &a.insurance_reservation_long,
+            &b.insurance_reservation_long,
+        )
+        && kani_eq_insurance_credit_reservation_v16_account(
+            &a.insurance_reservation_short,
+            &b.insurance_reservation_short,
+        )
 }
 
 #[cfg(kani)]
