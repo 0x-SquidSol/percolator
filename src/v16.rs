@@ -1414,6 +1414,122 @@ impl V16Core {
     }
 
     #[inline]
+    fn source_lien_backing_release_for_face_burn(
+        face_locked_num: u128,
+        backing_reserved_num: u128,
+        face_burn_num: u128,
+    ) -> V16Result<u128> {
+        if face_burn_num > face_locked_num || backing_reserved_num % BOUND_SCALE != 0 {
+            return Err(V16Error::InvalidLeg);
+        }
+        let effective_reserved = backing_reserved_num / BOUND_SCALE;
+        if effective_reserved > Self::amount_from_bound_num(face_locked_num)? {
+            return Err(V16Error::InvalidLeg);
+        }
+        let remaining_face_num = face_locked_num
+            .checked_sub(face_burn_num)
+            .ok_or(V16Error::CounterUnderflow)?;
+        let max_remaining_effective = Self::amount_from_bound_num(remaining_face_num)?;
+        let effective_release = effective_reserved.saturating_sub(max_remaining_effective);
+        Self::bound_num_from_amount(effective_release)
+    }
+
+    #[inline]
+    fn source_claim_domain_first_burn_partition(
+        source_claim_num: u128,
+        burn_num: u128,
+    ) -> (u128, u128) {
+        let source_burn_num = source_claim_num.min(burn_num);
+        (source_burn_num, burn_num - source_burn_num)
+    }
+
+    /// PRODUCTION KERNEL: partition a liened-face burn across counterparty then
+    /// insurance support without overlap or omission.
+    fn source_lien_face_burn_partition(
+        counterparty_face_num: u128,
+        insurance_face_num: u128,
+        face_burn_num: u128,
+    ) -> V16Result<(u128, u128)> {
+        let total_face_num = counterparty_face_num
+            .checked_add(insurance_face_num)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if face_burn_num > total_face_num {
+            return Err(V16Error::CounterUnderflow);
+        }
+        let counterparty_face_burn = face_burn_num.min(counterparty_face_num);
+        let insurance_face_burn = face_burn_num
+            .checked_sub(counterparty_face_burn)
+            .ok_or(V16Error::CounterUnderflow)?;
+        Ok((counterparty_face_burn, insurance_face_burn))
+    }
+
+    /// Compose the face partition with the minimum source-local backing release
+    /// needed to keep each remaining lien bounded by its remaining face.
+    fn source_lien_face_burn_plan(
+        counterparty_face_num: u128,
+        insurance_face_num: u128,
+        counterparty_backing_num: u128,
+        insurance_backing_num: u128,
+        face_burn_num: u128,
+    ) -> V16Result<(u128, u128, u128, u128, u128)> {
+        let (counterparty_face_burn, insurance_face_burn) = Self::source_lien_face_burn_partition(
+            counterparty_face_num,
+            insurance_face_num,
+            face_burn_num,
+        )?;
+        let counterparty_backing_release = Self::source_lien_backing_release_for_face_burn(
+            counterparty_face_num,
+            counterparty_backing_num,
+            counterparty_face_burn,
+        )?;
+        let insurance_backing_release = Self::source_lien_backing_release_for_face_burn(
+            insurance_face_num,
+            insurance_backing_num,
+            insurance_face_burn,
+        )?;
+        let backing_release_num = counterparty_backing_release
+            .checked_add(insurance_backing_release)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        Ok((
+            counterparty_face_burn,
+            insurance_face_burn,
+            counterparty_backing_release,
+            insurance_backing_release,
+            backing_release_num,
+        ))
+    }
+
+    /// PRODUCTION KERNEL: the fee revenue a source lien keeps after part of its
+    /// counterparty backing is released. Revenue scales with the backing that
+    /// remains, floored so the lien can never keep more than it earned. Releasing
+    /// all backing keeps nothing; releasing none keeps everything, without a
+    /// round-trip through mul_div. Backing that GREW is a caller error, not a
+    /// negative release. (upstream 6276d568)
+    fn source_lien_fee_after_backing_release(
+        fee_revenue: u128,
+        backing_before: u128,
+        backing_after: u128,
+    ) -> V16Result<u128> {
+        if backing_after > backing_before {
+            return Err(V16Error::InvalidLeg);
+        }
+        if backing_after == 0 || fee_revenue == 0 {
+            return Ok(0);
+        }
+        if backing_after == backing_before {
+            return Ok(fee_revenue);
+        }
+        if backing_before == 0 {
+            return Err(V16Error::InvalidLeg);
+        }
+        Ok(wide_mul_div_floor_u128(
+            fee_revenue,
+            backing_after,
+            backing_before,
+        ))
+    }
+
+    #[inline]
     fn validate_bound_num_atom_aligned(bound_num: u128) -> V16Result<()> {
         if bound_num == 0 {
             return Ok(());
@@ -1490,6 +1606,9 @@ impl V16Core {
             return Ok(CREDIT_RATE_SCALE);
         }
         let available = Self::available_backing_num_for_source_credit_state(state)?;
+        if available == 0 {
+            return Ok(0);
+        }
         let rate = U256::from_u128(available)
             .checked_mul(U256::from_u128(CREDIT_RATE_SCALE))
             .and_then(|v| v.checked_div(U256::from_u128(state.positive_claim_bound_num)))
@@ -2252,6 +2371,14 @@ pub fn kani_available_backing_num_for_source_credit_state(
     state: SourceCreditStateV16,
 ) -> V16Result<u128> {
     V16Core::available_backing_num_for_source_credit_state(state)
+}
+
+#[cfg(kani)]
+pub fn kani_source_claim_domain_first_burn_partition(
+    source_claim_num: u128,
+    burn_num: u128,
+) -> (u128, u128) {
+    V16Core::source_claim_domain_first_burn_partition(source_claim_num, burn_num)
 }
 
 #[cfg(kani)]
@@ -7791,7 +7918,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     // #137: reachable from the Live release path — must be compiled in.
-    pub fn release_source_credit_lien_from_insurance_not_atomic(
+    fn release_source_credit_lien_from_insurance_core_not_atomic(
         &mut self,
         domain: usize,
         amount: u128,
@@ -7819,6 +7946,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.set_insurance_reservation_for_domain(domain, reservation)?;
         self.set_source_credit_for_domain(domain, source)?;
         self.header.risk_epoch = V16PodU64::new(next_risk_epoch);
+        Ok(())
+    }
+
+    pub fn release_source_credit_lien_from_insurance_not_atomic(
+        &mut self,
+        domain: usize,
+        amount: u128,
+    ) -> V16Result<()> {
+        self.release_source_credit_lien_from_insurance_core_not_atomic(domain, amount)?;
         self.validate_shape()
     }
 
@@ -8347,6 +8483,156 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Self::burn_impaired_account_source_claim_fields(account, slot, burn_num)
     }
 
+    fn decrement_account_source_claim_for_domain_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        slot: usize,
+        domain: usize,
+        burn_num: u128,
+    ) -> V16Result<()> {
+        if burn_num == 0 {
+            return Ok(());
+        }
+        if slot >= PORTFOLIO_SOURCE_DOMAIN_CAP {
+            return Err(V16Error::InvalidLeg);
+        }
+        let source = &mut account.header.source_domains[slot];
+        source.source_claim_bound_num = V16PodU128::new(
+            source
+                .source_claim_bound_num
+                .get()
+                .checked_sub(burn_num)
+                .ok_or(V16Error::CounterUnderflow)?,
+        );
+        let mut source_credit = self.source_credit_for_domain(domain)?;
+        source_credit.positive_claim_bound_num = source_credit
+            .positive_claim_bound_num
+            .checked_sub(burn_num)
+            .ok_or(V16Error::CounterUnderflow)?;
+        source_credit.exact_positive_claim_num = source_credit
+            .exact_positive_claim_num
+            .checked_sub(burn_num.min(source_credit.exact_positive_claim_num))
+            .ok_or(V16Error::CounterUnderflow)?;
+        self.set_source_credit_for_domain(domain, source_credit)?;
+        account.reset_source_domain_slot_if_empty(slot);
+        self.recompute_source_credit_domain_after_mutation(domain)
+    }
+
+    fn burn_account_source_lien_face_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        slot: usize,
+        domain: usize,
+        face_burn_num: u128,
+    ) -> V16Result<()> {
+        if face_burn_num == 0 {
+            return Ok(());
+        }
+        if slot >= PORTFOLIO_SOURCE_DOMAIN_CAP {
+            return Err(V16Error::InvalidLeg);
+        }
+        let source_before = account.header.source_domains[slot];
+        if face_burn_num > source_before.source_claim_liened_num.get() {
+            return Err(V16Error::CounterUnderflow);
+        }
+        let (
+            counterparty_face_burn,
+            insurance_face_burn,
+            counterparty_backing_release,
+            insurance_backing_release,
+            backing_release_num,
+        ) = V16Core::source_lien_face_burn_plan(
+            source_before.source_claim_counterparty_liened_num.get(),
+            source_before.source_claim_insurance_liened_num.get(),
+            source_before.source_lien_counterparty_backing_num.get(),
+            source_before.source_lien_insurance_backing_num.get(),
+            face_burn_num,
+        )?;
+
+        if counterparty_backing_release != 0 {
+            // Unwinding returns already-liened principal; it does not extend new
+            // credit, so expiry must not block a loss from being recognized.
+            self.release_source_credit_lien_from_counterparty_terminal_not_atomic(
+                domain,
+                counterparty_backing_release,
+            )?;
+        }
+        if insurance_backing_release != 0 {
+            if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved {
+                self.release_source_credit_lien_from_insurance_terminal_not_atomic(
+                    domain,
+                    insurance_backing_release,
+                )?;
+            } else {
+                self.release_source_credit_lien_from_insurance_core_not_atomic(
+                    domain,
+                    insurance_backing_release,
+                )?;
+            }
+        }
+
+        let effective_release = backing_release_num / BOUND_SCALE;
+        let counterparty_backing_after = source_before
+            .source_lien_counterparty_backing_num
+            .get()
+            .checked_sub(counterparty_backing_release)
+            .ok_or(V16Error::CounterUnderflow)?;
+        let fee_revenue_after = V16Core::source_lien_fee_after_backing_release(
+            source_before.source_lien_capital_at_risk_fee_revenue.get(),
+            source_before.source_lien_counterparty_backing_num.get(),
+            counterparty_backing_after,
+        )?;
+
+        let source = &mut account.header.source_domains[slot];
+        source.source_claim_liened_num = V16PodU128::new(
+            source
+                .source_claim_liened_num
+                .get()
+                .checked_sub(face_burn_num)
+                .ok_or(V16Error::CounterUnderflow)?,
+        );
+        source.source_claim_counterparty_liened_num = V16PodU128::new(
+            source
+                .source_claim_counterparty_liened_num
+                .get()
+                .checked_sub(counterparty_face_burn)
+                .ok_or(V16Error::CounterUnderflow)?,
+        );
+        source.source_claim_insurance_liened_num = V16PodU128::new(
+            source
+                .source_claim_insurance_liened_num
+                .get()
+                .checked_sub(insurance_face_burn)
+                .ok_or(V16Error::CounterUnderflow)?,
+        );
+        source.source_lien_effective_reserved = V16PodU128::new(
+            source
+                .source_lien_effective_reserved
+                .get()
+                .checked_sub(effective_release)
+                .ok_or(V16Error::CounterUnderflow)?,
+        );
+        source.source_lien_counterparty_backing_num = V16PodU128::new(counterparty_backing_after);
+        source.source_lien_insurance_backing_num = V16PodU128::new(
+            source
+                .source_lien_insurance_backing_num
+                .get()
+                .checked_sub(insurance_backing_release)
+                .ok_or(V16Error::CounterUnderflow)?,
+        );
+        source.source_lien_capital_at_risk_fee_revenue = V16PodU128::new(fee_revenue_after);
+        if counterparty_backing_after == 0 {
+            source.source_lien_fee_last_slot = V16PodU64::new(0);
+        }
+        account.header.health_cert.valid = 0;
+        self.decrement_account_source_claim_for_domain_not_atomic(
+            account,
+            slot,
+            domain,
+            face_burn_num,
+        )
+    }
+
     fn burn_account_source_claim_bound_num(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -8374,75 +8660,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             let d = source_snapshot.domain.get() as usize;
             self.domain_asset_side(d)?;
-            // Terminal wind-down: a counterparty/insurance source-credit lien is created
-            // in Live to collateralize unrealized PnL and can only be released in Live.
-            // Forcing the winner's claim to zero in Resolved (close_resolved ->
-            // set_account_pnl(0)) would otherwise dead-lock on the liened portion
-            // (burn can only consume the unliened part -> LockActive forever). In
-            // Resolved mode release the domain's lien (returning backing) so the claim
-            // is burnable and the account/market can actually wind down.
-            if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved
-                && account.header.source_domains[slot]
-                    .source_claim_liened_num
-                    .get()
-                    != 0
-            {
-                self.release_account_source_credit_lien_for_domain_not_atomic(account, d, true)?;
-            }
-            let burnable = Self::source_claim_unliened_num(&account.as_view(), d)?;
-            let burn = burnable.min(burn_num);
-            if burn != 0 {
-                let source = &mut account.header.source_domains[slot];
-                source.source_claim_bound_num = V16PodU128::new(
-                    source
-                        .source_claim_bound_num
-                        .get()
-                        .checked_sub(burn)
-                        .ok_or(V16Error::CounterUnderflow)?,
-                );
-                let mut source_credit = self.source_credit_for_domain(d)?;
-                source_credit.positive_claim_bound_num = source_credit
-                    .positive_claim_bound_num
-                    .checked_sub(burn)
-                    .ok_or(V16Error::CounterUnderflow)?;
-                source_credit.exact_positive_claim_num = source_credit
-                    .exact_positive_claim_num
-                    .checked_sub(burn.min(source_credit.exact_positive_claim_num))
-                    .ok_or(V16Error::CounterUnderflow)?;
-                self.set_source_credit_for_domain(d, source_credit)?;
-                burn_num -= burn;
-                account.reset_source_domain_slot_if_empty(slot);
-                self.recompute_source_credit_domain_after_mutation(d)?;
-            }
-            if burn_num != 0 {
-                let (impaired_burn, impaired_effective_burn) =
-                    Self::burn_impaired_account_source_claim_fields(account, slot, burn_num)?;
-                if impaired_burn != 0 {
-                    if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved
-                        && impaired_effective_burn != 0
-                    {
-                        let impaired_insurance_backing =
-                            V16Core::bound_num_from_amount(impaired_effective_burn)?;
-                        self.release_source_credit_lien_from_insurance_terminal_not_atomic(
-                            d,
-                            impaired_insurance_backing,
-                        )?;
-                    }
-                    let mut source_credit = self.source_credit_for_domain(d)?;
-                    source_credit.positive_claim_bound_num = source_credit
-                        .positive_claim_bound_num
-                        .checked_sub(impaired_burn)
-                        .ok_or(V16Error::CounterUnderflow)?;
-                    source_credit.exact_positive_claim_num = source_credit
-                        .exact_positive_claim_num
-                        .checked_sub(impaired_burn.min(source_credit.exact_positive_claim_num))
-                        .ok_or(V16Error::CounterUnderflow)?;
-                    burn_num -= impaired_burn;
-                    self.set_source_credit_for_domain(d, source_credit)?;
-                    account.reset_source_domain_slot_if_empty(slot);
-                    self.recompute_source_credit_domain_after_mutation(d)?;
-                }
-            }
+            let burned =
+                self.burn_account_source_claim_at_slot_up_to(account, slot, d, burn_num)?;
+            burn_num = burn_num
+                .checked_sub(burned)
+                .ok_or(V16Error::CounterUnderflow)?;
             slot += 1;
         }
         if burn_num != 0 {
@@ -8450,6 +8672,110 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         account.compact_source_domains();
         Ok(())
+    }
+
+    fn burn_account_source_claim_at_slot_up_to(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        slot: usize,
+        domain: usize,
+        burn_num: u128,
+    ) -> V16Result<u128> {
+        if burn_num == 0 {
+            return Ok(0);
+        }
+        if slot >= PORTFOLIO_SOURCE_DOMAIN_CAP {
+            return Err(V16Error::CounterUnderflow);
+        }
+        // Read the slot IN PLACE. Resolving the slot by scanning for `domain`
+        // breaks once an earlier burn has emptied a slot and made the table
+        // sparse: the lookup no longer agrees with the caller's index and a
+        // still-funded later domain is refused. (upstream efa7e6f4)
+        let source = account.header.source_domains[slot];
+        if !source.is_occupied() || source.domain.get() as usize != domain {
+            return Err(V16Error::CounterUnderflow);
+        }
+        let target = burn_num.min(
+            account.header.source_domains[slot]
+                .source_claim_bound_num
+                .get(),
+        );
+        let mut remaining = target;
+
+        let burn = Self::source_claim_unliened_num(&account.as_view(), domain)?.min(remaining);
+        if burn != 0 {
+            self.decrement_account_source_claim_for_domain_not_atomic(account, slot, domain, burn)?;
+            remaining -= burn;
+        }
+        if remaining != 0 {
+            let liened_burn = account.header.source_domains[slot]
+                .source_claim_liened_num
+                .get()
+                .min(remaining);
+            if liened_burn != 0 {
+                self.burn_account_source_lien_face_not_atomic(account, slot, domain, liened_burn)?;
+                remaining -= liened_burn;
+            }
+        }
+        if remaining != 0 {
+            let (impaired_burn, impaired_effective_burn) =
+                Self::burn_impaired_account_source_claim_fields(account, slot, remaining)?;
+            if impaired_burn != 0 {
+                if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved
+                    && impaired_effective_burn != 0
+                {
+                    let impaired_insurance_backing =
+                        V16Core::bound_num_from_amount(impaired_effective_burn)?;
+                    self.release_source_credit_lien_from_insurance_terminal_not_atomic(
+                        domain,
+                        impaired_insurance_backing,
+                    )?;
+                }
+                let mut source_credit = self.source_credit_for_domain(domain)?;
+                source_credit.positive_claim_bound_num = source_credit
+                    .positive_claim_bound_num
+                    .checked_sub(impaired_burn)
+                    .ok_or(V16Error::CounterUnderflow)?;
+                source_credit.exact_positive_claim_num = source_credit
+                    .exact_positive_claim_num
+                    .checked_sub(impaired_burn.min(source_credit.exact_positive_claim_num))
+                    .ok_or(V16Error::CounterUnderflow)?;
+                self.set_source_credit_for_domain(domain, source_credit)?;
+                account.reset_source_domain_slot_if_empty(slot);
+                self.recompute_source_credit_domain_after_mutation(domain)?;
+                remaining -= impaired_burn;
+            }
+        }
+        if remaining != 0 {
+            return Err(V16Error::LockActive);
+        }
+        Ok(target)
+    }
+
+    fn burn_account_source_claim_bound_num_domain_first(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        domain: usize,
+        burn_num: u128,
+    ) -> V16Result<()> {
+        if burn_num == 0 {
+            return Ok(());
+        }
+        self.domain_asset_side(domain)?;
+        let slot = account.source_domain_slot(domain)?;
+        let source_claim_num = match slot {
+            Some(slot) => account.header.source_domains[slot]
+                .source_claim_bound_num
+                .get(),
+            None => 0,
+        };
+        let (source_burn_num, fallback_burn_num) =
+            V16Core::source_claim_domain_first_burn_partition(source_claim_num, burn_num);
+        if let Some(slot) = slot {
+            self.burn_account_source_claim_at_slot_up_to(account, slot, domain, source_burn_num)?;
+            account.compact_source_domains();
+        }
+        self.burn_account_source_claim_bound_num(account, fallback_burn_num)
     }
 
     fn source_domain_realizable_support_for_face(
@@ -9350,6 +9676,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         effective_credit: u128,
     ) -> V16Result<SourceCreditConsumptionV16> {
         account.validate_with_market(&self.as_view())?;
+        self.create_and_consume_validated_account_source_credit_for_effective_not_atomic(
+            account,
+            effective_credit,
+        )
+    }
+
+    fn create_and_consume_validated_account_source_credit_for_effective_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        effective_credit: u128,
+    ) -> V16Result<SourceCreditConsumptionV16> {
         if effective_credit == 0 {
             return Ok(SourceCreditConsumptionV16 {
                 face_burn: 0,
@@ -9788,7 +10125,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Err(V16Error::LockActive)
     }
 
-    #[cfg(kani)]
+    #[cfg(any(kani, feature = "fuzz"))]
     pub fn kani_create_initial_margin_source_lien_if_needed(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -10035,7 +10372,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Self::transfer_account_residual_reward_credit(trader, lp, principal_atoms)
     }
 
-    #[cfg(kani)]
+    #[cfg(any(kani, feature = "fuzz"))]
+    pub fn kani_settle_account_b_chunk(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        endpoint_delta_budget: u128,
+    ) -> V16Result<AccountBSettlementChunkV16> {
+        self.settle_account_b_chunk(account, asset_index, endpoint_delta_budget)
+    }
+
+    #[cfg(any(kani, feature = "fuzz"))]
     pub fn kani_set_account_pnl(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -10049,7 +10396,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account: &mut PortfolioV16ViewMut<'_>,
         new_pnl: i128,
     ) -> V16Result<()> {
-        self.set_account_pnl_inner(account, new_pnl, None)
+        self.set_account_pnl_inner(account, new_pnl, None, 0)
     }
 
     fn set_account_pnl_with_source(
@@ -10059,7 +10406,36 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         source_domain: usize,
     ) -> V16Result<()> {
         self.domain_asset_side(source_domain)?;
-        self.set_account_pnl_inner(account, new_pnl, Some(source_domain))
+        self.set_account_pnl_inner(account, new_pnl, Some(source_domain), 0)
+    }
+
+    fn set_account_pnl_after_source_claim_burn(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        new_pnl: i128,
+        source_face_burn_num: u128,
+    ) -> V16Result<()> {
+        self.set_account_pnl_inner(account, new_pnl, None, source_face_burn_num)
+    }
+
+    fn set_account_pnl_after_domain_first_source_claim_burn(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        new_pnl: i128,
+        source_domain: usize,
+    ) -> V16Result<()> {
+        let old_pos = account.header.pnl.get().max(0) as u128;
+        let new_pos = new_pnl.max(0) as u128;
+        let decrease = old_pos
+            .checked_sub(new_pos)
+            .ok_or(V16Error::InvalidConfig)?;
+        let decrease_num = V16Core::bound_num_from_amount(decrease)?;
+        self.burn_account_source_claim_bound_num_domain_first(
+            account,
+            source_domain,
+            decrease_num,
+        )?;
+        self.set_account_pnl_after_source_claim_burn(account, new_pnl, decrease_num)
     }
 
     /// Grants source-attributed positive PnL to an account — the first-class
@@ -10104,11 +10480,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account: &mut PortfolioV16ViewMut<'_>,
         new_pnl: i128,
         source_domain: Option<usize>,
+        preburned_source_claim_num: u128,
     ) -> V16Result<()> {
         validate_non_min_i128(new_pnl)?;
         let old_pos = account.header.pnl.get().max(0) as u128;
         let new_pos = new_pnl.max(0) as u128;
         if new_pos >= old_pos {
+            if preburned_source_claim_num != 0 {
+                return Err(V16Error::InvalidConfig);
+            }
             let increase = new_pos - old_pos;
             let increase_num = V16Core::bound_num_from_amount(increase)?;
             let increase_domain = if increase_num != 0 {
@@ -10165,7 +10545,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         } else {
             let decrease = old_pos - new_pos;
             let decrease_num = V16Core::bound_num_from_amount(decrease)?;
-            self.burn_account_source_claim_bound_num(account, decrease_num)?;
+            let remaining_source_claim_burn = decrease_num
+                .checked_sub(preburned_source_claim_num)
+                .ok_or(V16Error::CounterUnderflow)?;
+            self.burn_account_source_claim_bound_num(account, remaining_source_claim_burn)?;
             self.header.pnl_pos_tot = V16PodU128::new(
                 self.header
                     .pnl_pos_tot
@@ -11415,7 +11798,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         leg.b_rem = chunk.new_remainder;
         leg.b_stale = chunk.remaining_after != 0;
         account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&leg);
-        self.set_account_pnl(account, new_pnl)?;
+        let source_domain = self.insurance_domain_index(asset_index, opposite_side(leg.side))?;
+        self.set_account_pnl_after_domain_first_source_claim_burn(account, new_pnl, source_domain)?;
         if chunk.remaining_after != 0 {
             self.mark_account_b_stale(account)?;
         } else if !Self::has_b_stale_leg(&account.as_view())? {
@@ -15360,7 +15744,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         &self,
         account: &PortfolioV16View<'_>,
     ) -> V16Result<()> {
-        account.validate_with_market(&self.as_view())?;
+        // The account is validated once, two statements below, by
+        // ensure_favorable_action_allowed; a second full scan here only costs
+        // compute on the max-source shape.
         if decode_market_mode(self.header.mode)? != MarketModeV16::Live
             || decode_bool(self.header.payout_snapshot_captured)?
         {
@@ -15378,12 +15764,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if released == 0 {
             return Ok(0);
         }
-        if Self::account_has_source_claims(&account.as_view())?
-            && self.account_has_active_source_claim_exposure(&account.as_view())?
-        {
+        let has_source_claims = Self::account_has_source_claims(&account.as_view())?;
+        if has_source_claims && self.account_has_active_source_claim_exposure(&account.as_view())? {
             return Err(V16Error::LockActive);
         }
-        let converted = if Self::account_has_source_claims(&account.as_view())? {
+        let converted = if has_source_claims {
             self.account_source_realizable_support(&account.as_view(), released)?
         } else if decode_market_mode(self.header.mode)? == MarketModeV16::Live {
             0
@@ -15394,8 +15779,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Err(V16Error::LockActive);
         }
         let vault_before = self.header.vault.get();
-        let consumption = if Self::account_has_source_claims(&account.as_view())? {
-            self.create_and_consume_account_source_credit_for_effective_not_atomic(
+        let consumption = if has_source_claims {
+            self.create_and_consume_validated_account_source_credit_for_effective_not_atomic(
                 account, converted,
             )?
         } else {
@@ -16716,6 +17101,49 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     #[cfg(kani)]
+    pub fn kani_source_lien_face_burn_plan(
+        counterparty_face_num: u128,
+        insurance_face_num: u128,
+        counterparty_backing_num: u128,
+        insurance_backing_num: u128,
+        face_burn_num: u128,
+    ) -> V16Result<(u128, u128, u128, u128, u128)> {
+        V16Core::source_lien_face_burn_plan(
+            counterparty_face_num,
+            insurance_face_num,
+            counterparty_backing_num,
+            insurance_backing_num,
+            face_burn_num,
+        )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_source_lien_face_burn_partition(
+        counterparty_face_num: u128,
+        insurance_face_num: u128,
+        face_burn_num: u128,
+    ) -> V16Result<(u128, u128)> {
+        V16Core::source_lien_face_burn_partition(
+            counterparty_face_num,
+            insurance_face_num,
+            face_burn_num,
+        )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_source_lien_backing_release_for_face_burn(
+        face_locked_num: u128,
+        backing_reserved_num: u128,
+        face_burn_num: u128,
+    ) -> V16Result<u128> {
+        V16Core::source_lien_backing_release_for_face_burn(
+            face_locked_num,
+            backing_reserved_num,
+            face_burn_num,
+        )
+    }
+
+    #[cfg(kani)]
     pub fn kani_kernel_clear_leg(
         leg: PortfolioLegV16,
         asset: AssetStateV16,
@@ -17501,6 +17929,15 @@ pub fn kani_position_delta_increases_risk(current: i128, delta_q: i128) -> V16Re
 pub fn kani_position_change_requires_unit_adl(current: i128, new: i128) -> bool {
     let route = V16Core::kernel_classify_position_delta(current, new);
     V16Core::kernel_position_route_requires_unit_adl(route, current, new)
+}
+
+#[cfg(kani)]
+pub fn kani_source_lien_fee_after_backing_release(
+    fee_revenue: u128,
+    backing_before: u128,
+    backing_after: u128,
+) -> V16Result<u128> {
+    V16Core::source_lien_fee_after_backing_release(fee_revenue, backing_before, backing_after)
 }
 
 #[cfg(any(kani, feature = "fuzz"))]
