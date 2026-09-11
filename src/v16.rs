@@ -17641,7 +17641,10 @@ mod close_drift_scope_tests {
         account
     }
 
-    fn open_ledger_on_asset_zero(market_id: u64, drift_reference_slot: u64) -> CloseProgressLedgerV16 {
+    fn open_ledger_on_asset_zero(
+        market_id: u64,
+        drift_reference_slot: u64,
+    ) -> CloseProgressLedgerV16 {
         CloseProgressLedgerV16 {
             active: true,
             finalized: false,
@@ -17665,7 +17668,10 @@ mod close_drift_scope_tests {
     fn unrelated_asset_accrual_does_not_stale_an_open_close() {
         let (mut header, mut markets) = two_asset_market_fixture();
         let asset0 = markets[0].engine.asset.try_to_runtime().unwrap();
-        assert_eq!(asset0.slot_last, 1, "asset 0 anchored at its activation slot");
+        assert_eq!(
+            asset0.slot_last, 1,
+            "asset 0 anchored at its activation slot"
+        );
         // Asset 1 advanced the market-wide clock well past the close anchor.
         header.current_slot = V16PodU64::new(9);
         header.slot_last = V16PodU64::new(9);
@@ -17675,7 +17681,8 @@ mod close_drift_scope_tests {
 
         let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
         let account = PortfolioV16ViewMut::new(&mut account_header);
-        let result = market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
+        let result =
+            market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
         assert_eq!(
             result,
             Ok(()),
@@ -17700,7 +17707,8 @@ mod close_drift_scope_tests {
 
         let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
         let account = PortfolioV16ViewMut::new(&mut account_header);
-        let result = market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
+        let result =
+            market.ensure_open_close_snapshot_current_or_recovery(&account.as_view(), ledger);
         assert_eq!(result, Err(V16Error::RecoveryRequired));
         assert_eq!(market.header.mode, 2, "recovery declared");
     }
