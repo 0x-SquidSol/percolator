@@ -1475,6 +1475,20 @@ impl V16Core {
         !already_cleared && prior_reset_obligation && !pending_close_residual
     }
 
+    fn kernel_auto_crank_refresh_asset(
+        refresh_asset: Option<usize>,
+        reset_obligation_asset: Option<usize>,
+    ) -> Option<usize> {
+        refresh_asset.or(reset_obligation_asset)
+    }
+
+    fn kernel_refresh_detached_selected_leg(
+        selected_leg_before: bool,
+        selected_leg_after: bool,
+    ) -> bool {
+        selected_leg_before && !selected_leg_after
+    }
+
     /// PRODUCTION KERNEL (resolved-bankruptcy settlement): reduce an account's
     /// NEGATIVE PnL by the loss the residual booking just absorbed.
     /// `cleared = min(booked_loss + explicit_loss, |pnl|)` — capped at the
@@ -2495,6 +2509,22 @@ pub fn kani_should_clear_prior_reset_obligation(
         prior_reset_obligation,
         pending_close_residual,
     )
+}
+
+#[cfg(kani)]
+pub fn kani_auto_crank_refresh_asset(
+    refresh_asset: Option<usize>,
+    reset_obligation_asset: Option<usize>,
+) -> Option<usize> {
+    V16Core::kernel_auto_crank_refresh_asset(refresh_asset, reset_obligation_asset)
+}
+
+#[cfg(kani)]
+pub fn kani_refresh_detached_selected_leg(
+    selected_leg_before: bool,
+    selected_leg_after: bool,
+) -> bool {
+    V16Core::kernel_refresh_detached_selected_leg(selected_leg_before, selected_leg_after)
 }
 
 #[cfg(kani)]
@@ -12611,7 +12641,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         let (
             summary,
-            (b_stale_asset, refresh_asset, liquidatable_asset, _, released_obligation_asset),
+            (
+                b_stale_asset,
+                refresh_asset,
+                liquidatable_asset,
+                reset_obligation_asset,
+                released_obligation_asset,
+            ),
         ) = self.build_actionable_summary_and_selected_assets(&account.as_view(), work.now_slot)?;
         let recovery_reason = if summary.expired_close {
             PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
@@ -12624,7 +12660,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             summary,
             b_stale_asset.unwrap_or(0),
             liquidatable_asset.unwrap_or(0),
-            refresh_asset,
+            V16Core::kernel_auto_crank_refresh_asset(refresh_asset, reset_obligation_asset),
             recovery_reason,
         );
 
@@ -12775,7 +12811,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         let protective_progress = match request.action {
             PermissionlessCrankActionV16::Refresh => {
-                let touches_accrued_asset = request.asset_index
+                let selected_leg_before = request.asset_index
                     < self.header.config.max_market_slots.get() as usize
                     && Self::active_leg_slot_for_asset(&account.as_view(), request.asset_index)?
                         .is_some();
@@ -12791,7 +12827,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                         return Ok(PermissionlessProgressOutcomeV16::AccountBChunk(out));
                     }
                 }
-                touches_accrued_asset
+                let selected_leg_after = request.asset_index
+                    < self.header.config.max_market_slots.get() as usize
+                    && Self::active_leg_slot_for_asset(&account.as_view(), request.asset_index)?
+                        .is_some();
+                if V16Core::kernel_refresh_detached_selected_leg(
+                    selected_leg_before,
+                    selected_leg_after,
+                ) {
+                    self.validate_shape_audit_scan()?;
+                    return Ok(PermissionlessProgressOutcomeV16::AccountCurrent);
+                }
+                selected_leg_before
             }
             PermissionlessCrankActionV16::SettleB { asset_index } => {
                 let out = self.settle_account_b_chunk(

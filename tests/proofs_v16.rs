@@ -7,7 +7,7 @@ use percolator::v16::{
     kani_adl_scaled_accrual_index_deltas, kani_apply_backing_provider_earnings_withdraw,
     kani_apply_backing_utilization_fee_charge, kani_apply_resolved_payout_receipt_payment,
     kani_auto_crank_leg_flags, kani_auto_crank_lifecycle_dispatchable,
-    kani_available_backing_num_for_source_credit_state,
+    kani_auto_crank_refresh_asset, kani_available_backing_num_for_source_credit_state,
     kani_backing_utilization_fee_quote_atoms_for_lien,
     kani_backing_utilization_rate_e9_for_source_state, kani_commit_declared_liquidation_recovery,
     kani_decode_account_kf_settlement_plan_key, kani_expected_source_credit_rate_num_for_state,
@@ -20,18 +20,18 @@ use percolator::v16::{
     kani_loss_stale_trade_scope_allowed, kani_mark_kf_stale_cohorts,
     kani_pending_domain_loss_barrier_blocks_position_change,
     kani_position_change_requires_unit_adl, kani_position_delta_increases_risk,
-    kani_prepare_asset_recovery_transition, kani_select_auto_crank_plan,
-    kani_settle_kf_stale_cohort, kani_settle_resolved_pnl_after_booking,
-    kani_should_clear_prior_reset_obligation, kani_source_credit_state_realizable_support_for_face,
-    kani_target_effective_lag_adverse_delta, kani_trade_preexisting_oi_reduction_gate,
-    kani_trade_preflight_risk_gate, kani_validate_positive_pnl_source_attribution,
-    ActionableSummaryV16, AssetLifecycleV16, AssetStateV16, AssetStateV16Account, AutoCrankPlanV16,
-    BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account, BatchTradeOutcomeV16,
-    CloseProgressLedgerV16, CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16,
-    HealthCertV16, HealthCertV16Account, InsuranceCreditReservationV16,
-    InsuranceCreditReservationV16Account, Market, MarketGroupV16HeaderAccount,
-    MarketGroupV16ViewMut, MarketModeV16, PermissionlessCrankActionV16,
-    PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
+    kani_prepare_asset_recovery_transition, kani_refresh_detached_selected_leg,
+    kani_select_auto_crank_plan, kani_settle_kf_stale_cohort,
+    kani_settle_resolved_pnl_after_booking, kani_should_clear_prior_reset_obligation,
+    kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
+    kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
+    kani_validate_positive_pnl_source_attribution, ActionableSummaryV16, AssetLifecycleV16,
+    AssetStateV16, AssetStateV16Account, AutoCrankPlanV16, BackingBucketStatusV16,
+    BackingBucketV16, BackingBucketV16Account, BatchTradeOutcomeV16, CloseProgressLedgerV16,
+    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16,
+    HealthCertV16Account, InsuranceCreditReservationV16, InsuranceCreditReservationV16Account,
+    Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, MarketModeV16,
+    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
     PermissionlessRecoveryReasonV16, PortfolioAccountV16Account, PortfolioLegV16,
     PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16View, PortfolioV16ViewMut,
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16,
@@ -13976,6 +13976,43 @@ fn proof_v16_cert_is_current_matches_the_favorable_action_gate() {
         "a valid certificate can be stale on the leg bitmap alone"
     );
     assert_eq!(current, expected);
+}
+
+// Recovery can preserve a prior ResetPending obligation while ordinary accrual
+// is disabled for that asset. The auto-crank refresh target must therefore fall
+// back to the reset obligation, but a live accrual target retains priority when
+// both exist. Exhaustive over both Option-presence bits and full-width indices.
+#[kani::proof]
+fn proof_v16_auto_crank_refresh_target_includes_recovery_reset_obligation() {
+    let has_refresh: bool = kani::any();
+    let has_reset: bool = kani::any();
+    let refresh_index: usize = kani::any();
+    let reset_index: usize = kani::any();
+    let refresh = has_refresh.then_some(refresh_index);
+    let reset = has_reset.then_some(reset_index);
+    let selected = kani_auto_crank_refresh_asset(refresh, reset);
+
+    if has_refresh {
+        assert_eq!(selected, Some(refresh_index));
+    } else if has_reset {
+        assert_eq!(selected, Some(reset_index));
+    } else {
+        assert_eq!(selected, None);
+    }
+}
+
+// A full refresh that detached its selected prior-reset leg already committed
+// bounded progress. It must return before the generic post-refresh accrual,
+// because Recovery assets deliberately reject ordinary accrual. Exhaustive over
+// the complete two-bit before/after domain.
+#[kani::proof]
+fn proof_v16_detached_refresh_leg_skips_post_refresh_accrual() {
+    let selected_leg_before: bool = kani::any();
+    let selected_leg_after: bool = kani::any();
+    assert_eq!(
+        kani_refresh_detached_selected_leg(selected_leg_before, selected_leg_after),
+        selected_leg_before && !selected_leg_after
+    );
 }
 
 #[kani::proof]
