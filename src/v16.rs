@@ -3016,10 +3016,6 @@ pub enum BackingBucketStatusV16 {
 /// ActionableState classes are live for an account/market. The liveness
 /// selector reads only this — never per-class witnesses that another active
 /// class could invalidate.
-#[cfg_attr(
-    all(kani, any(feature = "contracts", feature = "closure")),
-    derive(kani::Arbitrary)
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionableSummaryV16 {
     pub stale: bool,             // A1
