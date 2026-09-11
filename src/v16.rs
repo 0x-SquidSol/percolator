@@ -764,6 +764,149 @@ pub fn active_bitmap_count_ones(bitmap: V16ActiveBitmap) -> u32 {
 struct V16Core;
 
 impl V16Core {
+    /// Recompute the resolved payout rate from the ledger's current residual
+    /// and outstanding claim bound. This deliberately contains no wide
+    /// division: receipts apply the resulting fraction when they are paid.
+    /// (upstream a7577b0b)
+    pub(crate) fn kernel_recompute_resolved_payout_rate(
+        mut ledger: ResolvedPayoutLedgerV16,
+    ) -> V16Result<ResolvedPayoutLedgerV16> {
+        let total_bound_num = ledger
+            .terminal_claim_exact_receipts_num
+            .checked_add(ledger.terminal_claim_bound_unreceipted_num)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if total_bound_num == 0 {
+            ledger.current_payout_rate_num = 1;
+            ledger.current_payout_rate_den = 1;
+        } else {
+            ledger.current_payout_rate_num = ledger
+                .snapshot_residual
+                .checked_mul(BOUND_SCALE)
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .min(total_bound_num);
+            ledger.current_payout_rate_den = total_bound_num;
+        }
+        Ok(ledger)
+    }
+
+    /// Credit residual released after terminal snapshot capture into both
+    /// persisted snapshots and immediately raise the common payout rate.
+    /// (upstream a7577b0b)
+    pub(crate) fn kernel_credit_post_snapshot_residual(
+        mut ledger: ResolvedPayoutLedgerV16,
+        legacy_snapshot: u128,
+        released: u128,
+    ) -> V16Result<(ResolvedPayoutLedgerV16, u128)> {
+        ledger.snapshot_residual = ledger
+            .snapshot_residual
+            .checked_add(released)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let legacy_snapshot = legacy_snapshot
+            .checked_add(released)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        ledger = Self::kernel_recompute_resolved_payout_rate(ledger)?;
+        Ok((ledger, legacy_snapshot))
+    }
+
+    /// PRODUCTION KERNEL: canonicalize only an economically empty expired
+    /// bucket. Retirement must not erase consumed principal, impaired backing,
+    /// or provider earnings merely because the freshness period ended.
+    /// (upstream 379fbfea)
+    fn kernel_retirement_backing_normalization(bucket: BackingBucketV16) -> BackingBucketV16 {
+        if bucket.status == BackingBucketStatusV16::Expired
+            && bucket.fresh_unliened_backing_num == 0
+            && bucket.valid_liened_backing_num == 0
+            && bucket.consumed_liened_backing_num == 0
+            && bucket.impaired_liened_backing_num == 0
+            && bucket.utilization_fee_earnings == 0
+        {
+            BackingBucketV16::empty_for_market(bucket.market_id)
+        } else {
+            bucket
+        }
+    }
+
+    /// PRODUCTION KERNEL: expire one lapsed Fresh counterparty-backing bucket.
+    /// Unliened and valid-liened principal leave the source fresh reserve; the
+    /// liened part becomes impaired on both the source and the bucket.
+    /// (upstream c09d4575, extracted from expire_source_backing_bucket_not_atomic)
+    fn prepare_counterparty_backing_expiry_delta(
+        mut bucket: BackingBucketV16,
+        mut source: SourceCreditStateV16,
+        now_slot: u64,
+    ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
+        if bucket.status != BackingBucketStatusV16::Fresh || now_slot < bucket.expiry_slot {
+            return Err(V16Error::Stale);
+        }
+        let expired_unliened = bucket.fresh_unliened_backing_num;
+        let expired_liened = bucket.valid_liened_backing_num;
+        let expired_total = expired_unliened
+            .checked_add(expired_liened)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if source.fresh_reserved_backing_num < expired_total
+            || source.valid_liened_backing_num < expired_liened
+        {
+            return Err(V16Error::CounterUnderflow);
+        }
+        source.fresh_reserved_backing_num -= expired_total;
+        source.valid_liened_backing_num -= expired_liened;
+        source.impaired_liened_backing_num = source
+            .impaired_liened_backing_num
+            .checked_add(expired_liened)
+            .ok_or(V16Error::CounterOverflow)?;
+        bucket.fresh_unliened_backing_num = 0;
+        bucket.valid_liened_backing_num = 0;
+        bucket.impaired_liened_backing_num = bucket
+            .impaired_liened_backing_num
+            .checked_add(expired_liened)
+            .ok_or(V16Error::CounterOverflow)?;
+        bucket.status = if expired_liened == 0 && bucket.impaired_liened_backing_num == 0 {
+            BackingBucketStatusV16::Expired
+        } else {
+            BackingBucketStatusV16::Impaired
+        };
+        Ok((bucket, source))
+    }
+
+    /// PRODUCTION KERNEL: one step of the compact source-domain expiry scan.
+    /// The first sparse-tail entry terminates the scan; otherwise the first
+    /// occupied lapsed Fresh bucket is selected and terminates the scan.
+    /// (upstream c09d4575)
+    fn kernel_lapsed_source_backing_scan_step(
+        selected: Option<usize>,
+        sparse_tail: bool,
+        occupied: bool,
+        domain: usize,
+        bucket_status: BackingBucketStatusV16,
+        expiry_slot: u64,
+        current_slot: u64,
+    ) -> (Option<usize>, bool) {
+        if selected.is_some() || sparse_tail {
+            return (selected, true);
+        }
+        if occupied && bucket_status == BackingBucketStatusV16::Fresh && expiry_slot <= current_slot
+        {
+            return (Some(domain), true);
+        }
+        (None, false)
+    }
+
+    /// Select the terminal owner-forfeit residual route. An unbookable positive
+    /// residual commits Recovery as a successful transition so SVM rollback
+    /// cannot erase the only path to resolved settlement. (upstream 650e3fdf)
+    pub(crate) fn kernel_forfeit_residual_step(
+        residual_remaining: u128,
+        booking_capacity: u128,
+    ) -> ForfeitResidualStepV16 {
+        if residual_remaining == 0 {
+            ForfeitResidualStepV16::NoResidual
+        } else if booking_capacity == 0 {
+            ForfeitResidualStepV16::CommitRecovery
+        } else {
+            ForfeitResidualStepV16::Book
+        }
+    }
+
     fn loss_stale_trade_scope_allowed(
         market_loss_stale_active: bool,
         trade_asset_loss_stale: bool,
@@ -3636,6 +3779,8 @@ struct TradeApplyOutcomeV16 {
     fee_b: u128,
     notional: u128,
     risk_increasing: bool,
+    long_requires_initial_margin: bool,
+    short_requires_initial_margin: bool,
     long_has_source_claims: bool,
     short_has_source_claims: bool,
 }
@@ -3643,6 +3788,8 @@ struct TradeApplyOutcomeV16 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TradePositionPreflightV16 {
     risk_increasing: bool,
+    long_requires_initial_margin: bool,
+    short_requires_initial_margin: bool,
     long_lookup: PositionDeltaLookupV16,
     short_lookup: PositionDeltaLookupV16,
     long_old_abs_q: u128,
@@ -3665,6 +3812,7 @@ struct PositionDeltaLookupV16 {
 enum AccountRefreshCertOutcomeV16 {
     Certified(HealthCertV16),
     BChunk(AccountBSettlementChunkV16),
+    SourceBackingExpired(usize),
 }
 
 #[cfg(kani)]
@@ -4211,6 +4359,13 @@ pub struct BResidualBookingOutcomeV16 {
     pub explicit_loss: u128,
     pub delta_b: u128,
     pub remaining_after: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForfeitResidualStepV16 {
+    NoResidual,
+    Book,
+    CommitRecovery,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6579,41 +6734,100 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         domain: usize,
         now_slot: u64,
     ) -> V16Result<()> {
-        let mut bucket = self.backing_bucket_for_domain(domain)?;
-        if bucket.status != BackingBucketStatusV16::Fresh || now_slot < bucket.expiry_slot {
-            return Err(V16Error::Stale);
-        }
-        let mut source = self.source_credit_for_domain(domain)?;
-        let expired_unliened = bucket.fresh_unliened_backing_num;
-        let expired_liened = bucket.valid_liened_backing_num;
-        let expired_total = expired_unliened
-            .checked_add(expired_liened)
-            .ok_or(V16Error::ArithmeticOverflow)?;
-        if source.fresh_reserved_backing_num < expired_total
-            || source.valid_liened_backing_num < expired_liened
-        {
-            return Err(V16Error::CounterUnderflow);
-        }
-        source.fresh_reserved_backing_num -= expired_total;
-        source.valid_liened_backing_num -= expired_liened;
-        source.impaired_liened_backing_num = source
-            .impaired_liened_backing_num
-            .checked_add(expired_liened)
-            .ok_or(V16Error::CounterOverflow)?;
-        bucket.fresh_unliened_backing_num = 0;
-        bucket.valid_liened_backing_num = 0;
-        bucket.impaired_liened_backing_num = bucket
-            .impaired_liened_backing_num
-            .checked_add(expired_liened)
-            .ok_or(V16Error::CounterOverflow)?;
-        bucket.status = if expired_liened == 0 && bucket.impaired_liened_backing_num == 0 {
-            BackingBucketStatusV16::Expired
+        let snapshot_captured = decode_bool(self.header.payout_snapshot_captured)?;
+        let residual_before = if snapshot_captured {
+            self.residual()
         } else {
-            BackingBucketStatusV16::Impaired
+            0
         };
+        let (bucket, source) = V16Core::prepare_counterparty_backing_expiry_delta(
+            self.backing_bucket_for_domain(domain)?,
+            self.source_credit_for_domain(domain)?,
+            now_slot,
+        )?;
         self.set_backing_bucket_for_domain(domain, bucket)?;
         self.set_source_credit_for_domain(domain, source)?;
-        self.refresh_source_credit_domain_after_mutation(domain)
+        self.refresh_source_credit_domain_after_mutation(domain)?;
+        if snapshot_captured {
+            // upstream a7577b0b: principal released after the terminal snapshot
+            // was captured must reach the payout ledger, not strand behind it.
+            let released = self
+                .residual()
+                .checked_sub(residual_before)
+                .ok_or(V16Error::CounterUnderflow)?;
+            self.credit_post_snapshot_residual_not_atomic(released)?;
+        }
+        Ok(())
+    }
+
+    fn credit_post_snapshot_residual_not_atomic(&mut self, released: u128) -> V16Result<()> {
+        if released == 0 || !decode_bool(self.header.payout_snapshot_captured)? {
+            return Ok(());
+        }
+        let (ledger, legacy_snapshot) = V16Core::kernel_credit_post_snapshot_residual(
+            self.header.resolved_payout_ledger.try_to_runtime()?,
+            self.header.payout_snapshot.get(),
+            released,
+        )?;
+        self.header.payout_snapshot = V16PodU128::new(legacy_snapshot);
+        self.header.resolved_payout_ledger = ResolvedPayoutLedgerV16Account::from_runtime(&ledger);
+        Ok(())
+    }
+
+    /// First occupied source domain of the account whose backing bucket is
+    /// Fresh and lapsed at `now_slot`; the sparse tail ends the scan.
+    /// (upstream c09d4575 / 867fbdc9)
+    fn first_lapsed_source_backing_for_account_at_slot(
+        &self,
+        account: &PortfolioV16View<'_>,
+        now_slot: u64,
+    ) -> V16Result<Option<usize>> {
+        let mut selected = None;
+        let mut slot = 0usize;
+        while slot < PORTFOLIO_SOURCE_DOMAIN_CAP {
+            let source = account.header.source_domains[slot];
+            let occupied = source.is_occupied();
+            let sparse_tail = source.has_default_sparse_tag() && !occupied;
+            let (domain, bucket_status, expiry_slot) = if occupied {
+                let domain = source.domain.get() as usize;
+                let bucket = self.backing_bucket_for_domain(domain)?;
+                (domain, bucket.status, bucket.expiry_slot)
+            } else {
+                (0, BackingBucketStatusV16::Empty, 0)
+            };
+            let (next_selected, stop) = V16Core::kernel_lapsed_source_backing_scan_step(
+                selected,
+                sparse_tail,
+                occupied,
+                domain,
+                bucket_status,
+                expiry_slot,
+                now_slot,
+            );
+            selected = next_selected;
+            if stop {
+                break;
+            }
+            slot += 1;
+        }
+        Ok(selected)
+    }
+
+    /// Expire exactly one lapsed backing bucket used by the account (the first in
+    /// scan order) at the market clock; None when nothing has lapsed.
+    /// (upstream c09d4575)
+    fn expire_first_lapsed_source_backing_for_account_not_atomic(
+        &mut self,
+        account: &PortfolioV16View<'_>,
+    ) -> V16Result<Option<usize>> {
+        let current_slot = self.header.current_slot.get();
+        let Some(domain) =
+            self.first_lapsed_source_backing_for_account_at_slot(account, current_slot)?
+        else {
+            return Ok(None);
+        };
+        self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
+        Ok(Some(domain))
     }
 
     #[cfg(any(kani, feature = "fuzz"))]
@@ -9871,6 +10085,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         match self.refresh_account_and_certify_not_atomic(account, None, 0, false)? {
             AccountRefreshCertOutcomeV16::Certified(cert) => Ok(cert),
             AccountRefreshCertOutcomeV16::BChunk(_) => Err(V16Error::BStale),
+            AccountRefreshCertOutcomeV16::SourceBackingExpired(_) => Err(V16Error::Stale),
         }
     }
 
@@ -9895,6 +10110,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 account.header.pnl.get(),
                 source_claim_sum_num,
             )?;
+        }
+        // A source-backed winner can remain Live past the backing bucket's expiry.
+        // The permissionless path commits exactly one canonical expiry transition
+        // per call, then returns before valuation. Repeated cranks drain the
+        // bounded domain set without an O(source-domains) CU cliff.
+        // (upstream c09d4575)
+        if allow_b_chunk {
+            if let Some(domain) =
+                self.expire_first_lapsed_source_backing_for_account_not_atomic(&account.as_view())?
+            {
+                return Ok(AccountRefreshCertOutcomeV16::SourceBackingExpired(domain));
+            }
         }
         if decode_bool(account.header.b_stale_state)? && !allow_b_chunk {
             return Err(V16Error::BStale);
@@ -10717,6 +10944,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     AccountRefreshCertOutcomeV16::BChunk(out) => {
                         self.validate_shape_audit_scan()?;
                         return Ok(PermissionlessProgressOutcomeV16::AccountBChunk(out));
+                    }
+                    AccountRefreshCertOutcomeV16::SourceBackingExpired(domain) => {
+                        self.validate_shape_audit_scan()?;
+                        return Ok(PermissionlessProgressOutcomeV16::SourceBackingExpired {
+                            domain,
+                        });
                     }
                 }
                 touches_accrued_asset
@@ -11618,8 +11851,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             Self::position_delta_lookup_for_asset(long_account, request.asset_index, long_delta)?;
         let short_lookup =
             Self::position_delta_lookup_for_asset(short_account, request.asset_index, short_delta)?;
-        let risk_increasing = position_delta_increases_risk(long_lookup.current_q, long_delta)?
-            || position_delta_increases_risk(short_lookup.current_q, short_delta)?;
+        let long_risk_increasing =
+            position_delta_increases_risk(long_lookup.current_q, long_delta)?;
+        let short_risk_increasing =
+            position_delta_increases_risk(short_lookup.current_q, short_delta)?;
+        let risk_increasing = long_risk_increasing || short_risk_increasing;
         let preflight_asset = self.asset_state(request.asset_index)?;
         // #132: the gate compares a reduction derived from RAW basis against A-scaled
         // oi_eff. After a unilateral reduction has scaled a side, an untouched
@@ -11679,6 +11915,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )?;
         Ok(TradePositionPreflightV16 {
             risk_increasing,
+            long_requires_initial_margin: trade_account_requires_initial_margin(
+                long_lookup.current_q,
+                long_lookup.next_q,
+            ),
+            short_requires_initial_margin: trade_account_requires_initial_margin(
+                short_lookup.current_q,
+                short_lookup.next_q,
+            ),
             long_lookup,
             short_lookup,
             long_old_abs_q: long_lookup.current_q.unsigned_abs(),
@@ -12972,6 +13216,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )? {
             AccountRefreshCertOutcomeV16::Certified(_) => {}
             AccountRefreshCertOutcomeV16::BChunk(_) => return Err(V16Error::BStale),
+            AccountRefreshCertOutcomeV16::SourceBackingExpired(_) => return Err(V16Error::Stale),
         }
         let cert = account.header.health_cert.try_to_runtime()?;
         if cert.certified_liq_deficit == 0 {
@@ -13182,6 +13427,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         match self.refresh_account_and_certify_not_atomic(account, None, 0, false)? {
             AccountRefreshCertOutcomeV16::Certified(cert) => Ok(cert),
             AccountRefreshCertOutcomeV16::BChunk(_) => Err(V16Error::BStale),
+            AccountRefreshCertOutcomeV16::SourceBackingExpired(_) => Err(V16Error::Stale),
         }
     }
 
@@ -13200,6 +13446,50 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     #[cfg(kani)]
     pub fn kani_ensure_initial_margin(account: &PortfolioV16View<'_>) -> V16Result<()> {
         Self::ensure_initial_margin(account)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_kernel_credit_post_snapshot_residual(
+        ledger: ResolvedPayoutLedgerV16,
+        legacy_snapshot: u128,
+        released: u128,
+    ) -> V16Result<(ResolvedPayoutLedgerV16, u128)> {
+        V16Core::kernel_credit_post_snapshot_residual(ledger, legacy_snapshot, released)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_retirement_backing_normalization(bucket: BackingBucketV16) -> BackingBucketV16 {
+        V16Core::kernel_retirement_backing_normalization(bucket)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_prepare_counterparty_backing_expiry_delta(
+        bucket: BackingBucketV16,
+        source: SourceCreditStateV16,
+        now_slot: u64,
+    ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
+        V16Core::prepare_counterparty_backing_expiry_delta(bucket, source, now_slot)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_lapsed_source_backing_scan_step(
+        selected: Option<usize>,
+        sparse_tail: bool,
+        occupied: bool,
+        domain: usize,
+        bucket_status: BackingBucketStatusV16,
+        expiry_slot: u64,
+        current_slot: u64,
+    ) -> (Option<usize>, bool) {
+        V16Core::kernel_lapsed_source_backing_scan_step(
+            selected,
+            sparse_tail,
+            occupied,
+            domain,
+            bucket_status,
+            expiry_slot,
+            current_slot,
+        )
     }
 
     fn account_no_positive_credit_equity(account: &PortfolioV16View<'_>) -> V16Result<i128> {
@@ -13229,6 +13519,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account: &PortfolioV16View<'_>,
     ) -> V16Result<()> {
         Self::ensure_no_positive_credit_initial_margin(account)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_trade_account_requires_initial_margin(current: i128, next: i128) -> bool {
+        trade_account_requires_initial_margin(current, next)
     }
 
     fn recertify_account_after_source_lien_change(
@@ -13495,6 +13790,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             fee_b,
             notional,
             risk_increasing,
+            long_requires_initial_margin: trade_preflight.long_requires_initial_margin,
+            short_requires_initial_margin: trade_preflight.short_requires_initial_margin,
             long_has_source_claims: trade_preflight.long_has_source_claims,
             short_has_source_claims: trade_preflight.short_has_source_claims,
         })
@@ -13552,6 +13849,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 fee_b,
                 notional,
                 risk_increasing: applied_risk_increasing,
+                long_requires_initial_margin: true,
+                short_requires_initial_margin: true,
                 long_has_source_claims: applied_long_has_source_claims,
                 short_has_source_claims: applied_short_has_source_claims,
             },
@@ -13564,22 +13863,32 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         short_account: &mut PortfolioV16ViewMut<'_>,
         locked: bool,
         risk_increasing: bool,
+        long_requires_initial_margin: bool,
+        short_requires_initial_margin: bool,
         long_has_source_claims: bool,
         short_has_source_claims: bool,
     ) -> V16Result<()> {
         if risk_increasing && !locked {
-            if long_has_source_claims {
+            if long_requires_initial_margin && long_has_source_claims {
                 self.create_initial_margin_source_lien_if_needed(long_account)?;
             }
-            if short_has_source_claims {
+            if short_requires_initial_margin && short_has_source_claims {
                 self.create_initial_margin_source_lien_if_needed(short_account)?;
             }
         }
-        Self::ensure_initial_margin(&long_account.as_view())?;
-        Self::ensure_initial_margin(&short_account.as_view())?;
+        if long_requires_initial_margin {
+            Self::ensure_initial_margin(&long_account.as_view())?;
+        }
+        if short_requires_initial_margin {
+            Self::ensure_initial_margin(&short_account.as_view())?;
+        }
         if locked {
-            Self::ensure_no_positive_credit_initial_margin(&long_account.as_view())?;
-            Self::ensure_no_positive_credit_initial_margin(&short_account.as_view())?;
+            if long_requires_initial_margin {
+                Self::ensure_no_positive_credit_initial_margin(&long_account.as_view())?;
+            }
+            if short_requires_initial_margin {
+                Self::ensure_no_positive_credit_initial_margin(&short_account.as_view())?;
+            }
         }
         self.validate_shape_audit_scan()?;
         self.validate_account_audit_scan(&long_account.as_view())?;
@@ -13773,6 +14082,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             notional: 0,
         };
         let mut risk_increasing = false;
+        let mut long_requires_initial_margin = false;
+        let mut short_requires_initial_margin = false;
         let mut long_has_source_claims = false;
         let mut short_has_source_claims = false;
         let recertify_after_fill = requests.len() == 1;
@@ -13785,6 +14096,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 recertify_after_fill,
                 taker_is_long_account,
             )?;
+            long_requires_initial_margin |= applied.long_requires_initial_margin;
+            short_requires_initial_margin |= applied.short_requires_initial_margin;
             Self::accumulate_batch_trade_apply(
                 &mut outcome,
                 &mut risk_increasing,
@@ -13803,6 +14116,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             short_account,
             locked,
             risk_increasing,
+            long_requires_initial_margin,
+            short_requires_initial_margin,
             long_has_source_claims,
             short_has_source_claims,
         )?;
@@ -13853,6 +14168,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             notional: 0,
         };
         let mut risk_increasing = false;
+        let mut long_requires_initial_margin = false;
+        let mut short_requires_initial_margin = false;
         let mut long_has_source_claims = false;
         let mut short_has_source_claims = false;
         let recertify_after_fill = requests.len() == 1;
@@ -13865,6 +14182,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 recertify_after_fill,
                 taker_is_long_account,
             )?;
+            long_requires_initial_margin |= applied.long_requires_initial_margin;
+            short_requires_initial_margin |= applied.short_requires_initial_margin;
             Self::accumulate_batch_trade_apply(
                 &mut outcome,
                 &mut risk_increasing,
@@ -13883,6 +14202,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             short_account,
             locked,
             risk_increasing,
+            long_requires_initial_margin,
+            short_requires_initial_margin,
             long_has_source_claims,
             short_has_source_claims,
         )?;
@@ -14331,22 +14652,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     fn recompute_resolved_payout_rate(&mut self) -> V16Result<()> {
-        let mut ledger = self.header.resolved_payout_ledger.try_to_runtime()?;
-        let total_bound_num = ledger
-            .terminal_claim_exact_receipts_num
-            .checked_add(ledger.terminal_claim_bound_unreceipted_num)
-            .ok_or(V16Error::ArithmeticOverflow)?;
-        if total_bound_num == 0 {
-            ledger.current_payout_rate_num = 1;
-            ledger.current_payout_rate_den = 1;
-        } else {
-            ledger.current_payout_rate_num = ledger
-                .snapshot_residual
-                .checked_mul(BOUND_SCALE)
-                .ok_or(V16Error::ArithmeticOverflow)?
-                .min(total_bound_num);
-            ledger.current_payout_rate_den = total_bound_num;
-        }
+        let ledger = V16Core::kernel_recompute_resolved_payout_rate(
+            self.header.resolved_payout_ledger.try_to_runtime()?,
+        )?;
         self.header.resolved_payout_ledger = ResolvedPayoutLedgerV16Account::from_runtime(&ledger);
         Ok(())
     }
@@ -15471,6 +15779,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             AssetLifecycleV16::Active
             | AssetLifecycleV16::DrainOnly
             | AssetLifecycleV16::Recovery => {
+                self.expire_lapsed_source_backing_for_asset_not_atomic(asset_index, now_slot)?;
                 self.require_empty_asset_lifecycle_state(asset_index)?;
                 let (next_asset_set_epoch, next_risk_epoch) =
                     self.checked_asset_set_epoch_bump()?;
@@ -15482,11 +15791,37 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 self.validate_shape()
             }
             AssetLifecycleV16::Retired => {
+                self.expire_lapsed_source_backing_for_asset_not_atomic(asset_index, now_slot)?;
                 self.require_empty_asset_lifecycle_state(asset_index)?;
                 self.validate_shape()
             }
             _ => Err(V16Error::LockActive),
         }
+    }
+
+    /// Retirement is the terminal consumer for one asset, so it must normalize
+    /// both of that asset's source domains before testing whether the slot is
+    /// empty. This is constant work and also covers a lapsed bucket that no
+    /// portfolio references, which account-local crank discovery cannot
+    /// otherwise select. (upstream 379fbfea)
+    fn expire_lapsed_source_backing_for_asset_not_atomic(
+        &mut self,
+        asset_index: usize,
+        now_slot: u64,
+    ) -> V16Result<()> {
+        for side in [SideV16::Long, SideV16::Short] {
+            let domain = self.insurance_domain_index(asset_index, side)?;
+            let bucket = self.backing_bucket_for_domain(domain)?;
+            if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= now_slot {
+                self.expire_source_backing_bucket_not_atomic(domain, now_slot)?;
+            }
+            let bucket = self.backing_bucket_for_domain(domain)?;
+            let normalized = V16Core::kernel_retirement_backing_normalization(bucket);
+            if normalized != bucket {
+                self.set_backing_bucket_for_domain(domain, normalized)?;
+            }
+        }
+        Ok(())
     }
 
     /// Restarts an empty Recovery/Retired asset with a fresh market_id.
@@ -15799,27 +16134,58 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         };
         let mut residual_booked = 0u128;
         let mut explicit_loss = 0u128;
-        if residual != 0 {
-            let outcome = self.book_bankruptcy_residual_chunk_for_account_core(
-                account,
-                asset_index,
-                leg.side,
-                residual,
-            )?;
-            residual_booked = outcome.booked_loss;
-            explicit_loss = outcome.explicit_loss;
-            let cleared = residual_booked
-                .checked_add(explicit_loss)
-                .ok_or(V16Error::ArithmeticOverflow)?
-                .min(residual);
-            let cleared_i128 = i128::try_from(cleared).map_err(|_| V16Error::ArithmeticOverflow)?;
-            let new_pnl = account
-                .header
-                .pnl
-                .get()
-                .checked_add(cleared_i128)
-                .ok_or(V16Error::ArithmeticOverflow)?;
-            self.set_account_pnl(account, new_pnl)?;
+        let booking_capacity = if residual == 0 {
+            0
+        } else {
+            self.bankruptcy_residual_single_step_capacity(asset_index, leg.side, residual)?
+        };
+        match V16Core::kernel_forfeit_residual_step(residual, booking_capacity) {
+            ForfeitResidualStepV16::NoResidual => {}
+            ForfeitResidualStepV16::CommitRecovery => {
+                // The opposing side may already have completed terminal wind-down.
+                // Returning RecoveryRequired would make SVM rollback the only
+                // terminal transition. The close ledger retains the exact debt.
+                // (upstream 650e3fdf)
+                self.declare_permissionless_recovery(
+                    PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+                )?;
+                self.validate_shape()?;
+                account.validate_with_market(&self.as_view())?;
+                return Ok(DeadLegForfeitOutcomeV16 {
+                    detached: false,
+                    positive_pnl_forfeited,
+                    loss_settled: total_loss_settled,
+                    support_consumed,
+                    junior_face_burned,
+                    principal_used,
+                    insurance_used,
+                    residual_booked: 0,
+                    explicit_loss: 0,
+                });
+            }
+            ForfeitResidualStepV16::Book => {
+                let outcome = self.book_bankruptcy_residual_chunk_for_account_core(
+                    account,
+                    asset_index,
+                    leg.side,
+                    residual,
+                )?;
+                residual_booked = outcome.booked_loss;
+                explicit_loss = outcome.explicit_loss;
+                let cleared = residual_booked
+                    .checked_add(explicit_loss)
+                    .ok_or(V16Error::ArithmeticOverflow)?
+                    .min(residual);
+                let cleared_i128 =
+                    i128::try_from(cleared).map_err(|_| V16Error::ArithmeticOverflow)?;
+                let new_pnl = account
+                    .header
+                    .pnl
+                    .get()
+                    .checked_add(cleared_i128)
+                    .ok_or(V16Error::ArithmeticOverflow)?;
+                self.set_account_pnl(account, new_pnl)?;
+            }
         }
 
         let detached = account.header.pnl.get() >= 0
@@ -16286,6 +16652,7 @@ impl RiskScoreV16 {
 pub enum PermissionlessProgressOutcomeV16 {
     AccountCurrent,
     AccountBChunk(AccountBSettlementChunkV16),
+    SourceBackingExpired { domain: usize },
     ResidualBooked(BResidualBookingOutcomeV16),
     RecoveryDeclared(PermissionlessRecoveryReasonV16),
 }
@@ -16333,6 +16700,13 @@ fn position_delta_increases_risk(current: i128, delta_q: i128) -> V16Result<bool
         .ok_or(V16Error::ArithmeticOverflow)?;
     validate_basis_or_zero(next)?;
     Ok(next.unsigned_abs() > current.unsigned_abs())
+}
+
+// upstream f06a04a7 "Keep strict trade reductions open below initial margin":
+// only a STRICT reduction of the account's position on the asset is exempt from
+// the final initial-margin gate; equal-size flips and increases keep it.
+fn trade_account_requires_initial_margin(current: i128, next: i128) -> bool {
+    next.unsigned_abs() >= current.unsigned_abs()
 }
 
 fn trade_preflight_risk_gate(
