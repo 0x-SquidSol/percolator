@@ -19,7 +19,9 @@ use percolator::v16::{
     kani_pending_domain_loss_barrier_blocks_position_change,
     kani_position_change_requires_unit_adl, kani_position_delta_increases_risk,
     kani_prepare_asset_recovery_transition, kani_settle_kf_stale_cohort,
-    kani_source_credit_state_realizable_support_for_face, kani_target_effective_lag_adverse_delta,
+    kani_source_claim_domain_first_burn_partition,
+    kani_source_credit_state_realizable_support_for_face,
+    kani_source_lien_fee_after_backing_release, kani_target_effective_lag_adverse_delta,
     kani_trade_preexisting_oi_reduction_gate, kani_trade_preflight_risk_gate,
     kani_validate_positive_pnl_source_attribution, AccrualStepV16, AssetLifecycleV16,
     AssetStateV16, AssetStateV16Account, BackingBucketStatusV16, BackingBucketV16,
@@ -11021,6 +11023,279 @@ fn proof_v16_source_credit_lien_face_and_backing_use_scaled_units() {
 #[kani::proof]
 #[kani::unwind(8)]
 #[kani::solver(cadical)]
+fn proof_v16_source_lien_face_burn_releases_only_required_backing() {
+    let face_whole_raw: u8 = kani::any();
+    let effective_raw: u8 = kani::any();
+    let burn_whole_raw: u8 = kani::any();
+    let has_fractional_face: bool = kani::any();
+    let burn_full_face: bool = kani::any();
+    kani::assume(face_whole_raw <= 32);
+    kani::assume(burn_whole_raw <= face_whole_raw);
+    let face_whole = face_whole_raw as u128;
+    let fractional_face = if has_fractional_face {
+        BOUND_SCALE / 2
+    } else {
+        0
+    };
+    let face_num = face_whole * BOUND_SCALE + fractional_face;
+    let max_effective = face_whole + u128::from(has_fractional_face);
+    kani::assume((effective_raw as u128) <= max_effective);
+    let backing_num = (effective_raw as u128) * BOUND_SCALE;
+    let face_burn_num = if burn_full_face {
+        face_num
+    } else {
+        (burn_whole_raw as u128) * BOUND_SCALE
+    };
+
+    let release_num = MarketGroupV16ViewMut::<u64>::kani_source_lien_backing_release_for_face_burn(
+        face_num,
+        backing_num,
+        face_burn_num,
+    )
+    .unwrap();
+    let remaining_face = face_num - face_burn_num;
+    let remaining_face_ceiling =
+        remaining_face / BOUND_SCALE + u128::from(remaining_face % BOUND_SCALE != 0);
+    let remaining_effective = (backing_num - release_num) / BOUND_SCALE;
+    let expected_release_effective = (effective_raw as u128).saturating_sub(remaining_face_ceiling);
+
+    kani::cover!(
+        release_num == 0,
+        "remaining face can preserve the full lien"
+    );
+    kani::cover!(release_num != 0, "face burn can require backing release");
+    kani::cover!(
+        has_fractional_face && face_burn_num != face_num,
+        "fractional scaled face is covered"
+    );
+    assert_eq!(release_num % BOUND_SCALE, 0);
+    assert_eq!(release_num, expected_release_effective * BOUND_SCALE);
+    assert!(remaining_effective <= remaining_face_ceiling);
+    if release_num != 0 {
+        assert!(remaining_effective + 1 > remaining_face_ceiling);
+    }
+    if face_burn_num == face_num {
+        assert_eq!(release_num, backing_num);
+    }
+}
+
+// Live mark-reversal liveness and conservation across both source classes.
+// Full-width source partition: every valid liened-face burn is assigned exactly
+// once, counterparty-first, and the aggregate face rank decreases by the burn.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_source_lien_face_burn_partition_is_total_disjoint_and_strict_progress() {
+    let counterparty_face: u128 = kani::any();
+    let insurance_face: u128 = kani::any();
+    kani::assume(counterparty_face <= u128::MAX - insurance_face);
+    let total_face = counterparty_face + insurance_face;
+    kani::assume(total_face > 0);
+    let face_burn: u128 = kani::any();
+    kani::assume(face_burn > 0 && face_burn <= total_face);
+
+    let (counterparty_burn, insurance_burn) =
+        MarketGroupV16ViewMut::<u64>::kani_source_lien_face_burn_partition(
+            counterparty_face,
+            insurance_face,
+            face_burn,
+        )
+        .unwrap();
+
+    assert_eq!(counterparty_burn, face_burn.min(counterparty_face));
+    assert_eq!(counterparty_burn + insurance_burn, face_burn);
+    assert!(counterparty_burn <= counterparty_face);
+    assert!(insurance_burn <= insurance_face);
+    assert_eq!(
+        (counterparty_face - counterparty_burn) + (insurance_face - insurance_burn),
+        total_face - face_burn
+    );
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn == 0,
+        "counterparty-only partition is reachable"
+    );
+    kani::cover!(
+        counterparty_burn == 0 && insurance_burn > 0,
+        "insurance-only partition is reachable"
+    );
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn > 0,
+        "one burn can cross both source classes"
+    );
+    kani::cover!(face_burn == total_face, "full face burn reaches rank zero");
+}
+
+// Domain-isolation theorem for every representable two-domain claim rank. The
+// affected domain is exhausted before fallback can touch an unrelated domain,
+// while the aggregate claim rank falls by exactly the requested B loss.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn proof_v16_source_claim_burn_partition_is_domain_first_conservative_and_isolated() {
+    let source_claim_num: u128 = kani::any();
+    let unrelated_claim_num: u128 = kani::any();
+    let burn_num: u128 = kani::any();
+    let Some(total_claim_num) = source_claim_num.checked_add(unrelated_claim_num) else {
+        kani::assume(false);
+        return;
+    };
+    kani::assume(burn_num <= total_claim_num);
+
+    let (source_burn_num, fallback_burn_num) =
+        kani_source_claim_domain_first_burn_partition(source_claim_num, burn_num);
+    let source_after = source_claim_num.checked_sub(source_burn_num).unwrap();
+    let unrelated_after = unrelated_claim_num.checked_sub(fallback_burn_num).unwrap();
+
+    assert!(source_burn_num <= source_claim_num);
+    assert!(source_burn_num <= burn_num);
+    assert!(fallback_burn_num <= unrelated_claim_num);
+    assert_eq!(
+        source_burn_num.checked_add(fallback_burn_num),
+        Some(burn_num)
+    );
+    assert_eq!(
+        source_after.checked_add(unrelated_after),
+        total_claim_num.checked_sub(burn_num)
+    );
+    if burn_num <= source_claim_num {
+        assert_eq!(fallback_burn_num, 0);
+        assert_eq!(unrelated_after, unrelated_claim_num);
+    } else {
+        assert_eq!(source_after, 0);
+        assert_eq!(fallback_burn_num, burn_num - source_claim_num);
+    }
+
+    kani::cover!(
+        burn_num > 0 && burn_num < source_claim_num && unrelated_claim_num > 0,
+        "partial source burn frames an unrelated claim"
+    );
+    kani::cover!(
+        source_claim_num > 0
+            && unrelated_claim_num > 0
+            && burn_num > source_claim_num
+            && burn_num < total_claim_num,
+        "fallback burns only a strict uncovered remainder"
+    );
+    kani::cover!(
+        total_claim_num > 1 && burn_num == total_claim_num,
+        "the exact aggregate claim rank can be retired"
+    );
+}
+
+// Bounded composition through the complete production plan. The separate
+// full-width partition theorem and fractional source-local release theorem
+// discharge the amount-independent algebra around this composition seam.
+// Any valid liened-face burn must admit a plan, reduce the face rank exactly,
+// release only the backing no longer supportable by remaining face, and leave
+// counterparty/insurance backing independently bounded by their own claims.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_source_lien_face_burn_plan_is_total_minimal_and_source_isolated() {
+    let counterparty_whole: u8 = kani::any();
+    let insurance_whole: u8 = kani::any();
+    let burn_whole: u8 = kani::any();
+    kani::assume(counterparty_whole <= 8);
+    kani::assume(insurance_whole <= 8);
+    kani::assume(burn_whole <= 16);
+    let counterparty_face = (counterparty_whole as u128) * BOUND_SCALE;
+    let insurance_face = (insurance_whole as u128) * BOUND_SCALE;
+    let total_face = counterparty_face + insurance_face;
+    kani::assume(total_face > 0);
+
+    let counterparty_face_ceiling =
+        counterparty_face / BOUND_SCALE + u128::from(counterparty_face % BOUND_SCALE != 0);
+    let insurance_face_ceiling =
+        insurance_face / BOUND_SCALE + u128::from(insurance_face % BOUND_SCALE != 0);
+    let counterparty_effective: u8 = kani::any();
+    let insurance_effective: u8 = kani::any();
+    kani::assume((counterparty_effective as u128) <= counterparty_face_ceiling);
+    kani::assume((insurance_effective as u128) <= insurance_face_ceiling);
+    let counterparty_backing = (counterparty_effective as u128) * BOUND_SCALE;
+    let insurance_backing = (insurance_effective as u128) * BOUND_SCALE;
+    let face_burn = (burn_whole as u128) * BOUND_SCALE;
+    kani::assume(face_burn > 0 && face_burn <= total_face);
+
+    let (counterparty_burn, insurance_burn, counterparty_release, insurance_release, total_release) =
+        MarketGroupV16ViewMut::<u64>::kani_source_lien_face_burn_plan(
+            counterparty_face,
+            insurance_face,
+            counterparty_backing,
+            insurance_backing,
+            face_burn,
+        )
+        .unwrap();
+
+    assert_eq!(counterparty_burn, face_burn.min(counterparty_face));
+    assert_eq!(counterparty_burn + insurance_burn, face_burn);
+    assert!(counterparty_burn <= counterparty_face);
+    assert!(insurance_burn <= insurance_face);
+    assert_eq!(counterparty_release % BOUND_SCALE, 0);
+    assert_eq!(insurance_release % BOUND_SCALE, 0);
+    assert_eq!(total_release, counterparty_release + insurance_release);
+    assert!(counterparty_release <= counterparty_backing);
+    assert!(insurance_release <= insurance_backing);
+
+    let counterparty_face_after = counterparty_face - counterparty_burn;
+    let insurance_face_after = insurance_face - insurance_burn;
+    let counterparty_backing_after = counterparty_backing - counterparty_release;
+    let insurance_backing_after = insurance_backing - insurance_release;
+    let counterparty_ceiling_after = counterparty_face_after / BOUND_SCALE
+        + u128::from(counterparty_face_after % BOUND_SCALE != 0);
+    let insurance_ceiling_after =
+        insurance_face_after / BOUND_SCALE + u128::from(insurance_face_after % BOUND_SCALE != 0);
+
+    assert_eq!(
+        counterparty_face_after + insurance_face_after,
+        total_face - face_burn,
+        "every successful reversal strictly decreases the liened-face rank"
+    );
+    assert!(counterparty_backing_after / BOUND_SCALE <= counterparty_ceiling_after);
+    assert!(insurance_backing_after / BOUND_SCALE <= insurance_ceiling_after);
+    if counterparty_release != 0 {
+        assert_eq!(
+            counterparty_backing_after / BOUND_SCALE,
+            counterparty_ceiling_after
+        );
+    }
+    if insurance_release != 0 {
+        assert_eq!(
+            insurance_backing_after / BOUND_SCALE,
+            insurance_ceiling_after
+        );
+    }
+    if counterparty_burn == counterparty_face {
+        assert_eq!(counterparty_release, counterparty_backing);
+    }
+    if insurance_burn == insurance_face {
+        assert_eq!(insurance_release, insurance_backing);
+    }
+
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn == 0,
+        "counterparty-only face burn is reachable"
+    );
+    kani::cover!(
+        counterparty_burn == 0 && insurance_burn > 0,
+        "insurance-only face burn is reachable"
+    );
+    kani::cover!(
+        counterparty_burn > 0 && insurance_burn > 0,
+        "one burn can cross both source classes"
+    );
+    kani::cover!(
+        total_release == 0,
+        "face can shrink without over-releasing backing"
+    );
+    kani::cover!(total_release > 0, "face shrink can require backing release");
+    kani::cover!(
+        face_burn == total_face,
+        "full reversal releases the complete lien"
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
 fn proof_v16_residual_reward_credit_is_capped_by_principal_and_crystallized_loss() {
     let crystallized_raw: u8 = kani::any();
     let spent_raw: u8 = kani::any();
@@ -13970,4 +14245,410 @@ fn proof_v16_canonical_accrual_path_is_partition_invariant() {
     let mut normalized_engine = delayed_markets[0].engine;
     normalized_engine.asset = AssetStateV16Account::from_runtime(&normalized_asset);
     assert!(normalized_engine == split_markets[0].engine);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_foreign_expiry_lien_impairment_is_exact_relabel() {
+    let counter_face_atoms: u8 = kani::any();
+    let counter_effective: u8 = kani::any();
+    let insurance_face_atoms: u8 = kani::any();
+    let insurance_effective: u8 = kani::any();
+    let prior_impaired_face_atoms: u8 = kani::any();
+    let prior_impaired_effective: u8 = kani::any();
+    let live_fee: u8 = kani::any();
+    let impaired_fee: u8 = kani::any();
+    kani::assume(counter_face_atoms > 0 && counter_face_atoms <= 8);
+    kani::assume(counter_effective > 0 && counter_effective <= counter_face_atoms);
+    kani::assume(insurance_face_atoms <= 8);
+    kani::assume(insurance_effective <= insurance_face_atoms);
+    kani::assume(prior_impaired_face_atoms <= 8);
+    kani::assume(prior_impaired_effective <= prior_impaired_face_atoms);
+
+    let counter_face = (counter_face_atoms as u128) * BOUND_SCALE;
+    let insurance_face = (insurance_face_atoms as u128) * BOUND_SCALE;
+    let prior_impaired_face = (prior_impaired_face_atoms as u128) * BOUND_SCALE;
+    let counter_backing = (counter_effective as u128) * BOUND_SCALE;
+    let insurance_backing = (insurance_effective as u128) * BOUND_SCALE;
+    let live_effective = counter_effective as u128 + insurance_effective as u128;
+    let source = PortfolioSourceDomainV16Account {
+        domain: V16PodU32::new(3),
+        source_claim_market_id: V16PodU64::new(9),
+        source_claim_bound_num: V16PodU128::new(
+            counter_face + insurance_face + prior_impaired_face + BOUND_SCALE,
+        ),
+        source_claim_liened_num: V16PodU128::new(counter_face + insurance_face),
+        source_claim_counterparty_liened_num: V16PodU128::new(counter_face),
+        source_claim_insurance_liened_num: V16PodU128::new(insurance_face),
+        source_lien_effective_reserved: V16PodU128::new(live_effective),
+        source_lien_counterparty_backing_num: V16PodU128::new(counter_backing),
+        source_lien_insurance_backing_num: V16PodU128::new(insurance_backing),
+        source_lien_fee_last_slot: V16PodU64::new(7),
+        source_claim_impaired_num: V16PodU128::new(prior_impaired_face),
+        source_lien_impaired_effective_reserved: V16PodU128::new(prior_impaired_effective as u128),
+        source_lien_capital_at_risk_fee_revenue: V16PodU128::new(live_fee as u128),
+        source_lien_impaired_capital_at_risk_fee_revenue: V16PodU128::new(impaired_fee as u128),
+    };
+
+    let (after, impaired_effective) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_account_counterparty_lien_impairment(source)
+            .unwrap();
+
+    kani::cover!(
+        insurance_face_atoms > 0,
+        "foreign expiry preserves a mixed insurance-backed lien"
+    );
+    kani::cover!(
+        prior_impaired_face_atoms > 0,
+        "foreign expiry composes with prior impaired face"
+    );
+    kani::cover!(
+        live_fee > 0 && insurance_effective > 0,
+        "foreign expiry splits mixed-lien fee revenue"
+    );
+    assert_eq!(impaired_effective, counter_effective as u128);
+    assert_eq!(after.domain.get(), source.domain.get());
+    assert_eq!(
+        after.source_claim_market_id.get(),
+        source.source_claim_market_id.get()
+    );
+    assert_eq!(
+        after.source_claim_bound_num.get(),
+        source.source_claim_bound_num.get()
+    );
+    assert_eq!(after.source_claim_liened_num.get(), insurance_face);
+    assert_eq!(after.source_claim_counterparty_liened_num.get(), 0);
+    assert_eq!(
+        after.source_claim_insurance_liened_num.get(),
+        source.source_claim_insurance_liened_num.get()
+    );
+    assert_eq!(
+        after.source_claim_impaired_num.get(),
+        prior_impaired_face + counter_face
+    );
+    assert_eq!(
+        after.source_claim_liened_num.get() + after.source_claim_impaired_num.get(),
+        source.source_claim_liened_num.get() + source.source_claim_impaired_num.get()
+    );
+    assert_eq!(
+        after.source_lien_effective_reserved.get(),
+        insurance_effective as u128
+    );
+    assert_eq!(after.source_lien_counterparty_backing_num.get(), 0);
+    assert_eq!(
+        after.source_lien_insurance_backing_num.get(),
+        source.source_lien_insurance_backing_num.get()
+    );
+    assert_eq!(
+        after.source_lien_impaired_effective_reserved.get(),
+        prior_impaired_effective as u128
+    );
+    assert_eq!(
+        after.source_lien_effective_reserved.get()
+            + after.source_lien_impaired_effective_reserved.get(),
+        source.source_lien_effective_reserved.get()
+            + source.source_lien_impaired_effective_reserved.get()
+            - counter_effective as u128
+    );
+    assert_eq!(after.source_lien_fee_last_slot.get(), 0);
+    let expected_impaired_fee = (live_fee as u128) * (counter_effective as u128) / live_effective;
+    assert_eq!(
+        after.source_lien_capital_at_risk_fee_revenue.get(),
+        live_fee as u128 - expected_impaired_fee
+    );
+    assert_eq!(
+        after.source_lien_impaired_capital_at_risk_fee_revenue.get(),
+        impaired_fee as u128 + expected_impaired_fee
+    );
+    assert_eq!(
+        after.source_lien_capital_at_risk_fee_revenue.get()
+            + after.source_lien_impaired_capital_at_risk_fee_revenue.get(),
+        live_fee as u128 + impaired_fee as u128
+    );
+}
+
+// 1e0d952e: utilization rent stops at the backing bucket's own expiry slot. The
+// window here is last_slot..current_slot = 3 slots, but the bucket lapsed after
+// one, so exactly one slot of rent may be charged and the fee cursor may only
+// advance to the expiry slot. Before that fix the whole 3-slot window was
+// charged and the cursor jumped to the current slot.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_backing_utilization_rent_stops_at_bucket_expiry() {
+    let slack_raw: u8 = kani::any();
+    let earnings_raw: u8 = kani::any();
+    kani::assume(slack_raw <= 4);
+    kani::assume(earnings_raw <= 4);
+    let lien_atoms = 1u128;
+    let lien_num = lien_atoms * BOUND_SCALE;
+    let last_slot = 3u64;
+    let expiry_slot = 4u64;
+    let current_slot = 6u64;
+    let earnings_before = earnings_raw as u128;
+    // Only last_slot..expiry_slot may be billed, not last_slot..current_slot.
+    let expected_charged = lien_atoms * (expiry_slot - last_slot) as u128;
+    let capital = expected_charged + slack_raw as u128;
+    let (mut header, mut markets, mut account_header) = one_market_direct_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    header.config.backing_fee_base_rate_e9_per_slot =
+        V16PodU64::new(MAX_BACKING_FEE_RATE_E9_PER_SLOT);
+    header.config.backing_fee_slope_at_kink_e9_per_slot = V16PodU64::new(0);
+    header.config.backing_fee_slope_above_kink_e9_per_slot = V16PodU64::new(0);
+    header.current_slot = V16PodU64::new(current_slot);
+    header.slot_last = V16PodU64::new(current_slot);
+    header.vault = V16PodU128::new(capital + earnings_before + lien_atoms);
+    header.c_tot = V16PodU128::new(capital);
+    header.backing_provider_earnings_total = V16PodU128::new(earnings_before);
+    header.source_fresh_backing_total_num = V16PodU128::new(lien_num);
+    account_header.capital = V16PodU128::new(capital);
+    account_header.pnl = V16PodI128::new(0);
+    account_header.health_cert.valid = 1;
+    account_header.source_domains[0] = PortfolioSourceDomainV16Account {
+        domain: V16PodU32::new(0),
+        source_claim_market_id: V16PodU64::new(market_id),
+        source_lien_counterparty_backing_num: V16PodU128::new(lien_num),
+        source_lien_fee_last_slot: V16PodU64::new(last_slot),
+        ..PortfolioSourceDomainV16Account::default()
+    };
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            fresh_reserved_backing_num: lien_num,
+            valid_liened_backing_num: lien_num,
+            credit_rate_num: CREDIT_RATE_SCALE,
+            ..SourceCreditStateV16::EMPTY
+        });
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id,
+        valid_liened_backing_num: lien_num,
+        utilization_fee_earnings: earnings_before,
+        expiry_slot,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut {
+        header: &mut account_header,
+    };
+    let charged = market
+        .kani_collect_account_backing_utilization_fee_for_domain_not_atomic(&mut account, 0)
+        .unwrap();
+
+    kani::cover!(
+        slack_raw > 0 && earnings_raw > 0,
+        "expired-bucket rent cap covers a solvent account with prior provider earnings"
+    );
+    assert_eq!(charged, expected_charged);
+    assert_eq!(
+        account.header.source_domains[0]
+            .source_lien_fee_last_slot
+            .get(),
+        expiry_slot
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_foreign_expiry_retires_exact_provider_label_only() {
+    let total_raw: u8 = kani::any();
+    let retired_raw: u8 = kani::any();
+    let consumed_raw: u8 = kani::any();
+    let insurance_reserved_raw: u8 = kani::any();
+    let insurance_valid_raw: u8 = kani::any();
+    let insurance_impaired_raw: u8 = kani::any();
+    kani::assume((1..=8).contains(&total_raw));
+    kani::assume((1..=total_raw).contains(&retired_raw));
+    kani::assume(insurance_valid_raw <= insurance_reserved_raw);
+    kani::assume(insurance_impaired_raw <= insurance_reserved_raw - insurance_valid_raw);
+
+    let total = total_raw as u128 * BOUND_SCALE;
+    let retired = retired_raw as u128 * BOUND_SCALE;
+    let consumed = consumed_raw as u128 * BOUND_SCALE;
+    let insurance_reserved = insurance_reserved_raw as u128 * BOUND_SCALE;
+    let insurance_valid = insurance_valid_raw as u128 * BOUND_SCALE;
+    let insurance_impaired = insurance_impaired_raw as u128 * BOUND_SCALE;
+    let bucket = BackingBucketV16 {
+        market_id: 9,
+        impaired_liened_backing_num: total,
+        consumed_liened_backing_num: consumed,
+        expiry_slot: 7,
+        utilization_fee_earnings: 3,
+        status: BackingBucketStatusV16::Impaired,
+        ..BackingBucketV16::EMPTY
+    };
+    let source = SourceCreditStateV16 {
+        impaired_liened_backing_num: total,
+        spent_backing_num: consumed,
+        provider_receivable_num: consumed,
+        insurance_credit_reserved_num: insurance_reserved,
+        valid_liened_insurance_num: insurance_valid,
+        impaired_liened_insurance_num: insurance_impaired,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+
+    let (after_bucket, after_source) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_impaired_lien_retirement_delta(
+            bucket, source, retired,
+        )
+        .unwrap();
+
+    kani::cover!(
+        retired_raw < total_raw,
+        "one account retires its provider label while sibling labels remain"
+    );
+    kani::cover!(
+        retired_raw == total_raw,
+        "the final account normalizes the impaired bucket to expired"
+    );
+    kani::cover!(
+        insurance_impaired_raw > 0,
+        "provider retirement frames an independent impaired insurance rail"
+    );
+    assert_eq!(after_bucket.impaired_liened_backing_num, total - retired);
+    assert_eq!(after_source.impaired_liened_backing_num, total - retired);
+    assert_eq!(after_bucket.fresh_unliened_backing_num, 0);
+    assert_eq!(after_bucket.valid_liened_backing_num, 0);
+    assert_eq!(after_bucket.consumed_liened_backing_num, consumed);
+    assert_eq!(after_bucket.expiry_slot, bucket.expiry_slot);
+    assert_eq!(
+        after_bucket.utilization_fee_earnings,
+        bucket.utilization_fee_earnings
+    );
+    assert_eq!(after_source.fresh_reserved_backing_num, 0);
+    assert_eq!(after_source.valid_liened_backing_num, 0);
+    assert_eq!(after_source.spent_backing_num, consumed);
+    assert_eq!(after_source.provider_receivable_num, consumed);
+    assert_eq!(
+        after_source.insurance_credit_reserved_num,
+        insurance_reserved
+    );
+    assert_eq!(after_source.valid_liened_insurance_num, insurance_valid);
+    assert_eq!(
+        after_source.impaired_liened_insurance_num,
+        insurance_impaired
+    );
+    assert_eq!(
+        after_bucket.status,
+        if retired == total {
+            BackingBucketStatusV16::Expired
+        } else {
+            BackingBucketStatusV16::Impaired
+        }
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_foreign_expiry_provider_retirement_acceptance_is_exact() {
+    let bucket_raw: u8 = kani::any();
+    let source_raw: u8 = kani::any();
+    let amount_raw: u8 = kani::any();
+    let status_raw: u8 = kani::any();
+    let fractional: bool = kani::any();
+    kani::assume(bucket_raw <= 8);
+    kani::assume(source_raw <= 8);
+    kani::assume(amount_raw <= 8);
+    kani::assume(status_raw <= 3);
+
+    let bucket_amount = bucket_raw as u128 * BOUND_SCALE;
+    let source_amount = source_raw as u128 * BOUND_SCALE;
+    let amount = amount_raw as u128 * BOUND_SCALE + u128::from(fractional);
+    let status = match status_raw {
+        0 => BackingBucketStatusV16::Empty,
+        1 => BackingBucketStatusV16::Fresh,
+        2 => BackingBucketStatusV16::Expired,
+        _ => BackingBucketStatusV16::Impaired,
+    };
+    let bucket = BackingBucketV16 {
+        market_id: 9,
+        impaired_liened_backing_num: bucket_amount,
+        status,
+        ..BackingBucketV16::EMPTY
+    };
+    let source = SourceCreditStateV16 {
+        impaired_liened_backing_num: source_amount,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+
+    let result =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_impaired_lien_retirement_delta(
+            bucket, source, amount,
+        );
+    let accepted = amount == 0
+        || (!fractional
+            && status == BackingBucketStatusV16::Impaired
+            && amount <= bucket_amount
+            && amount <= source_amount);
+
+    kani::cover!(accepted && amount != 0, "valid provider retirement accepts");
+    kani::cover!(
+        !accepted && fractional,
+        "fractional provider retirement rejects"
+    );
+    kani::cover!(
+        !accepted && !fractional && status != BackingBucketStatusV16::Impaired,
+        "wrong-state provider retirement rejects"
+    );
+    kani::cover!(
+        !accepted && !fractional && amount > bucket_amount,
+        "over-retirement rejects"
+    );
+    assert_eq!(result.is_ok(), accepted);
+}
+
+// Fee revenue a source lien keeps must track the backing that REMAINS: never
+// more than it earned, exactly all of it when nothing was released, and nothing
+// at all when the backing is gone. (upstream 6276d568)
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_source_lien_fee_proration_tracks_remaining_backing() {
+    let fee_raw: u8 = kani::any();
+    let before_raw: u8 = kani::any();
+    let after_raw: u8 = kani::any();
+    kani::assume(fee_raw <= 32);
+    kani::assume((1..=16).contains(&before_raw));
+    kani::assume(after_raw <= before_raw);
+    let fee = fee_raw as u128;
+    let before = before_raw as u128 * BOUND_SCALE;
+    let after = after_raw as u128 * BOUND_SCALE;
+
+    let remaining = kani_source_lien_fee_after_backing_release(fee, before, after).unwrap();
+
+    kani::cover!(
+        after == before,
+        "unchanged backing preserves all fee history"
+    );
+    kani::cover!(after == 0, "full backing release clears live fee history");
+    kani::cover!(
+        after > 0 && after < before && fee > 0,
+        "partial backing release prorates nonzero fee history"
+    );
+    assert_eq!(remaining, fee * after / before);
+    assert!(remaining <= fee);
+    if after == before {
+        assert_eq!(remaining, fee);
+    }
+    if after == 0 {
+        assert_eq!(remaining, 0);
+    }
+
+    // FORK ADDITION: upstream's proof assumes after <= before, so its own
+    // `backing_after > backing_before -> Err(InvalidLeg)` guard is never
+    // exercised. Backing that GREW is a caller error (a negative release), and
+    // silently prorating it would hand the lien MORE revenue than it earned.
+    // Pin it here rather than ship the guard uncontrolled.
+    if before < 16 * BOUND_SCALE {
+        let grown = before + BOUND_SCALE;
+        assert_eq!(
+            kani_source_lien_fee_after_backing_release(fee, before, grown),
+            Err(V16Error::InvalidLeg)
+        );
+    }
 }
