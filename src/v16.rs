@@ -11374,6 +11374,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     {
                         return Err(V16Error::Stale);
                     }
+                    asset.k_epoch_start_long = 0;
+                    asset.f_epoch_start_long_num = 0;
+                    asset.b_epoch_start_long_num = 0;
                     asset.mode_long = SideModeV16::Normal;
                 }
             },
@@ -11388,6 +11391,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     {
                         return Err(V16Error::Stale);
                     }
+                    asset.k_epoch_start_short = 0;
+                    asset.f_epoch_start_short_num = 0;
+                    asset.b_epoch_start_short_num = 0;
                     asset.mode_short = SideModeV16::Normal;
                 }
             },
