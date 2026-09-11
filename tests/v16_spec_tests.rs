@@ -4250,6 +4250,43 @@ fn direct_live_lien_release_leaves_a_certificate_the_conversion_can_use() {
     );
 }
 
+// upstream b4b975f3 "fix: allow lagging committed checkpoint accrual" (2026-08-31):
+// `now_slot` is the endpoint of one asset-local committed segment. Another asset can
+// already have advanced the market's authenticated clock past it, so a lagging asset
+// must still be able to settle its earlier checkpoint while the global clock stays
+// monotonic (max), and an asset-local checkpoint still cannot move behind that
+// asset's own clock.
+#[test]
+fn v16_asset_local_committed_accrual_can_trail_global_clock() {
+    let (mut header, mut markets) = market_fixture(2, 100);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+    market
+        .accrue_asset_to_not_atomic(0, 10, 100, 0, true)
+        .expect("the first asset must advance the authenticated market clock");
+    let global_slot = market.header.current_slot.get();
+    let lagging_before = market.markets[1].engine.asset.slot_last.get();
+    let committed_slot = lagging_before + 1;
+    assert!(committed_slot < global_slot);
+
+    let outcome = market
+        .accrue_asset_to_not_atomic(1, committed_slot, 100, 0, true)
+        .expect("a lagging asset must settle an earlier committed checkpoint");
+
+    assert_eq!(outcome.dt, 1);
+    assert_eq!(
+        market.markets[1].engine.asset.slot_last.get(),
+        committed_slot
+    );
+    assert_eq!(market.header.current_slot.get(), global_slot);
+    assert_eq!(
+        market.accrue_asset_to_not_atomic(1, committed_slot - 1, 100, 0, true),
+        Err(V16Error::InvalidConfig),
+        "an asset-local checkpoint still cannot move behind that asset's own clock"
+    );
+    market.validate_shape().unwrap();
+}
+
 // upstream 44847fd5 "Authenticate resolved settlement time" (2026-08-20): resolved
 // routes do not accrue markets, but expiry-sensitive backing still needs a
 // monotonic clock. The wrapper authenticates the slot (Clock sysvar) and the
