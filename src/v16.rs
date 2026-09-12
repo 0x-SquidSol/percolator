@@ -22329,3 +22329,211 @@ mod margin_rounding_tests {
         }
     }
 }
+
+
+/// GH#164 tripwire: the ATTACH writer's `oi_eff` contribution must not depend
+/// on the attaching side's own `a` scale.
+///
+/// `validate_asset_shape_for_view` enforces `oi_eff_long_q == oi_eff_short_q`
+/// in Live mode, but that check reaches production only through
+/// `validate_shape_full_audit_scan`, which is gated
+/// `#[cfg(any(test, kani, feature = "audit-scan"))]`. A writer that breaks the
+/// equality therefore builds a state the default build commits and the audit
+/// build rejects with `InvalidConfig` -- a split invisible to anyone not
+/// running the audit feature.
+///
+/// Existing coverage cannot catch that class of change.
+/// `proof_v16_view_trade_position_delta_preserves_oi_symmetry` builds its asset
+/// from `AssetStateV16::default()`, so both sides sit at equal `a`, and scaling
+/// by equal scales is equality-preserving either way. The divergence needs
+/// `a_long != a_short`, which needs a prior one-sided ADL, and nothing else in
+/// the suite constructs that state -- which is why the reverted #162 passed CI.
+///
+/// The fixture below is a genuinely reachable state, not merely a shape-valid
+/// one: `fixture_is_reachable_and_audit_clean` asserts the telescoping relation
+/// `oi_eff_side == floor(a_side * sum_w_side / SCALE)` holds exactly on both
+/// sides, which the shape validator itself never checks.
+///
+/// These tests pass trivially against the nominal writer. That is the point --
+/// they are a tripwire for the next attempt at the `#457` fix, not a claim of a
+/// defect in current `main`.
+#[cfg(test)]
+mod attach_writer_cross_side_oi_tripwire_tests {
+    use super::*;
+
+    const CURRENT_SLOT: u64 = 1_000;
+    const NEXT_MARKET_ID: u64 = 2;
+    const PRICE: u64 = 1_000_000;
+
+    /// A long side scaled down by a prior one-sided ADL. This exact value is
+    /// load-bearing: `the_fixture_is_one_where_an_a_scaled_writer_would_diverge`
+    /// pins that it is a scale at which an A-scaled contribution rounds apart
+    /// from the untouched short side. Most scales do not, so do not reduce this
+    /// to a round number without re-checking that test.
+    const A_LONG: u128 = 656_160_904_301_049;
+    const BALANCED_OI: u128 = 62_275_870;
+    const ATTACH_Q: u128 = 8_513_359;
+
+    /// An Active, Live-shaped asset whose sides sit at DIFFERENT `a` scales
+    /// with balanced open interest: what a prior one-sided ADL leaves behind.
+    /// Each side's weight is derived with the production helper, so the
+    /// telescoping relation holds by construction rather than by hand-tuning.
+    fn asset_with_asymmetric_a() -> AssetStateV16 {
+        let mut asset = AssetStateV16::default();
+        asset.market_id = 1;
+        asset.lifecycle = AssetLifecycleV16::Active;
+        asset.raw_oracle_target_price = PRICE;
+        asset.effective_price = PRICE;
+        asset.fund_px_last = PRICE;
+        asset.slot_last = CURRENT_SLOT;
+        asset.a_long = A_LONG;
+        asset.a_short = ADL_ONE;
+        asset.oi_eff_long_q = BALANCED_OI;
+        asset.oi_eff_short_q = BALANCED_OI;
+        asset.loss_weight_sum_long = loss_weight_for_basis(BALANCED_OI, A_LONG).unwrap();
+        asset.loss_weight_sum_short = loss_weight_for_basis(BALANCED_OI, ADL_ONE).unwrap();
+        asset.stored_pos_count_long = 1;
+        asset.stored_pos_count_short = 1;
+        asset
+    }
+
+    fn audit_scan(asset: AssetStateV16) -> V16Result<()> {
+        MarketGroupV16View::<u64>::validate_asset_shape_for_view(
+            asset,
+            MarketModeV16::Live,
+            CURRENT_SLOT,
+            NEXT_MARKET_ID,
+        )
+    }
+
+    /// `floor(a * sum_w / SCALE)` -- the aggregate `oi_eff` a side's lazy
+    /// indices reconstruct to.
+    fn telescoped_oi(a: u128, weight_sum: u128) -> u128 {
+        wide_mul_div_floor_u128(a, weight_sum, SOCIAL_WEIGHT_SCALE)
+    }
+
+    /// Attach both legs of one fill, weighting each leg the way production
+    /// does: normalized against the side's own `a`.
+    fn attach_one_fill(asset: &mut AssetStateV16) {
+        let (a_long, a_short) = (asset.a_long, asset.a_short);
+        let w_long = loss_weight_for_basis(ATTACH_Q, a_long).unwrap();
+        let w_short = loss_weight_for_basis(ATTACH_Q, a_short).unwrap();
+        add_open_interest_for_new_position(asset, SideV16::Long, ATTACH_Q, w_long).unwrap();
+        add_open_interest_for_new_position(asset, SideV16::Short, ATTACH_Q, w_short).unwrap();
+    }
+
+    /// The fixture must be a state the engine could actually be in, or every
+    /// test below proves nothing. Shape-validity alone is not enough: the
+    /// validator never checks the telescoping relation, so a fixture can pass
+    /// it while being unreachable.
+    #[test]
+    fn fixture_is_reachable_and_audit_clean() {
+        let asset = asset_with_asymmetric_a();
+
+        assert_ne!(
+            asset.a_long, asset.a_short,
+            "fixture must be asymmetric or it cannot exercise the divergence"
+        );
+        assert_eq!(
+            telescoped_oi(asset.a_long, asset.loss_weight_sum_long),
+            asset.oi_eff_long_q,
+            "long side must satisfy oi_eff == floor(a * sum_w / SCALE)"
+        );
+        assert_eq!(
+            telescoped_oi(asset.a_short, asset.loss_weight_sum_short),
+            asset.oi_eff_short_q,
+            "short side must satisfy oi_eff == floor(a * sum_w / SCALE)"
+        );
+        audit_scan(asset).expect("asymmetric `a` with balanced OI is a legal Live state");
+    }
+
+    /// Why these particular constants. An A-scaled writer computes each side's
+    /// contribution as the difference of that side's aggregates; on this
+    /// fixture those differ by one atom across the two sides. Most scales round
+    /// identically and would make the tripwire vacuous, so this pins that the
+    /// chosen fixture genuinely trips.
+    ///
+    /// This asserts on the formula directly, NOT on the writer, so it holds
+    /// whichever writer is in tree.
+    #[test]
+    fn the_fixture_is_one_where_an_a_scaled_writer_would_diverge() {
+        let asset = asset_with_asymmetric_a();
+        let contribution = |a: u128, w_before: u128, added: u128| {
+            telescoped_oi(a, w_before + added) - telescoped_oi(a, w_before)
+        };
+
+        let long = contribution(
+            asset.a_long,
+            asset.loss_weight_sum_long,
+            loss_weight_for_basis(ATTACH_Q, asset.a_long).unwrap(),
+        );
+        let short = contribution(
+            asset.a_short,
+            asset.loss_weight_sum_short,
+            loss_weight_for_basis(ATTACH_Q, asset.a_short).unwrap(),
+        );
+
+        assert_eq!(
+            long,
+            ATTACH_Q + 1,
+            "long side A-scaled contribution rounds up"
+        );
+        assert_eq!(short, ATTACH_Q, "short side A-scaled contribution is exact");
+        assert_ne!(
+            long, short,
+            "fixture must be one where an A-scaled writer diverges, or this module cannot catch a re-land of #162"
+        );
+    }
+
+    /// Each side's `oi_eff` grows by exactly the nominal size, with no
+    /// dependence on that side's `a`. This is the property the reverted #162
+    /// gave up, and what makes the equality below structural not incidental.
+    #[test]
+    fn attach_contribution_is_independent_of_the_side_a_scale() {
+        let before = asset_with_asymmetric_a();
+        let mut asset = before;
+        attach_one_fill(&mut asset);
+
+        assert_eq!(
+            asset.oi_eff_long_q,
+            before.oi_eff_long_q + ATTACH_Q,
+            "long side oi_eff must grow by the nominal size, not an a-scaled one"
+        );
+        assert_eq!(
+            asset.oi_eff_short_q,
+            before.oi_eff_short_q + ATTACH_Q,
+            "short side oi_eff must grow by the nominal size, not an a-scaled one"
+        );
+    }
+
+    /// The Live-mode invariant the audit scanner enforces, asserted at the
+    /// writer, on a state where it is not automatic.
+    #[test]
+    fn attach_onto_asymmetric_a_preserves_cross_side_oi_equality() {
+        let mut asset = asset_with_asymmetric_a();
+        attach_one_fill(&mut asset);
+
+        assert_eq!(
+            asset.oi_eff_long_q, asset.oi_eff_short_q,
+            "a fill attaches the same size to both sides, so Live-mode cross-side equality must survive it at any `a` scales"
+        );
+        audit_scan(asset)
+            .expect("the production writer must not build a state the audit scan rejects");
+    }
+
+    /// Negative control. Without it, the assertions above would still pass if
+    /// the scanner had stopped enforcing the equality. This pins that a
+    /// one-atom divergence really is rejected, which is exactly the size of
+    /// divergence an A-scaled writer produces here.
+    #[test]
+    fn audit_scanner_rejects_a_one_atom_cross_side_divergence() {
+        let mut asset = asset_with_asymmetric_a();
+        attach_one_fill(&mut asset);
+        asset.oi_eff_long_q += 1;
+
+        assert!(
+            matches!(audit_scan(asset), Err(V16Error::InvalidConfig)),
+            "a one-atom cross-side divergence must be rejected in Live mode"
+        );
+    }
+}
