@@ -13655,7 +13655,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Err(V16Error::InvalidLeg);
         }
         if normalize_exhausted_sides
-            && Self::leg_has_exhausted_effective_oi(asset, leg)
+            && Self::leg_effective_oi_cannot_cover_leg(asset, leg)?
             && !account
                 .header
                 .close_progress
@@ -20993,7 +20993,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     return Ok(());
                 }
                 let asset = self.asset_state(asset_index)?;
-                if Self::leg_has_exhausted_effective_oi(asset, leg) {
+                if Self::leg_effective_oi_cannot_cover_leg(asset, leg)? {
                     self.begin_full_drain_reset_inner(asset_index, leg.side)?;
                 }
                 let asset = self.asset_state(asset_index)?;
@@ -21592,6 +21592,55 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             && mode != SideModeV16::ResetPending
     }
 
+    /// GH#290: the side aggregate cannot cover this leg's effective quantity.
+    ///
+    /// A strict generalization of [`Self::leg_has_exhausted_effective_oi`]:
+    /// `effective_oi == 0` with a non-zero basis always implies
+    /// `ceil(leg) > effective_oi`, so every state that predicate accepts this
+    /// one accepts too, with the same side conditions.
+    ///
+    /// Why the `== 0` boundary is not enough. A leg's effective quantity is
+    /// CEILed (`effective_abs_quantity_for_leg`) while the side aggregate's `a`
+    /// is FLOOR-rescaled by every unilateral close, and nothing reconciles the
+    /// two. After a haircut, `ceil(basis * a / a_basis)` can therefore exceed
+    /// `oi_eff_side` by up to one atom per leg -- the same terminal residue the
+    /// `== 0` branch exists to drain, reached by rounding instead of by exact
+    /// consumption. Both detach writers then `checked_sub` past zero and raise
+    /// `CounterUnderflow`, which strands the leg: forfeit is the owner's
+    /// designated Recovery exit, and `withdraw_not_atomic` refuses ANY amount
+    /// while a leg is still attached.
+    ///
+    /// Deliberately a separate predicate rather than a widening of
+    /// `leg_has_exhausted_effective_oi`, because that one also feeds the
+    /// reset-obligation flag on the refresh path, where the `== 0` semantics is
+    /// load-bearing for a different reason (upstream 9ffc4749).
+    fn leg_effective_oi_cannot_cover_leg(
+        asset: AssetStateV16,
+        leg: PortfolioLegV16,
+    ) -> V16Result<bool> {
+        let (effective_oi, stored_count, pending_count, mode) = match leg.side {
+            SideV16::Long => (
+                asset.oi_eff_long_q,
+                asset.stored_pos_count_long,
+                asset.pending_obligation_count_long,
+                asset.mode_long,
+            ),
+            SideV16::Short => (
+                asset.oi_eff_short_q,
+                asset.stored_pos_count_short,
+                asset.pending_obligation_count_short,
+                asset.mode_short,
+            ),
+        };
+        if !leg.active || leg.basis_pos_q == 0 {
+            return Ok(false);
+        }
+        Ok(V16Core::effective_abs_quantity_for_leg(asset, leg)? > effective_oi
+            && stored_count != 0
+            && pending_count == 0
+            && mode != SideModeV16::ResetPending)
+    }
+
     #[cfg(kani)]
     pub fn kani_kernel_unilateral_close_capacity(
         account_effective_abs: u128,
@@ -21746,7 +21795,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if !self.leg_is_dead_for_forfeit(asset_index, leg.side)? {
             return Err(V16Error::LockActive);
         }
-        if Self::leg_has_exhausted_effective_oi(self.asset_state(asset_index)?, leg)
+        if Self::leg_effective_oi_cannot_cover_leg(self.asset_state(asset_index)?, leg)?
             && !account
                 .header
                 .close_progress
@@ -24501,5 +24550,134 @@ mod taker_fee_shortfall_tests {
             // exactly the fee: still taker-only.
             assert_eq!(charge(FEE, taker_is_long), (FEE, 0, FEE));
         }
+    }
+}
+
+/// GH#290 -- the DETACH-side mirror of the `#457` / `#162` story.
+///
+/// `attach_writer_cross_side_oi_tripwire_tests` above is, by its own doc, "a
+/// tripwire for the next attempt at the `#457` fix, not a claim of a defect in
+/// current `main`": on the ATTACH side the ceil/floor asymmetry is benign today.
+/// On the DETACH side it is not. A leg's effective quantity is CEILed while the
+/// side aggregate's `a` is FLOOR-rescaled by every unilateral close, so after a
+/// haircut `ceil(basis * a / a_basis)` can exceed `oi_eff_side`. Both detach
+/// writers subtract that figure with an unclamped `checked_sub`, so the leg can
+/// no longer be detached at all -- and `withdraw_not_atomic` refuses ANY amount
+/// while a leg is attached, so the owner's whole portfolio capital is stranded.
+///
+/// `leg_has_exhausted_effective_oi` already drains exactly this terminal residue
+/// ("a matched Recovery close can consume the final effective OI while leaving
+/// an ADL-reduced account's larger stored basis behind"), but only at the
+/// `effective_oi == 0` boundary. Rounding reaches the same state one atom short
+/// of zero, which that predicate does not accept.
+#[cfg(test)]
+mod detach_writer_oi_exhaustion_gh290_tests {
+    use super::*;
+
+    /// A long side scaled to ~1/3 by a prior one-sided ADL, and a basis chosen
+    /// so the ceil lands exactly one atom above the floor aggregate. Both values
+    /// are load-bearing: `the_surplus_is_exactly_one_atom` pins the arithmetic.
+    const A_LONG: u128 = 333_333_333_333_333;
+    const LEG_BASIS: u128 = 4_000_002;
+    const OI_EFF_LONG: u128 = 1_333_333;
+
+    fn asset_after_one_sided_adl() -> AssetStateV16 {
+        let mut asset = AssetStateV16::default();
+        asset.market_id = 1;
+        asset.lifecycle = AssetLifecycleV16::Recovery;
+        asset.a_long = A_LONG;
+        asset.a_short = ADL_ONE;
+        asset.oi_eff_long_q = OI_EFF_LONG;
+        asset.oi_eff_short_q = 0;
+        asset.loss_weight_sum_long = loss_weight_for_basis(OI_EFF_LONG, A_LONG).unwrap();
+        asset.stored_pos_count_long = 1;
+        asset.pending_obligation_count_long = 0;
+        asset
+    }
+
+    fn stuck_leg(asset: AssetStateV16) -> PortfolioLegV16 {
+        let mut leg = PortfolioLegV16::default();
+        leg.active = true;
+        leg.side = SideV16::Long;
+        leg.basis_pos_q = LEG_BASIS as i128;
+        leg.a_basis = ADL_ONE;
+        leg.epoch_snap = asset.epoch_long;
+        leg.loss_weight = loss_weight_for_basis(LEG_BASIS, ADL_ONE).unwrap();
+        leg
+    }
+
+    /// The fixture must be a state the engine could actually be in, or the rest
+    /// proves nothing: the telescoping relation the side's lazy indices
+    /// reconstruct to must hold exactly.
+    #[test]
+    fn fixture_is_reachable() {
+        let asset = asset_after_one_sided_adl();
+        assert_eq!(
+            wide_mul_div_floor_u128(asset.a_long, asset.loss_weight_sum_long, SOCIAL_WEIGHT_SCALE),
+            asset.oi_eff_long_q,
+            "fixture must satisfy oi_eff == floor(a * sum_w / SCALE)"
+        );
+        assert_ne!(asset.a_long, ADL_ONE, "fixture needs a haircut long side");
+    }
+
+    /// The whole defect in one assertion.
+    #[test]
+    fn the_surplus_is_exactly_one_atom() {
+        let asset = asset_after_one_sided_adl();
+        let leg = stuck_leg(asset);
+        let effective = V16Core::effective_abs_quantity_for_leg(asset, leg).unwrap();
+        assert_eq!(effective, OI_EFF_LONG + 1, "ceil must exceed the floor aggregate by 1");
+    }
+
+    /// The pre-existing `== 0` predicate does NOT accept this state, which is
+    /// why the terminal-residue drain never runs for it.
+    #[test]
+    fn the_exact_zero_predicate_does_not_accept_a_one_atom_surplus() {
+        let asset = asset_after_one_sided_adl();
+        let leg = stuck_leg(asset);
+        assert!(
+            !MarketGroupV16ViewMut::<u64>::leg_has_exhausted_effective_oi(asset, leg),
+            "the == 0 boundary must not accept a non-zero aggregate"
+        );
+    }
+
+    /// Without the drain, both detach writers underflow. This is the stranding.
+    #[test]
+    fn both_detach_writers_underflow_on_the_surplus() {
+        let asset = asset_after_one_sided_adl();
+        let leg = stuck_leg(asset);
+        let effective = V16Core::effective_abs_quantity_for_leg(asset, leg).unwrap();
+
+        assert_eq!(
+            V16Core::kernel_retain_leg_as_pending_obligation(leg, asset, effective).unwrap_err(),
+            V16Error::CounterUnderflow,
+            "retain writer must be the one that strands the leg"
+        );
+    }
+
+    /// GH#290 fix: the generalized predicate accepts it, so the forfeit path
+    /// routes into the existing terminal-residue drain instead of reverting.
+    #[test]
+    fn the_generalized_predicate_accepts_a_one_atom_surplus() {
+        let asset = asset_after_one_sided_adl();
+        let leg = stuck_leg(asset);
+        assert!(
+            MarketGroupV16ViewMut::<u64>::leg_effective_oi_cannot_cover_leg(asset, leg).unwrap(),
+            "GH#290: an aggregate that cannot cover the leg must be drained, not reverted"
+        );
+    }
+
+    /// And it is a strict generalization: everything the old predicate accepted
+    /// it still accepts.
+    #[test]
+    fn the_generalized_predicate_subsumes_the_exact_zero_one() {
+        let mut asset = asset_after_one_sided_adl();
+        asset.oi_eff_long_q = 0;
+        let leg = stuck_leg(asset);
+        assert!(MarketGroupV16ViewMut::<u64>::leg_has_exhausted_effective_oi(asset, leg));
+        assert!(
+            MarketGroupV16ViewMut::<u64>::leg_effective_oi_cannot_cover_leg(asset, leg).unwrap(),
+            "generalization must accept every state the == 0 predicate accepted"
+        );
     }
 }
