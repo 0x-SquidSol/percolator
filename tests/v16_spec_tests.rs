@@ -12860,19 +12860,45 @@ fn v16_liquidation_of_unattributed_deficit_reduces_risk_without_charging_the_sur
 
     let insurance_before = market.header.insurance.get();
     let asset1_before = markets_snapshot(&market, 1);
-    let outcome = market
-        .liquidate_account_not_atomic(&mut short, LiquidationRequestV16 { asset_index: 1 })
-        .expect("a locked account still liquidates, reduce-only");
+    // GH#292: `open_unattributed_deficit` closes the asset-0 leg outright, so this
+    // liquidation closes the account's LAST leg and leaves it FLAT while still
+    // carrying the unattributable -250 deficit. That state has no resolution path:
+    // capital is 0, so the principal-settlement path returns early at its
+    // `paid == 0` guard, nothing writes the PnL again, `negative_pnl_account_count`
+    // never decrements, and the group-wide `bankruptcy_hlock_active` never clears.
+    // The locked branch therefore now declares Recovery and returns RecoveryRequired;
+    // the sole caller converts that into progress once the marker is complete, so the
+    // position close still commits -- which the OI assertion below verifies.
+    //
+    // This test previously asserted `mode == 0` here, i.e. it pinned the creation of
+    // that terminal state. Its STATED purpose is unchanged and still asserted below.
+    let outcome =
+        market.liquidate_account_not_atomic(&mut short, LiquidationRequestV16 { asset_index: 1 });
+    assert!(
+        matches!(outcome, Err(percolator::V16Error::RecoveryRequired)),
+        "a locked liquidation that strands a deficit on a flat account must escalate"
+    );
+    assert_eq!(
+        market.header.mode, 2,
+        "the Recovery declaration must have committed"
+    );
+    assert!(
+        market.header.recovery_reason.try_to_runtime().unwrap().is_some(),
+        "a complete Recovery marker is required, or the caller's \
+         kernel_commit_declared_liquidation_recovery propagates the error instead"
+    );
     // NEGATIVE CONTROL for 6d8e0a48: without the lock this liquidation charges the
     // asset-0 loss to asset 1 (residual booked / fee charged against the surviving
-    // domain). With it, only risk is removed.
-    assert!(outcome.closed_q > 0);
-    assert_eq!(outcome.insurance_used, 0);
-    assert_eq!(outcome.residual_booked, 0);
-    assert_eq!(outcome.explicit_loss, 0);
-    assert_eq!(outcome.fee_charged, 0);
-    assert_eq!(market.header.insurance.get(), insurance_before);
-    assert_eq!(market.header.mode, 0, "no market recovery declared");
+    // domain). With it, only risk is removed. The outcome struct is not available on
+    // the Err path, so this is now asserted on state instead, which covers the same
+    // ground: the liquidation fee is credited to insurance, so an unchanged
+    // `insurance` implies `fee_charged == 0` and `insurance_used == 0`, and an
+    // untouched close ledger on the surviving side implies nothing was booked there.
+    assert_eq!(
+        market.header.insurance.get(),
+        insurance_before,
+        "no insurance consumed and no fee charged against the surviving domain"
+    );
     assert_eq!(short.header.liquidation_lock, 1);
     assert_eq!(short.header.pnl.get(), -250);
     let asset1_after = markets_snapshot(&market, 1);

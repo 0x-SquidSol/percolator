@@ -377,6 +377,28 @@ fn uncovered_loss_remains_with_open_risk(
     uncovered_loss_after_principal != 0 && !active_bitmap_is_empty(remaining_active_bitmap)
 }
 
+/// GH#292: the exact complement of `uncovered_loss_remains_with_open_risk` on the
+/// loss side — an uncovered loss on an account the close leaves FLAT.
+///
+/// The two are used on opposite branches of `liquidate_account_not_atomic` and
+/// together cover both shapes of an unresolvable deficit. On the unlocked path the
+/// flat case needs no escalation, because that path resolves the deficit in place
+/// (principal settlement, then `consume_domain_insurance_for_negative_pnl`, which
+/// zeroes the PnL and so decrements `negative_pnl_account_count`, then the residual
+/// chunk). The locked path deliberately runs none of those — a multi-asset deficit
+/// has no safe per-domain attribution — so for it the flat case is terminal: nothing
+/// writes the PnL again, the counter never decrements, and the group-wide
+/// `bankruptcy_hlock_active` can never clear.
+#[inline]
+fn uncovered_loss_strands_a_flat_account(
+    pnl: i128,
+    capital: u128,
+    remaining_active_bitmap: V16ActiveBitmap,
+) -> bool {
+    let uncovered_loss_after_principal = liquidation_uncovered_loss_after_principal(pnl, capital);
+    uncovered_loss_after_principal != 0 && active_bitmap_is_empty(remaining_active_bitmap)
+}
+
 #[inline]
 fn unattributed_loss_lock_after_pnl(
     was_locked: bool,
@@ -20887,6 +20909,34 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             self.validate_liquidation_progress_from_score(before_score, &account.as_view())?;
             self.validate_shape_audit_scan()?;
             self.validate_account_audit_scan(&account.as_view())?;
+            // GH#292: this branch books nothing and consumes no insurance, so unlike
+            // the unlocked path below it never RESOLVES a deficit it cannot attribute.
+            // While the account still holds open risk that is the intended behaviour and
+            // is pinned by `v16_liquidation_of_unattributed_deficit_reduces_risk_without
+            // _charging_the_surviving_domain` (6d8e0a48): remove risk, charge nothing,
+            // declare nothing. But once a close leaves the account FLAT the deficit has
+            // no resolution path left at all. Capital is 0, so
+            // `settle_negative_pnl_from_principal_core` returns early at its `paid == 0`
+            // guard (arming the hlock on the way out); nothing writes the PnL again, so
+            // `negative_pnl_account_count` never decrements and `bankruptcy_hlock_active`
+            // -- a group-wide withdrawal gate -- can never clear. Recovery is the only
+            // attribution-free terminal for that state, and the sole caller converts the
+            // declaration into progress once the marker is complete
+            // (`kernel_commit_declared_liquidation_recovery`), so the close above still
+            // commits rather than being rolled back.
+            //
+            // `reduce_position` has already run, so the account's own bitmap is the
+            // post-close state and needs no prediction.
+            if uncovered_loss_strands_a_flat_account(
+                account.header.pnl.get(),
+                account.header.capital.get(),
+                account.header.active_bitmap.map(V16PodU64::get),
+            ) {
+                self.declare_permissionless_recovery(
+                    PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress,
+                )?;
+                return Err(V16Error::RecoveryRequired);
+            }
             return Ok(LiquidationOutcomeV16 {
                 closed_q: close_q,
                 insurance_used: 0,
